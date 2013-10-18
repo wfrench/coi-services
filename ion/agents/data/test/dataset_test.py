@@ -17,6 +17,7 @@ from pyon.core.bootstrap import get_service_registry
 
 # 3rd party imports.
 import os
+import sys
 from gevent.event import AsyncResult
 import gevent
 import shutil
@@ -117,7 +118,7 @@ PRELOAD_CATEGORIES = [
     #'Scheduler',
     #'Reference',                        # No resource
     ]
-PRELOAD_CATEGORIES = None
+#PRELOAD_CATEGORIES = None
 
 class FakeProcess(LocalContextMixin):
     """
@@ -135,6 +136,9 @@ class DatasetAgentTestConfig(object):
     dsa_class   = None
 
     instrument_device_name = None
+
+    # If set load the driver from this repo instead of the egg
+    mi_repo = None
 
     data_dir    = "/tmp/dsatest"
     test_resource_dir = None
@@ -164,6 +168,8 @@ class DatasetAgentTestConfig(object):
         self.preload_scenario = kwargs.get('preload_scenario', self.preload_scenario)
 
         self.test_resource_dir = kwargs.get('test_resource_dir', os.path.join(self.test_base_dir(), 'resource'))
+
+        self.mi_repo = kwargs.get('mi_repo', self.mi_repo)
 
     def verify(self):
         """
@@ -282,8 +288,25 @@ class DatasetAgentTestCase(IonIntegrationTestCase):
                                      predicate=PRED.hasAgentInstance,
                                      object_type=RT.ExternalDatasetAgentInstance)
 
-        log.debug("dsa_instance found: %s", dsa_instance)
+        log.info("dsa_instance found: %s", dsa_instance)
         self._driver_config = dsa_instance.driver_config
+
+        dsa_obj = rr.read_object(
+            object_type=RT.ExternalDatasetAgent, predicate=PRED.hasAgentDefinition, subject=dsa_instance._id, id_only=False)
+
+        log.info("dsa agent found: %s", dsa_obj)
+
+        # If we don't want to load from an egg then we need to
+        # alter the driver config read from preload
+        if self.test_config.mi_repo is not None:
+            dsa_obj.driver_uri = None
+            # Strip the custom namespace
+            dsa_obj.driver_module = ".".join(dsa_obj.driver_module.split('.')[1:])
+
+            log.info("saving new dsa agent config: %s", dsa_obj)
+            rr.update(dsa_obj)
+
+            if not self.test_config.mi_repo in sys.path: sys.path.insert(0, self.test_config.mi_repo)
 
         self.clear_sample_data()
 

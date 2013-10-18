@@ -33,17 +33,20 @@ class HypmCTDTest(DatasetAgentTestCase):
     def setUp(self):
         self.test_config.initialize(
             instrument_device_name = 'CTDPF',
-            preload_scenario= 'CTDPF'
+            preload_scenario= 'CTDPF',
+
+            # Uncomment this line to load driver from a locak repository
+            # mi_repo = '/Users/wfrench/Workspace/code/wfrench/marine-integrations'
         )
 
         super(HypmCTDTest, self).setUp()
 
+    @unittest.skip("Skip this test until OOIION-1332 passes.")
     def test_init(self):
         """
         """
         self.assert_initialize()
 
         self.create_sample_data("hypm_ctdpf/DAT0003.txt")
-        gevent.sleep(5)
 
         self.assert_reset()
