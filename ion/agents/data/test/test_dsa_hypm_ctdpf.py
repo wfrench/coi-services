@@ -23,7 +23,6 @@ import unittest
 ###############################################################################
 
 
-@unittest.skip("Skip this test until OOIION-1332 passes.")
 @attr('INT', group='mi')
 class HypmCTDTest(DatasetAgentTestCase):
     """
@@ -34,19 +33,20 @@ class HypmCTDTest(DatasetAgentTestCase):
         self.test_config.initialize(
             instrument_device_name = 'CTDPF',
             preload_scenario= 'CTDPF',
+            stream_name= 'ctdpf_parsed',
 
             # Uncomment this line to load driver from a locak repository
-            # mi_repo = '/Users/wfrench/Workspace/code/wfrench/marine-integrations'
+            mi_repo = '/Users/wfrench/Workspace/code/wfrench/marine-integrations'
         )
 
         super(HypmCTDTest, self).setUp()
 
-    @unittest.skip("Skip this test until OOIION-1332 passes.")
     def test_init(self):
         """
         """
         self.assert_initialize()
 
         self.create_sample_data("hypm_ctdpf/DAT0003.txt")
+        self.get_samples(self.test_config.stream_name, sample_count=1)
 
         self.assert_reset()
