@@ -41,12 +41,24 @@ class HypmCTDTest(DatasetAgentTestCase):
 
         super(HypmCTDTest, self).setUp()
 
-    def test_init(self):
+    def test_large_file(self):
         """
+        Verify a large file import with no buffering
         """
         self.assert_initialize()
 
-        self.create_sample_data("hypm_ctdpf/DAT0003.txt")
-        self.get_samples(self.test_config.stream_name, sample_count=1)
+        # First with unbuffered publishing
+        #self.assert_set_pubrate(0)
+
+        #self.create_sample_data("hypm_ctdpf/DAT0003.txt")
+        #self.get_samples(self.test_config.stream_name, sample_count=436, timeout=120)
+        #self.assert_sample_queue_size(self.test_config.stream_name, 0)
+
+        # Then publishing granules every 5 seconds
+        self.assert_set_pubrate(5)
+
+        self.create_sample_data("hypm_ctdpf/DAT0003.txt", "DAT004.txt")
+        self.get_samples(self.test_config.stream_name, sample_count=436, timeout=120)
+        self.assert_sample_queue_size(self.test_config.stream_name, 0)
 
         self.assert_reset()

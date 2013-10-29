@@ -31,6 +31,7 @@ from ion.services.dm.utility.granule_utils import RecordDictionaryTool
 
 # Pyon unittest support.
 from ion.util.agent_launcher import AgentLauncher
+from ion.agents.data.result_set import ResultSet
 from pyon.util.int_test import IonIntegrationTestCase
 
 # Pyon Object Serialization
@@ -601,7 +602,7 @@ class DatasetAgentTestCase(IonIntegrationTestCase):
                 if(self._samples_received.has_key(stream_id) and
                    len(self._samples_received.get(stream_id))):
                     log.trace("get_samples() received sample #%d!", i)
-                    result.append(self._samples_received[stream_id].pop())
+                    result.append(self._samples_received[stream_id].pop(0))
                     i += 1
 
                     if i >= sample_count:
@@ -616,6 +617,7 @@ class DatasetAgentTestCase(IonIntegrationTestCase):
             self.fail("Failed to read samples from stream %s", stream_name)
         finally:
             to.cancel()
+            return result
 
     ###
     #   Common assert methods
@@ -697,3 +699,42 @@ class DatasetAgentTestCase(IonIntegrationTestCase):
             state = self._dsa_client.get_agent_state()
 
         self.assertEqual(state, ResourceAgentState.UNINITIALIZED)
+
+    def assert_data_values(self, granules, dataset_definition_file):
+        """
+        Verify granules match the granules defined in the definition file
+        """
+        rs_file = self._get_source_data_file(dataset_definition_file)
+        rs = ResultSet(rs_file)
+
+        self.assertTrue(rs.verify(granules), msg="Failed data validation.  See log for details")
+
+    def assert_sample_queue_size(self, stream_name, size):
+        """
+        verify a sample queue is the size we expect it to be.
+        """
+        # Sleep a couple seconds to ensure the
+        gevent.sleep(2)
+
+        stream_id = self._stream_id_map.get(stream_name)
+        length = 0
+        if stream_id in self._samples_received:
+            length = len(self._samples_received[stream_id])
+        self.assertEqual(length, size, msg="Queue size != expected size (%d != %d)" % (length, size))
+
+    def assert_set_pubrate(self, rate):
+        """
+        Set the pubrate for the parsed data stream.  Set to 0 for
+        no buffering
+        """
+        self.assertIsInstance(rate, (int, float))
+        self.assertGreaterEqual(rate, 0)
+
+        expected_pubrate = {self.test_config.stream_name: rate}
+
+        retval = self._dsa_client.set_agent({'pubrate': expected_pubrate})
+
+        retval = self._dsa_client.get_agent(['pubrate'])
+        expected_pubrate_result = {'pubrate': expected_pubrate}
+        self.assertEqual(retval, expected_pubrate_result)
+
