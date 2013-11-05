@@ -391,6 +391,15 @@ class ScienceGranuleIngestionWorker(TransformStreamListener, BaseIngestionWorker
                 finally:
                     self._bad_coverages[stream_id] = 1
                     raise CorruptionError(e.message)
+            except IndexError as e:
+                log.error("Value set: %s", v[:])
+                data_products, _ = self.container.resource_registry.find_subjects(object=stream_id, predicate=PRED.hasStream, subject_type=RT.DataProduct)
+                for data_product in data_products:
+                    log.exception("Index exception with %s, trying to insert %s into coverage with shape %s", 
+                                  data_product.name,
+                                  k,
+                                  v.shape)
+
     
         if 'ingestion_timestamp' in coverage.list_parameters():
             t_now = time.time()
@@ -411,7 +420,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener, BaseIngestionWorker
         if not self.ignore_gaps:
             gap_found = self.has_gap(rdt.connection_id, rdt.connection_index)
             if gap_found:
-                log.error('Gap Found!   New connection: (%s,%s)\tOld Connection: (%s,%s)', rdt.connection_id, rdt.connection_index, self.connection_id, self.connection_index)
+                log.warning('Gap Found!   New connection: (%s,%s)\tOld Connection: (%s,%s)', rdt.connection_id, rdt.connection_index, self.connection_id, self.connection_index)
                 self.gap_coverage(stream_id)
 
 
