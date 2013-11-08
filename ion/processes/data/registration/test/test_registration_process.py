@@ -19,7 +19,7 @@ import os
 import gevent
 import numpy as np
 
-@attr('INT')
+@attr('INT', group='dm')
 class RegistrationProcessTest(IonIntegrationTestCase):
     def setUp(self):
         self._start_container()
@@ -55,7 +55,7 @@ class RegistrationProcessTest(IonIntegrationTestCase):
                 if n.attributes["name"].value == "institution":
                     self.assertEquals('OOI', n.childNodes[0].nodeValue)
                 if n.attributes["name"].value == "infoUrl":
-                    self.assertEquals(self.rp.pydap_url+cov.name, n.childNodes[0].nodeValue)
+                    self.assertIn(self.rp.pydap_url+cov.name, n.childNodes[0].nodeValue)
         parameters = []
         node = dom.getElementsByTagName('sourceName')
         for n in node:
