@@ -9,9 +9,11 @@ import copy
 from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
 from pyon.core.exception import BadRequest, NotFound
 from pyon.ion.resource import PRED, RT, OT
+from ion.core.ooiref import OOIReferenceDesignator
 
 from ooi.logging import log
 from pyon.util.containers import get_ion_ts
+from ion.services.sa.observatory.observatory_util import ObservatoryUtil
 
 import constraint
 
@@ -41,7 +43,7 @@ class DeploymentOperatorFactory(object):
         new_object_type = self.creation_type()
 
         # a bundled, integrated platform
-        if OT.RemotePlatformDeploymentContext == deployment_context_type:
+        if deployment_context_type in (OT.RemotePlatformDeploymentContext, OT.MobileAssetDeploymentContext):
             return new_object_type(self.clients,
                                    deployment_obj,
                                    allow_children=True,
@@ -53,7 +55,7 @@ class DeploymentOperatorFactory(object):
             return new_object_type(self.clients,
                                    deployment_obj,
                                    allow_children=True,
-                                   include_children=True,
+                                   include_children=False,
                                    RR2=self.RR2)
 
         # single node, with instruments optionally
@@ -61,7 +63,7 @@ class DeploymentOperatorFactory(object):
             return new_object_type(self.clients,
                                    deployment_obj,
                                    allow_children=True,
-                                   include_children=True,
+                                   include_children=False,
                                    RR2=self.RR2)
 
         raise BadRequest("Can't activate deployments of unimplemented context type '%s'" % deployment_context_type)
@@ -526,6 +528,7 @@ class DeploymentActivator(DeploymentOperator):
 
         self._hasdevice_associations_to_delete = []
         self._hasdevice_associations_to_create = []
+        self.outil = ObservatoryUtil(self, enhanced_rr=self.RR2)
 
     # these are the output accessors
     def hasdevice_associations_to_delete(self):
@@ -553,9 +556,12 @@ class DeploymentActivator(DeploymentOperator):
         Prepare (validate) a deployment for activation, returning lists of what associations need to be added
         and which ones need to be removed.
         """
-
-        #TODO: check for already deployed?
-
+        #retrieve the site tree information using the OUTIL functions; site info as well has site children
+        site_ids = self.RR2.find_subjects(subject_type=RT.PlatformSite, predicate=PRED.hasDeployment, object=self.deployment_obj._id, id_only=True)
+        if not site_ids:
+           site_ids = self.RR2.find_subjects(subject_type=RT.InstrumentSite, predicate=PRED.hasDeployment, object=self.deployment_obj._id, id_only=True)
+        if site_ids:
+            self.site_resources, self.site_children = self.outil.get_child_sites( parent_site_id=site_ids[0], id_only=False)
 
         log.debug("about to collect deployment components")
         self.resource_collector.collect()
@@ -599,7 +605,8 @@ class DeploymentActivator(DeploymentOperator):
         device_tree = self.resource_collector.collected_device_tree()
 
         merged_tree_pairs, leftover_devices = self._merge_trees(site_tree, device_tree)
-        if 0 < len(leftover_devices):
+
+        if leftover_devices:
             raise BadRequest("Merging site and device trees resulted in %s unassigned devices" % len(leftover_devices))
 
         return merged_tree_pairs
@@ -621,8 +628,6 @@ class DeploymentActivator(DeploymentOperator):
 
         portref_of_device = self.deployment_obj.port_assignments
 
-
-
         def _merge_helper(acc, site_ptr, dev_ptr, unmatched_list):
             """
             given 2 trees, try to match up all their children.  assume roots already matched
@@ -630,24 +635,50 @@ class DeploymentActivator(DeploymentOperator):
             dev_id  = dev_ptr["_id"]
             site_id = site_ptr["_id"]
             if not dev_ptr["model"] in site_ptr["models"]:
-                raise BadRequest("Attempted to assign device '%s' to a site that doesn't support its model" % dev_id)
+                log.warning("Attempted to assign device '%s' to a site '%s' that doesn't support its model", dev_id, site_id)
 
             if dev_id in unmatched_list: unmatched_list.remove(dev_id)
             acc.append((site_id, dev_id))
+            log.debug('Add to matched list  site_id:  %s   dev_id: %s', site_id, dev_id)
 
-            site_of_portref = dict([(v["uplink_port"], k) for k, v in site_ptr["children"].iteritems()])
+
+            site_of_portref = {}
+            #creat a dict of reference_designator on sites so that devices can be matched
+            dev_site_obj = self.site_resources[site_id]
+            site_of_portref[dev_site_obj.reference_designator] = site_id
+            if site_id in self.site_children:
+                for child in self.site_children[site_id]:
+                    dev_site_obj = self.site_resources[child]
+                    site_of_portref[dev_site_obj.reference_designator] = child
 
             for child_dev_id, child_dev_ptr in dev_ptr["children"].iteritems():
+
                 if not child_dev_id in portref_of_device:
-                    raise BadRequest("No reference_designator specified for device %s" % child_dev_id)
+                    log.warning("No platform port information specified for device %s" % child_dev_id)
                 dev_port = portref_of_device[child_dev_id]
-                if not dev_port in site_of_portref:
-                    raise BadRequest("Couldn't find a port on site %s (%s) called '%s'" % (site_ptr["name"],
-                                                                                           site_id,
-                                                                                           dev_port))
-                child_site_id = site_of_portref[dev_port]
-                child_site_ptr = site_ptr["children"][child_site_id]
-                acc, unmatched_list = _merge_helper(acc[:], child_site_ptr, child_dev_ptr, unmatched_list[:])
+
+                #check that a PlatformPort object is provided
+                if dev_port.type_ != OT.PlatformPort:
+                    log.warning("No platform port information specified for device %s" % child_dev_id)
+
+                ooi_rd = OOIReferenceDesignator(dev_port.reference_designator)
+                if ooi_rd.error:
+                   log.warning("Invalid OOIReferenceDesignator ( %s ) specified for device %s", dev_port.reference_designator, child_dev_id)
+                if not ooi_rd.port:
+                    log.warning("Invalid OOIReferenceDesignator ( %s ) specified for device %s, could not retrieve port", dev_port.reference_designator, child_dev_id)
+
+                if dev_port.reference_designator in site_of_portref:
+                    child_site_id = site_of_portref[dev_port.reference_designator]
+                    child_site_ptr = site_ptr["children"][child_site_id]
+                    acc, unmatched_list = _merge_helper(acc[:], child_site_ptr, child_dev_ptr, unmatched_list[:])
+
+                else:
+                    log.warning("Couldn't find a port on site %s (%s) called '%s'", site_ptr["name"],  site_id, dev_port)
+
+                    # this check is to match the ref_designator in the deployment object with the ref_designator in the target site
+                    #todo add ref_designators to the Sites in preload to match intended deployments
+
+
 
             return acc, unmatched_list
 

@@ -35,6 +35,7 @@ from ion.agents.platform.util.network_util import NetworkUtil
 from ion.agents.agent_alert_manager import AgentAlertManager
 
 from ion.agents.platform.platform_driver import PlatformDriverEvent, PlatformDriverState
+from ion.core.includes.mi import DriverEvent
 
 
 from pyon.util.containers import DotDict
@@ -423,10 +424,10 @@ class PlatformAgent(ResourceAgent):
 
         # get PlatformNode corresponding to this agent:
         self._pnode = self._network_definition.pnodes[self._platform_id]
-        if self._pnode.platform_id != self._platform_id:     
+        if self._pnode.platform_id != self._platform_id:
             msg = "PlatformAgent._validate_configuration: platform ID %r not equal to ID %r of node." % (self._platform_id, self._pnode.platform_id)
             log.error(msg)
-            
+
         log.debug("PlatformAgent._validate_configuration: self._pnode = %s" %self._pnode)
 
         self._children_resource_ids = self._get_children_resource_ids()
@@ -452,6 +453,11 @@ class PlatformAgent(ResourceAgent):
         #
         if 'ports' in self._driver_config:
             ports = self._driver_config['ports']
+
+            # Remove this device from the ports information, the driver does not use this
+            platform_port = self._driver_config['ports'].pop(self.resource_id, None)
+            log.debug('_validate_configuration removed platform port info from ports config for driver.  dev_id:  %s   platform_port: %s', self.resource_id, platform_port)
+
             self._platform_ports = ports
             log.debug("%r: platform ports taken from driver_config: %s",
                       self._platform_id, self._platform_ports)
@@ -506,7 +512,7 @@ class PlatformAgent(ResourceAgent):
             self._fsm.on_event(PlatformAgentEvent.LAUNCH_COMPLETE)
         except:
             log.exception("PlatformAgent %r: _children_launch greenlet, fsm exception for LAUNCH_COMPLETE event", self._platform_id)
-            
+
         log.info("PlatformAgent %r: _children_launch greenlet stopping", self._platform_id)
 
     def _get_children_resource_ids(self):
@@ -629,22 +635,25 @@ class PlatformAgent(ResourceAgent):
         self._configure_driver()
         log.debug("%r: _initialize_this_platform completed.", self._platform_id)
 
-    def _go_active_this_platform(self):
+    def _go_active_this_platform(self, recursion=None):
         """
         Connects the driver
         and resets stream publisher connection id and index.
         """
         log.debug("%r: triggering driver event CONNECT", self._platform_id)
-        self._trigger_driver_event(PlatformDriverEvent.CONNECT)
-        
+
+        kwargs = dict(recursion=recursion)
+        self._trigger_driver_event(PlatformDriverEvent.CONNECT, **kwargs)
+
         self._asp.reset_connection()
 
-    def _go_inactive_this_platform(self):
+    def _go_inactive_this_platform(self, recursion=None):
         """
         Disconnects the driver.
         """
         log.debug("%r: triggering driver event DISCONNECT")
-        self._trigger_driver_event(PlatformDriverEvent.DISCONNECT)
+        kwargs = dict(recursion=recursion)
+        self._trigger_driver_event(PlatformDriverEvent.DISCONNECT, **kwargs)
 
     def _run_this_platform(self):
         """
@@ -665,7 +674,7 @@ class PlatformAgent(ResourceAgent):
         log.debug("%r: resetting this platform", self._platform_id)
 
         if self._platform_resource_monitor:
-            self._stop_resource_monitoring()
+            self._stop_resource_monitoring(recursion=True)
 
         if self._plat_driver:
             # disconnect driver if connected:
@@ -677,7 +686,7 @@ class PlatformAgent(ResourceAgent):
             self._plat_driver.destroy()
             self._plat_driver = None
             self._resource_schema = {}
-            
+
         if self._asp:
             self._asp.reset()
 
@@ -868,7 +877,7 @@ class PlatformAgent(ResourceAgent):
 
         if self._platform_id is None:
             msg = "PlatformAgent._create_driver: must know platform_id to create driver"
-            log.error(msg)  
+            log.error(msg)
             raise CannotInstantiateDriverException(msg)
 
         if log.isEnabledFor(logging.DEBUG):
@@ -911,7 +920,7 @@ class PlatformAgent(ResourceAgent):
         if PlatformDriverState.DISCONNECTED != curr_state:
             msg = "PlatformAgent._configure_driver: expected driver state to be %s but got %s" % (
                   PlatformDriverState.DISCONNECTED, curr_state)
-            log.error(msg)  
+            log.error(msg)
             raise PlatformDriverException(msg)
 
         self._resource_schema = self._plat_driver.get_config_metadata()
@@ -927,7 +936,7 @@ class PlatformAgent(ResourceAgent):
         """
         if self._plat_driver is None:
             msg = "PlatformAgent._get_attribute_values: _create_driver must be called first"
-            log.error(msg)  
+            log.error(msg)
             raise PlatformDriverException(msg)
         kwargs = dict(attrs=attrs)
         result = self._plat_driver.get_resource(**kwargs)
@@ -936,7 +945,7 @@ class PlatformAgent(ResourceAgent):
     def _set_attribute_values(self, attrs):
         if self._plat_driver is None:
             msg = "PlatformAgent._set_attribute_values: _create_driver must be called first"
-            log.error(msg)  
+            log.error(msg)
             raise PlatformDriverException(msg)
         kwargs = dict(attrs=attrs)
         result = self._plat_driver.set_resource(**kwargs)
@@ -1184,19 +1193,31 @@ class PlatformAgent(ResourceAgent):
             log.debug("%r: _execute_agent: cmd=%r %s=%r ...",
                       self._platform_id, cmd.command, poi, sub_id)
 
-            time_start = time.time()
+        time_start = time.time()
+
+        if ResourceAgentEvent.has(cmd.command) or PlatformAgentEvent.has(cmd.command):
             retval = a_client.execute_agent(cmd, timeout=self._timeout)
+        elif DriverEvent.has(cmd.command) :
+            retval = a_client.execute_resource(cmd, timeout=self._timeout)
+        else:
+            log.error('_execute_agent invalid command: %s is not ResourceAgentEvent or DriverEvent', cmd)
+
+        if log.isEnabledFor(logging.DEBUG):
             elapsed_time = time.time() - time_start
             log.debug("%r: _execute_agent: cmd=%r %s=%r elapsed_time=%s",
                       self._platform_id, cmd.command, poi, sub_id, elapsed_time)
-        else:
-            retval = a_client.execute_agent(cmd, timeout=self._timeout)
 
         return retval
 
     def _get_recursion_parameter(self, method_name, *args, **kwargs):
         """
         Utility to extract the 'recursion' parameter.
+
+        @param method_name   for logging purposes
+        @param *args         as received by FSM handler (not used)
+        @param *kwargs       as received by FSM handler
+        @return              The boolean value of the 'recursion' parameter in
+                             kwargs; True by default.
         """
         recursion = kwargs.get('recursion', None)
         if recursion is None:
@@ -1552,7 +1573,7 @@ class PlatformAgent(ResourceAgent):
         """
         subplatform_ids = self._get_subplatform_ids()
         if set(subplatform_ids) != set(self._pa_clients.keys()) :
-            raise PlatformException("PlatformAgent._subplatforms_execute_agent: platform ids %s does not equal pa client ids %s ", 
+            raise PlatformException("PlatformAgent._subplatforms_execute_agent: platform ids %s does not equal pa client ids %s ",
                                     subplatform_ids, self._pa_clients.keys())
 
         children_with_errors = {}
@@ -1706,6 +1727,39 @@ class PlatformAgent(ResourceAgent):
 
         return children_with_errors
 
+    def _subplatforms_start_streaming(self):
+        """
+        Executes START_MONITORING with recursion=True on all my sub-platforms.
+
+        @return dict with children having caused some error. Empty if all
+                children were processed OK.
+        """
+        # pass recursion=True to each sub-platform
+        kwargs = dict(recursion=True)
+        cmd = AgentCommand(command=PlatformAgentEvent.START_MONITORING, kwargs=kwargs)
+        children_with_errors = self._subplatforms_execute_agent(
+            command=cmd,
+            expected_state=PlatformAgentState.MONITORING)
+
+        return children_with_errors
+
+    def _subplatforms_stop_streaming(self):
+        """
+        Executes STOP_MONITORING with recursion=True on all my sub-platforms.
+
+        @return dict with children having caused some error. Empty if all
+                children were processed OK.
+        """
+        # pass recursion=True to each sub-platform
+        kwargs = dict(recursion=True)
+        cmd = AgentCommand(command=PlatformAgentEvent.STOP_MONITORING, kwargs=kwargs)
+        children_with_errors = self._subplatforms_execute_agent(
+            command=cmd,
+            expected_state=PlatformAgentState.COMMAND)
+
+        return children_with_errors
+
+
     def _shutdown_and_terminate_subplatform(self, subplatform_id):
         """
         Executes SHUTDOWN with recursion=True on the given sub-platform and
@@ -1809,7 +1863,7 @@ class PlatformAgent(ResourceAgent):
         """
         subplatform_ids = self._get_subplatform_ids()
         if set(subplatform_ids) != set(self._pa_clients.keys()) :
-            raise PlatformException("PlatformAgent._subplatforms_shutdown_and_terminate: platform ids %s does not equal pa client ids %s ", 
+            raise PlatformException("PlatformAgent._subplatforms_shutdown_and_terminate: platform ids %s does not equal pa client ids %s ",
                                     subplatform_ids, self._pa_clients.keys())
 
         children_with_errors = {}
@@ -1970,7 +2024,7 @@ class PlatformAgent(ResourceAgent):
         if i_resource_id is None:
             log.error("PlatformAgent._launch_instrument_agent: agent.resource_id must be present for child %r" % instrument_id)
             return
-              
+
         if i_resource_id != instrument_id:
             log.error("PlatformAgent._launch_instrument_agent: agent.resource_id %r must be equal to %r" % (i_resource_id, instrument_id))
             return
@@ -2026,7 +2080,7 @@ class PlatformAgent(ResourceAgent):
 
             state = ia_client.get_agent_state()
             if ResourceAgentState.UNINITIALIZED != state:
-                log.error("PlatformAgent._launch_instrument_agent: child instrument %r started but state is not %s, it is %s" 
+                log.error("PlatformAgent._launch_instrument_agent: child instrument %r started but state is not %s, it is %s"
                           % (instrument_id, ResourceAgentState.UNINITIALIZED, state))
 
         # here, instrument agent process is running.
@@ -2105,7 +2159,7 @@ class PlatformAgent(ResourceAgent):
         """
         instrument_ids = self._get_instrument_ids()
         if set(instrument_ids) != set(self._ia_clients.keys()) :
-            raise PlatformException("PlatformAgent._instruments_execute_agent: instrument ids %s does not equal ia client ids %s ", 
+            raise PlatformException("PlatformAgent._instruments_execute_agent: instrument ids %s does not equal ia client ids %s ",
                                     instrument_ids, self._ia_clients.keys())
 
         children_with_errors = {}
@@ -2245,6 +2299,35 @@ class PlatformAgent(ResourceAgent):
 
         return children_with_errors
 
+
+    def _instruments_start_streaming(self):
+        """
+        Executes START_AUTOSAMPLE on all my instruments.
+
+        @return dict with children having caused some error. Empty if all
+                children were processed OK.
+        """
+
+        expected_state = None
+        children_with_errors = self._instruments_execute_agent(
+            command=DriverEvent.START_AUTOSAMPLE,
+            expected_state=expected_state)
+
+        return children_with_errors
+
+    def _instruments_stop_streaming(self):
+        """
+        Executes STOP_AUTOSAMPLE on all my instruments.
+
+        @return dict with children having caused some error. Empty if all
+                children were processed OK.
+        """
+        children_with_errors = self._instruments_execute_agent(
+            command=DriverEvent.STOP_AUTOSAMPLE,
+            expected_state=ResourceAgentState.COMMAND)
+
+        return children_with_errors
+
     def _shutdown_and_terminate_instrument(self, instrument_id):
         """
         Executes RESET on the instrument and then terminates it.
@@ -2349,7 +2432,7 @@ class PlatformAgent(ResourceAgent):
         """
         instrument_ids = self._get_instrument_ids()
         if set(instrument_ids) != set(self._ia_clients.keys()) :
-            raise PlatformException("PlatformAgent._instruments_shutdown_and_terminate: instrument ids %s does not equal ia client ids %s ", 
+            raise PlatformException("PlatformAgent._instruments_shutdown_and_terminate: instrument ids %s does not equal ia client ids %s ",
                                     instrument_ids, self._ia_clients.keys())
 
         instruments_with_errors = {}
@@ -2443,7 +2526,7 @@ class PlatformAgent(ResourceAgent):
                 #
                 # Do not proceed further with initialization of children.
                 #
-                msg = ("%r: exception while waiting for children to be launched. " 
+                msg = ("%r: exception while waiting for children to be launched. "
                        "Not proceeding with initialization of children." %self._platform_id)
                 log.exception(msg)
                 raise PlatformException(msg)
@@ -2476,7 +2559,7 @@ class PlatformAgent(ResourceAgent):
         """
 
         # first myself
-        self._go_active_this_platform()
+        self._go_active_this_platform(recursion=recursion)
 
         # then instruments and sub-platforms
         if recursion:
@@ -2537,7 +2620,7 @@ class PlatformAgent(ResourceAgent):
                             instruments_with_errors=instruments_with_errors)
 
         # then myself:
-        self._go_inactive_this_platform()
+        self._go_inactive_this_platform(recursion=recursion)
         return None
 
     def _run(self, recursion):
@@ -2804,17 +2887,45 @@ class PlatformAgent(ResourceAgent):
         self._clear_this_platform()
         return None
 
-    ##############################################################
-    # main operations *not* involving commands to child agents
-    ##############################################################
 
-    def _start_resource_monitoring(self):
+    def _start_resource_monitoring(self, recursion):
         """
         Starts resource monitoring.
+
+        STREAMING is dispatched in a bottom-up fashion:
+        - if recursion is True, "stream" the children
+        - then "stream" this platform itself.
+
+
+        @param recursion  If True, children are sent the START_STREAMING command
+                          (with corresponding recursion parameter set to True
+                           in the case of platforms).
+
+        @return None if all went ok; otherwise a dict
+                {"subplatforms_with_errors": dict, "instruments_with_errors": dict},
+                where each entry is a dict indicating any errors generated by
+                the corresp children.
         """
+
+
+        if recursion:
+            # first sub-platforms:
+            subplatforms_with_errors = self._subplatforms_start_streaming()
+
+            # we proceed with instruments even if some sub-platforms failed.
+
+            # then my own instruments:
+            instruments_with_errors = self._instruments_start_streaming()
+
+            if len(subplatforms_with_errors) or len(instruments_with_errors):
+                log.warning("%r: some sub-platforms or instruments failed to start streaming. "
+                          "subplatforms_with_errors=%s "
+                          "instruments_with_errors=%s",
+                          self._platform_id, subplatforms_with_errors, instruments_with_errors)
+
         if self._plat_driver is None:
             msg = "PlatformAgent._start_resource_monitoring: _create_driver must be called first"
-            log.error(msg)  
+            log.error(msg)
             raise PlatformDriverException(msg)
 
         self._platform_resource_monitor = PlatformResourceMonitor(
@@ -2823,14 +2934,30 @@ class PlatformAgent(ResourceAgent):
 
         self._platform_resource_monitor.start_resource_monitoring()
 
-    def _stop_resource_monitoring(self):
+    def _stop_resource_monitoring(self, recursion):
         """
         Stops resource monitoring.
         """
+
+        if recursion:
+            # first sub-platforms:
+            subplatforms_with_errors = self._subplatforms_stop_streaming()
+
+            # we proceed with instruments even if some sub-platforms failed.
+
+            # then my own instruments:
+            instruments_with_errors = self._instruments_stop_streaming()
+
+            if len(subplatforms_with_errors) or len(instruments_with_errors):
+                log.warning("%r: some sub-platforms or instruments failed to stop streaming. "
+                          "subplatforms_with_errors=%s "
+                          "instruments_with_errors=%s",
+                          self._platform_id, subplatforms_with_errors, instruments_with_errors)
+
         if self._platform_resource_monitor is None:
             log.error("PlatformAgent._stop_resource_monitoring: _start_resource_monitoring must be called first")
             return
-        
+
         self._platform_resource_monitor.destroy()
         self._platform_resource_monitor = None
 
@@ -2861,7 +2988,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_uninitialized_initialize", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_uninitialized_initialize", *args, **kwargs)
 
         next_state = PlatformAgentState.INACTIVE
         result = self._initialize(recursion)
@@ -2879,7 +3006,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_inactive_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_inactive_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -2896,7 +3023,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_inactive_go_active", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_inactive_go_active", *args, **kwargs)
 
         next_state = PlatformAgentState.IDLE
         result = self._go_active(recursion)
@@ -2914,7 +3041,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_idle_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_idle_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -2931,7 +3058,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_idle_go_inactive", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_idle_go_inactive", *args, **kwargs)
 
         next_state = PlatformAgentState.INACTIVE
         result = self._go_inactive(recursion)
@@ -2948,7 +3075,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_idle_run", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_idle_run", *args, **kwargs)
 
         next_state = PlatformAgentState.COMMAND
         result = self._run(recursion)
@@ -2966,7 +3093,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_stopped_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_stopped_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -2983,7 +3110,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                       self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_stopped_go_inactive", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_stopped_go_inactive", *args, **kwargs)
 
         next_state = PlatformAgentState.INACTIVE
         result = self._go_inactive(recursion)
@@ -3001,7 +3128,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_stopped_resume", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_stopped_resume", *args, **kwargs)
 
         next_state = PlatformAgentState.COMMAND
         result = self._resume(recursion)
@@ -3019,7 +3146,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_stopped_clear", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_stopped_clear", *args, **kwargs)
 
         next_state = PlatformAgentState.IDLE
         result = self._clear(recursion)
@@ -3040,7 +3167,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_command_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_command_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -3058,7 +3185,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_command_clear", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_command_clear", *args, **kwargs)
 
         next_state = PlatformAgentState.IDLE
         result = self._clear(recursion)
@@ -3076,7 +3203,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_command_pause", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_command_pause", *args, **kwargs)
 
         next_state = PlatformAgentState.STOPPED
         result = self._pause(recursion)
@@ -3193,8 +3320,10 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
+        recursion = self._get_recursion_parameter("_handler_start_resource_monitoring", *args, **kwargs)
+
         try:
-            result = self._start_resource_monitoring()
+            result = self._start_resource_monitoring(recursion)
 
             next_state = PlatformAgentState.MONITORING
 
@@ -3212,8 +3341,10 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
+        recursion = self._get_recursion_parameter("_handler_stop_resource_monitoring", *args, **kwargs)
+
         try:
-            result = self._stop_resource_monitoring()
+            result = self._stop_resource_monitoring(recursion)
 
             next_state = PlatformAgentState.COMMAND
 
@@ -3281,13 +3412,14 @@ class PlatformAgent(ResourceAgent):
             log.error("PlatformAgent._handler_lost_connection_autoreconnect: %r: Exception while trying CONNECT: %s", self._platform_id, e)
             return None, None
 
-        if driver_state != PlatformDriverState.CONNECTED: 
-            log.error("PlatformAgent._handler_lost_connection_autoreconnect: %r: driver state not %s, it is %s", 
+        if driver_state != PlatformDriverState.CONNECTED:
+            log.error("PlatformAgent._handler_lost_connection_autoreconnect: %r: driver state not %s, it is %s",
                       self._platform_id, PlatformDriverState.CONNECTED, driver_state)
             return None, None
 
         if self._state_when_lost == PlatformAgentState.MONITORING:
-            self._start_resource_monitoring()
+            recursion = self._get_recursion_parameter("_handler_lost_connection_autoreconnect", *args, **kwargs)
+            self._start_resource_monitoring(recursion)
 
         next_state = self._state_when_lost
 
@@ -3303,7 +3435,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                       self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_lost_connection_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_lost_connection_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -3320,7 +3452,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                       self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_lost_connection_go_inactive", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_lost_connection_go_inactive", *args, **kwargs)
 
         next_state = PlatformAgentState.INACTIVE
         result = self._go_inactive(recursion)
@@ -3347,7 +3479,7 @@ class PlatformAgent(ResourceAgent):
                   self._platform_id, self._state_when_lost)
 
         if self._platform_resource_monitor:
-            self._stop_resource_monitoring()
+            self._stop_resource_monitoring(recursion=False)
 
         return PlatformAgentState.LOST_CONNECTION, None
 
@@ -3358,7 +3490,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                       self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_shutdown", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_shutdown", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._shutdown(recursion)
@@ -3506,4 +3638,3 @@ class PlatformAgent(ResourceAgent):
         self._fsm.add_handler(PlatformAgentState.LOST_CONNECTION, PlatformAgentEvent.AUTORECONNECT, self._handler_lost_connection_autoreconnect)
         self._fsm.add_handler(PlatformAgentState.LOST_CONNECTION, PlatformAgentEvent.GO_INACTIVE, self._handler_lost_connection_go_inactive)
         self._fsm.add_handler(PlatformAgentState.LOST_CONNECTION, PlatformAgentEvent.GET_RESOURCE_STATE, self._handler_get_resource_state)
-

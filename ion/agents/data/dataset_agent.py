@@ -77,6 +77,9 @@ class DataSetAgent(InstrumentAgent):
 
         self._retry_calculator = FactorialRetryCalculator(60, 1.5, 3600)
 
+        # simulate compliance with platform agent - dict of aggregate statuses for all descendants
+        self.aparam_child_agg_status = {}
+
     ####
     ##    Response Handlers
     ####
@@ -190,8 +193,25 @@ class DataSetAgent(InstrumentAgent):
 
         egg_name = None
         egg_repo = None
+
         memento = self._get_state(DSA_STATE_KEY)
 
+        if memento:
+            # memento not empty, which is the case after restart. Just keep what we have.
+            log.info("Using process persistent state: %s", memento)
+        else:
+            # memento empty, which is the case after a fresh start. See if we got stuff in CFG
+
+            # Set state based on CFG using prior process' state
+            prior_state = self.CFG.get_safe("agent.prior_state")
+            if prior_state:
+                if isinstance(prior_state, dict):
+                    if DSA_STATE_KEY in prior_state:
+                        memento = prior_state[DSA_STATE_KEY]
+                        log.info("Using persistent state from prior agent run: %s", memento)
+                        self.persist_state_callback(memento)
+                else:
+                    raise InstrumentStateException('agent.prior_state invalid: %s' % prior_state)
 
         log.warn("Get driver object: %s, %s, %s, %s, %s", class_name, module_name, egg_name, egg_repo, memento)
         if uri:

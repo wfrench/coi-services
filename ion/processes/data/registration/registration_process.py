@@ -18,6 +18,7 @@ import os
 import urllib
 import xml.dom.minidom
 import StringIO
+import re
 
 class RegistrationProcess(StandaloneProcess):
 
@@ -35,6 +36,9 @@ class RegistrationProcess(StandaloneProcess):
         real_path = FileSystem.get_extended_url(base)
         self.datasets_xml_path = os.path.join(real_path, filename)
         self.setup_filesystem(real_path)
+
+
+        self.ux_url = self.CFG.get_safe('system.web_ui_url','http://localhost:3000/')
 
     def setup_filesystem(self, path):
         if os.path.exists(os.path.join(path,'datasets.xml')):
@@ -134,129 +138,153 @@ class RegistrationProcess(StandaloneProcess):
             if len(vars)==1:
                 raise BadRequest('A dataset needs a proper range, not just the temporal dimension. %s\n%s' %( coverage_path, cov))
 
-            if not (len(dims) == 1 and dims[0] == vars[0]):
-                dataset_element = doc.createElement('dataset')
-                dataset_element.setAttribute('type', 'EDDGridFromDap')
-                dataset_element.setAttribute('datasetID', product_id)
-                dataset_element.setAttribute('active', 'True')
+            dataset_element = doc.createElement('dataset')
+            #dataset_element.setAttribute('type', 'EDDGridFromDap')
+            dataset_element.setAttribute('type', 'EDDTableFromDapSequence')
+            dataset_element.setAttribute('datasetID', product_id)
+            dataset_element.setAttribute('active', 'True')
 
-                source_element = doc.createElement('sourceUrl')
-                text_node = doc.createTextNode(self.pydap_url + paths[1])
-                source_element.appendChild(text_node)
-                dataset_element.appendChild(source_element)
+            source_element = doc.createElement('sourceUrl')
+            text_node = doc.createTextNode(self.pydap_url + paths[1])
+            source_element.appendChild(text_node)
+            dataset_element.appendChild(source_element)
 
-                reload_element = doc.createElement('reloadEveryNMinutes')
-                if self.CFG.get_safe('server.erddap.dataset_caching',True):
-                    text_node = doc.createTextNode('1440')
-                else:
-                    text_node = doc.createTextNode('5')
-                reload_element.appendChild(text_node)
-                dataset_element.appendChild(reload_element)
+            reload_element = doc.createElement('reloadEveryNMinutes')
+            if self.CFG.get_safe('server.erddap.dataset_caching',True):
+                text_node = doc.createTextNode('1440')
+            else:
+                text_node = doc.createTextNode('5')
+            reload_element.appendChild(text_node)
+            dataset_element.appendChild(reload_element)
+            
+            outer_element = doc.createElement('outerSequenceName')
+            text_node = doc.createTextNode('data')
+            outer_element.appendChild(text_node)
+            dataset_element.appendChild(outer_element)
 
-                if self.CFG.get_safe('server.erddap.dataset_caching',True):
-                    refresh_interval = self.CFG.get_safe('server.erddap.refresh_interval', 30000)
-                    update_element = doc.createElement('updateEveryNMillis')
-                    text_node = doc.createTextNode(str(refresh_interval))
-                    update_element.appendChild(text_node)
-                    dataset_element.appendChild(update_element)
+            default_element = doc.createElement('defaultDataQuery')
+            text_node = doc.createTextNode('&amp;time&gt;=1970-01-01')
+            default_element.appendChild(text_node)
+            dataset_element.appendChild(default_element)
+
+            # No longer applicable
+            #if self.CFG.get_safe('server.erddap.dataset_caching',True):
+                #refresh_interval = self.CFG.get_safe('server.erddap.refresh_interval', 30000)
+                #update_element = doc.createElement('updateEveryNMillis')
+                #text_node = doc.createTextNode(str(refresh_interval))
+                #update_element.appendChild(text_node)
+                #dataset_element.appendChild(update_element)
+            
+
+            add_attributes_element = doc.createElement('addAttributes')
+
+            atts = {}
+            atts['title'] = product_name or urllib.unquote(cov.name)
+            atts['infoUrl'] = self.ux_url + 'DataProduct/face/' + product_id
+            atts['institution'] = 'OOI'
+            atts['Conventions'] = "COARDS, CF-1.6, Unidata Dataset Discovery v1.0"
+            atts['license'] = '''These data were collected by the Ocean Observatory Initiative (OOI) project purely for internal system development purposes during the construction phase of the project and are offered for release to the public with no assurance of data quality, consistency, temporal continuity or additional support. The OOI Program assumes no liability resulting from the use of these data for other than the intended purpose. No data quality assurance steps have been implemented on this data to date.'''
+            atts['summary'] = cov.name
+            atts['cdm_data_type'] = 'Other'
+            atts['standard_name_vocabulary'] = 'CF-12'
+            
+            for key, val in atts.iteritems():
+                att_element = doc.createElement('att')
+                att_element.setAttribute('name', key)
+                text_node = doc.createTextNode(val)
+                att_element.appendChild(text_node)
+                add_attributes_element.appendChild(att_element)
+
+            if len(add_attributes_element.childNodes) > 0:
+                dataset_element.appendChild(add_attributes_element)
+
+            for var_name in vars:
+                var = cov.get_parameter_context(var_name)
+                if re.match(r'.*_[a-z0-9]{32}', var.name):
+                    continue # Let's not do this
                 
+                units = "unknown"
+                if hasattr(var,'uom') and var.uom:
+                    units = var.uom
 
+                #if len(param.shape) >=1 and not param.is_coordinate: #dataVariable
+                data_element = doc.createElement('dataVariable')
+                source_name_element = doc.createElement('sourceName')
+                text_node = doc.createTextNode(var.name)
+                source_name_element.appendChild(text_node)
+                data_element.appendChild(source_name_element)
+
+                destination_name_element = doc.createElement('destinationName')
+                text_node = doc.createTextNode(erd_name_map[var.name])
+                destination_name_element.appendChild(text_node)
+                data_element.appendChild(destination_name_element)
+                
                 add_attributes_element = doc.createElement('addAttributes')
+                if var.ATTRS is not None:
+                    for key in var.ATTRS:
+                        if not hasattr(var,key):
+                            continue
+                        val = getattr(var,key)
+                        if not val:
+                            val = ''
+                        att_element = doc.createElement('att')
+                        att_element.setAttribute('name', key)
+                        text_node = doc.createTextNode(val)
+                        att_element.appendChild(text_node)
+                        add_attributes_element.appendChild(att_element)
 
-                atts = {}
-                atts['title'] = product_name or urllib.unquote(cov.name)
-                atts['infoUrl'] = self.pydap_url + paths[1]
-                atts['institution'] = 'OOI'
-                atts['Conventions'] = "COARDS, CF-1.6, Unidata Dataset Discovery v1.0"
-                atts['license'] = '[standard]'
-                atts['summary'] = cov.name
-                atts['cdm_data_type'] = 'Grid'
-                atts['standard_name_vocabulary'] = 'CF-12'
+                att_element = doc.createElement('att')
+                att_element.setAttribute('name', 'ioos_category')
+                text_node = doc.createTextNode(self.get_ioos_category(var.name, units))
+                att_element.appendChild(text_node)
+                add_attributes_element.appendChild(att_element)
+
+                att_element = doc.createElement('att')
+                att_element.setAttribute('name', 'long_name')
+                long_name = ""
+                if hasattr(var,'display_name') and var.display_name is not None:
+                    long_name = var.display_name
+                    text_node = doc.createTextNode(long_name)
+                    att_element.appendChild(text_node)
+                    add_attributes_element.appendChild(att_element)
                 
-                for key, val in atts.iteritems():
+                att_element = doc.createElement('att')
+                standard_name = ""
+                if hasattr(var,'standard_name') and var.standard_name is not None:
+                    standard_name = var.standard_name
+                    att_element.setAttribute('name', 'standard_name')
+                    text_node = doc.createTextNode(standard_name)
+                    att_element.appendChild(text_node)
+                    add_attributes_element.appendChild(att_element)
+                
+
+                if 'seconds' in units and 'since' in units:
                     att_element = doc.createElement('att')
-                    att_element.setAttribute('name', key)
-                    text_node = doc.createTextNode(val)
+                    att_element.setAttribute('name', 'time_precision')
+                    text_node = doc.createTextNode('1970-01-01T00:00:00.000Z')
                     att_element.appendChild(text_node)
                     add_attributes_element.appendChild(att_element)
 
-                if len(add_attributes_element.childNodes) > 0:
-                    dataset_element.appendChild(add_attributes_element)
+                att_element = doc.createElement('att')
+                att_element.setAttribute('name', 'units')
+                text_node = doc.createTextNode(units)
+                att_element.appendChild(text_node)
+                add_attributes_element.appendChild(att_element)
 
-                for var_name in vars:
-                    var = cov.get_parameter_context(var_name)
-                    
-                    units = "unknown"
-                    if hasattr(var,'uom') and var.uom:
-                        units = var.uom
+                data_element.appendChild(add_attributes_element)
+                dataset_element.appendChild(data_element)
 
-                    #if len(param.shape) >=1 and not param.is_coordinate: #dataVariable
-                    data_element = doc.createElement('dataVariable')
-                    source_name_element = doc.createElement('sourceName')
-                    text_node = doc.createTextNode(var.name)
-                    source_name_element.appendChild(text_node)
-                    data_element.appendChild(source_name_element)
-
-                    destination_name_element = doc.createElement('destinationName')
-                    text_node = doc.createTextNode(erd_name_map[var.name])
-                    destination_name_element.appendChild(text_node)
-                    data_element.appendChild(destination_name_element)
-                    
-                    add_attributes_element = doc.createElement('addAttributes')
-                    if var.ATTRS is not None:
-                        for key in var.ATTRS:
-                            if not hasattr(var,key):
-                                continue
-                            val = getattr(var,key)
-                            if not val:
-                                val = ''
-                            att_element = doc.createElement('att')
-                            att_element.setAttribute('name', key)
-                            text_node = doc.createTextNode(val)
-                            att_element.appendChild(text_node)
-                            add_attributes_element.appendChild(att_element)
-
-                    att_element = doc.createElement('att')
-                    att_element.setAttribute('name', 'ioos_category')
-                    text_node = doc.createTextNode(self.get_ioos_category(var.name, units))
-                    att_element.appendChild(text_node)
-                    add_attributes_element.appendChild(att_element)
-
-                    att_element = doc.createElement('att')
-                    att_element.setAttribute('name', 'long_name')
-                    long_name = ""
-                    if hasattr(var,'display_name') and var.display_name is not None:
-                        long_name = var.display_name
-                        text_node = doc.createTextNode(long_name)
-                        att_element.appendChild(text_node)
-                        add_attributes_element.appendChild(att_element)
-                    
-                    att_element = doc.createElement('att')
-                    standard_name = ""
-                    if hasattr(var,'standard_name') and var.standard_name is not None:
-                        standard_name = var.standard_name
-                        att_element.setAttribute('name', 'standard_name')
-                        text_node = doc.createTextNode(standard_name)
-                        att_element.appendChild(text_node)
-                        add_attributes_element.appendChild(att_element)
-                    
-
-                    att_element = doc.createElement('att')
-                    att_element.setAttribute('name', 'units')
-                    text_node = doc.createTextNode(units)
-                    att_element.appendChild(text_node)
-                    add_attributes_element.appendChild(att_element)
-
-                    data_element.appendChild(add_attributes_element)
-                    dataset_element.appendChild(data_element)
-
-                index += 1
-                #bug with prettyxml
-                #http://ronrothman.com/public/leftbraned/xml-dom-minidom-toprettyxml-and-silly-whitespace/
-                result += dataset_element.toprettyxml() + '\n'
-                #result += dataset_element.toxml() + '\n'
+            index += 1
+            #bug with prettyxml
+            #http://ronrothman.com/public/leftbraned/xml-dom-minidom-toprettyxml-and-silly-whitespace/
+            result += dataset_element.toprettyxml() + '\n'
+            #result += dataset_element.toxml() + '\n'
 
         cov.close()
+
+        if not result:
+            log.error("Attempted to register empty dataset\nDims: %s\nDatasets: %s", dims, datasets)
+
 
         return result
 
