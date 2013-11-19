@@ -66,3 +66,6 @@ class HypmCTDTest(DatasetAgentTestCase):
         self.assert_sample_queue_size(self.test_config.stream_name, 0)
 
         self.assert_reset()
+
+    def test_capabilities(self):
+        self.assert_agent_capabilities()

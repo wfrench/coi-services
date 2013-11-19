@@ -629,6 +629,14 @@ class DatasetAgentTestCase(IonIntegrationTestCase):
             to.cancel()
             return result
 
+    def remove_sample_dir(self):
+        """
+        Remove the sample dir and all files
+        """
+        data_dir = self.create_data_dir()
+        self.clear_sample_data()
+        os.rmdir(data_dir)
+
     ###
     #   Common assert methods
     ###
@@ -764,9 +772,9 @@ class DatasetAgentTestCase(IonIntegrationTestCase):
         @param args: kwargs to pass to the agent command object
         """
         cmd = AgentCommand(command=command, kwargs=args)
-        retval = self._dsa_clientt.execute_resource(cmd)
+        retval = self._dsa_client.execute_resource(cmd)
 
-    def test_capabilities(self):
+    def assert_agent_capabilities(self):
         """
         Verify capabilities throughout the agent lifecycle
         """
