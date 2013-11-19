@@ -17,9 +17,11 @@ from ion.services.dm.utility.hydrophone_simulator import HydrophoneSimulator
 from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 from nose.plugins.attrib import attr
 from pyon.util.breakpoint import breakpoint
+from pyon.util.file_sys import FileSystem
 from pyon.public import IonObject, RT, CFG
 from pyon.util.containers import DotDict
 from pydap.client import open_url
+import os
 import unittest
 import numpy as np
 import time
@@ -43,19 +45,23 @@ class TestDMExtended(DMTestCase):
 
 
         rdt = self.ph.get_rdt(stream_def_id)
-        rdt['time'] = np.arange(20)
-        rdt['temp'] = np.arange(20)
+        t = np.arange(3600)
+        np.random.shuffle(t)
+        rdt['time'] = t
+        rdt['temp'] = np.arange(3600)
         dataset_monitor = DatasetMonitor(dataset_id)
         self.addCleanup(dataset_monitor.stop)
         self.ph.publish_rdt_to_data_product(data_product_id,rdt)
         dataset_monitor.event.wait(10)
 
-        from pydap.client import open_url
+        #from pydap.client import open_url
         pydap_host = CFG.get_safe('server.pydap.host','localhost')
         pydap_port = CFG.get_safe('server.pydap.port',8001)
         url = 'http://%s:%s/%s' %(pydap_host, pydap_port, dataset_id)
         ds = open_url(url)
-        ds['temp']['temp'][:]
+
+        breakpoint(locals(), globals())
+        #ds['temp']['temp'][:]
 
     def make_array_data_product(self):
         pdict_id = self.ph.crete_simple_array_pdict()
@@ -138,7 +144,6 @@ class TestDMExtended(DMTestCase):
         self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
         self.container.spawn_process('import_dataset', 'ion.processes.data.import_dataset', 'ImportDataset', {'op':'load', 'instrument':'CTDPF'})
 
-
     def preload_lctest(self):
         config = DotDict()
         config.op = 'load'
@@ -161,6 +166,22 @@ class TestDMExtended(DMTestCase):
         config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary'
         self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
 
+    def preload_ctdgv(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,GLIDER,CTDGV,CTDGV01'
+        config.path = 'master'
+        #config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary,StreamDefinition,DataProduct'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+        self.container.spawn_process('import_dataset', 'ion.processes.data.import_dataset', 'ImportDataset', {'op':'load', 'instrument':'CTDGV'})
+
+    def stop_ctdgv(self):
+        self.container.spawn_process('import_dataset', 'ion.processes.data.import_dataset', 'ImportDataset', {'op':'stop', 'instrument':'CTDGV'})
+
+
     def preload_ui(self):
         config = DotDict()
         config.op='loadui'
@@ -169,8 +190,26 @@ class TestDMExtended(DMTestCase):
         config.ui_path = "http://userexperience.oceanobservatories.org/database-exports/Candidates"
         
         self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
-
     
+    def launch_ui_facepage(self, data_product_id):
+        '''
+        Opens the UI face page on localhost for a particular data product
+        '''
+        from subprocess import call
+        call(['open', 'http://localhost:3000/DataProduct/face/%s/' % data_product_id])
+
+    def strap_erddap(self):
+        '''
+        Copies the datasets.xml to /tmp
+        '''
+        from shutil import copyfile
+        datasets_xml_path = CFG.get_safe('server.pydap.datasets_xml_path', "RESOURCE:ext/datasets.xml")
+        filename = datasets_xml_path.split('/')[-1]
+        base = '/'.join(datasets_xml_path.split('/')[:-1])
+        real_path = FileSystem.get_extended_url(base)
+        real_path = os.path.join(real_path,filename)
+        copyfile(real_path, '/tmp/datasets.xml')
+
     def create_google_dt_workflow_def(self):
         # Check to see if the workflow defnition already exist
         workflow_def_ids,_ = self.resource_registry.find_resources(restype=RT.WorkflowDefinition, name='Realtime_Google_DT', id_only=True)
@@ -247,7 +286,7 @@ class TestDMExtended(DMTestCase):
         dataset_id = self.RR2.find_dataset_id_of_data_product_using_has_dataset(data_product_id)
 
 
-        breakpoint(locals())
+        breakpoint(locals(), globals())
 
 
     @attr('UTIL')
@@ -520,23 +559,39 @@ class TestDMExtended(DMTestCase):
 
         breakpoint(locals())
 
-    @attr("UTIL")
-    def test_ctdpf(self):
+    def extract_static_dataset(self, key):
+        dsatest_dir = '/tmp/dsatest'
+        static_files = {
+                'ctdpf':'test_data/ctdpf_example.zip',
+                'ctdgv':'test_data/glider_data_files.zip'
+                }
         import os
         #import shutil
         from zipfile import ZipFile
-        if not os.path.exists('/tmp/dsatest'):
-            os.makedirs('/tmp/dsatest')
+        if not os.path.exists(dsatest_dir):
+            os.makedirs(dsatest_dir)
 
-        with ZipFile('test_data/ctdpf_example.zip','r') as zf:
+        with ZipFile(static_files[key],'r') as zf:
             for f in zf.infolist():
-                zf.extract(f, '/tmp/dsatest')
+                zf.extract(f, dsatest_dir)
+
+    @attr("UTIL")
+    def test_ctdpf(self):
+        self.extract_static_dataset('ctdpf')
         self.preload_ctdpf()
         data_product_ids, _ = self.container.resource_registry.find_resources_ext(alt_id='DPROD100', alt_id_ns='PRE')
         data_product_id = data_product_ids[0]
         dataset_id = self.RR2.find_dataset_id_of_data_product_using_has_dataset(data_product_id)
         breakpoint(locals(), globals())
 
+    @attr("UTIL")
+    def test_ctdgv(self):
+        self.extract_static_dataset('ctdgv')
+        self.preload_ctdgv()
+        data_product_ids, _ = self.container.resource_registry.find_resources_ext(alt_id='DPROD118', alt_id_ns='PRE')
+        data_product_id = data_product_ids[0]
+        dataset_id = self.RR2.find_dataset_id_of_data_product_using_has_dataset(data_product_id)
+        breakpoint(locals(), globals())
 
     @attr("UTIL")
     def test_out_of_order(self):
@@ -644,6 +699,60 @@ class TestDMExtended(DMTestCase):
         np.testing.assert_array_equal(temp_values, np.array(['0.0,1.0,2.0,3.0']))
 
     @attr('INT')
+    def test_ingest_metadata(self):
+        data_product_id = self.make_ctd_data_product()
+        dataset_id = self.RR2.find_dataset_id_of_data_product_using_has_dataset(data_product_id)
+        dataset_monitor = DatasetMonitor(dataset_id)
+        self.addCleanup(dataset_monitor.stop)
+
+        rdt = self.ph.rdt_for_data_product(data_product_id)
+        rdt['time'] = np.arange(30)
+        rdt['temp'] = np.arange(30)
+        self.ph.publish_rdt_to_data_product(data_product_id, rdt)
+        self.assertTrue(dataset_monitor.event.wait(10))
+        dataset_monitor.event.clear()
+
+        object_store = self.container.object_store
+        metadata_doc = object_store.read_doc(dataset_id)
+        self.assertIn('bounds', metadata_doc)
+        bounds = metadata_doc['bounds']
+        self.assertEquals(bounds['time'], [0, 29])
+        self.assertEquals(bounds['temp'], [0, 29])
+
+        rdt = self.ph.rdt_for_data_product(data_product_id)
+        rdt['time'] = [-15, -1, 20, 40]
+        rdt['temp'] = [-1, 0, 0, 0]
+        self.ph.publish_rdt_to_data_product(data_product_id, rdt)
+        self.assertTrue(dataset_monitor.event.wait(10))
+        dataset_monitor.event.clear()
+        
+        metadata_doc = object_store.read_doc(dataset_id)
+        self.assertIn('bounds', metadata_doc)
+        bounds = metadata_doc['bounds']
+        self.assertEquals(bounds['time'], [-15, 40])
+        self.assertEquals(bounds['temp'], [-1, 29])
+
+        bounds = self.dataset_management.dataset_bounds(dataset_id)
+        self.assertEquals(bounds['time'], [-15, 40])
+        self.assertEquals(bounds['temp'], [-1, 29])
+        bounds = self.dataset_management.dataset_bounds(dataset_id, ['temp'])
+        self.assertEquals(bounds['temp'], [-1, 29])
+        assert 'time' not in bounds
+        tmin, tmax = self.dataset_management.dataset_bounds_by_axis(dataset_id, 'temp')
+        self.assertEquals([tmin,tmax], [-1, 29])
+        tmin, tmax = self.dataset_management.dataset_temporal_bounds(dataset_id)
+        self.assertEquals([tmin,tmax], [-15 - 2208988800, 40 - 2208988800])
+
+        extents = self.dataset_management.dataset_extents(dataset_id)
+        self.assertEquals(extents['time'], 34)
+        self.assertEquals(extents['temp'], 34)
+
+        extent = self.dataset_management.dataset_extents_by_axis(dataset_id, 'time')
+        self.assertEquals(extent, 34)
+        self.preload_ui()
+        self.launch_ui_facepage(data_product_id)
+
+    @attr('INT')
     def test_ccov_domain_slicing(self):
         '''
         Verifies that the complex coverage can handle slicing across the domain instead of the range
@@ -711,16 +820,20 @@ class TestDMExtended(DMTestCase):
         data_product_id = self.make_ctd_data_product()
         dataset_id = self.RR2.find_dataset_id_of_data_product_using_has_dataset(data_product_id)
 
-        cov = DatasetManagementService._get_simplex_coverage(dataset_id)
-        cov.insert_timesteps(22000)
-        value_array = np.arange(22000)
-        cov.set_parameter_values('time', value_array)
+        cov = DatasetManagementService._get_simplex_coverage(dataset_id, mode='w')
+        size = 3600 * 24 * 7
+        cov.insert_timesteps(size)
+        value_array = np.arange(size)
+        random_array = np.arange(size)
+        np.random.shuffle(random_array)
+        cov.set_parameter_values('time', random_array)
         cov.set_parameter_values('temp', value_array)
         cov.set_parameter_values('conductivity', value_array)
         cov.set_parameter_values('pressure', value_array)
 
 
         #self.data_retriever.retrieve(dataset_id)
+        self.strap_erddap()
         breakpoint(locals(), globals())
 
 
@@ -766,8 +879,6 @@ class TestDMExtended(DMTestCase):
         self.assertTrue(dataset_monitor.event.wait(30))
         dataset_monitor.event.clear()
 
-
-
     @attr("UTIL")
     def test_sptest(self):
         self.preload_sptest()
@@ -777,3 +888,13 @@ class TestDMExtended(DMTestCase):
         data_product_id = self.create_data_product('CTDBP-NO Parsed', stream_def_id=stream_def_id)
         self.activate_data_product(data_product_id)
         breakpoint(locals(), globals())
+
+    @attr("INT")
+    def test_empty_dataset(self):
+        data_product_id = self.make_ctd_data_product()
+
+        dataset_id = self.RR2.find_dataset_id_of_data_product_using_has_dataset(data_product_id)
+
+        bounds = self.dataset_management.dataset_temporal_bounds(dataset_id)
+        self.assertEquals(bounds, {})
+

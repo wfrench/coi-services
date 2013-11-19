@@ -343,14 +343,33 @@ class InstrumentManagementService(BaseInstrumentManagementService):
                 raise
             self.RR2.update(producer_obj)
 
+    def _assert_persistence_on(self, config_builder):
+        if not config_builder or RT.DataProduct not in config_builder.associated_objects:
+           return
+        data_products = config_builder.associated_objects[RT.DataProduct]
+        parsed_dp_id = None
+        for dp in data_products:
+            if dp.processing_level_code == "Parsed":
+                parsed_dp_id = dp._id
+                break
+        if parsed_dp_id:
+            if not self.DPMS.is_persisted(parsed_dp_id):
+                raise BadRequest("Cannot start agent - data product persistence is not activated!")
+        else:
+            log.warn("Cannot determine if persistence is activated for agent instance=%s", config_builder.agent_instance_obj._id)
 
     def start_instrument_agent_instance(self, instrument_agent_instance_id=''):
         """
         Agent instance must first be created and associated with a instrument device
-        Launch the instument agent instance and return the id
+        Launch the instrument agent instance and return the id
         """
-
-        instrument_agent_instance_obj = self.read_instrument_agent_instance(instrument_agent_instance_id)
+        instrument_agent_instance_obj = self.RR2.read(instrument_agent_instance_id)
+        if instrument_agent_instance_obj.type_ == RT.ExternalDatasetAgentInstance:
+            log.info("IMS.start_instrument_agent_instance() is=%s is ExternalDatasetAgentInstance - forwarding to DAMS", instrument_agent_instance_id)
+            return self.DAMS.start_external_dataset_agent_instance(instrument_agent_instance_id)
+        elif instrument_agent_instance_obj.type_ != RT.InstrumentAgentInstance:
+            raise BadRequest("Expected a InstrumentAgentInstance for the resource %s, but received type %s" %
+                            (instrument_agent_instance_id, instrument_agent_instance_obj.type_))
 
         # launch the port agent before verifying anything.
         # if agent instance doesn't validate, port agent won't care and will be available for when it does validate
@@ -375,23 +394,20 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             log.error('failed to launch', exc_info=True)
             raise ServerError('failed to launch')
 
-        #save the config into spawn_config which will be passed to the agent by the container.
+        # Check that persistence is on
+        self._assert_persistence_on(config_builder)
+
+        # Save the config into an object in the object store which will be passed to the agent by the container.
         config_builder.record_launch_parameters(config)
 
-        config_ref = "resources:%s/agent_spawn_config" % instrument_agent_instance_id
-        launch_config = {'process':{'config_ref':config_ref}}
-
-        process_id = launcher.launch(launch_config, config_builder._get_process_definition()._id)
+        process_id = launcher.launch(config, config_builder._get_process_definition()._id)
         if not process_id:
             raise ServerError("Launched instrument agent instance but no process_id")
 
-
         # reload resource as it has been updated by the launch function
-        instrument_agent_instance_obj = self.RR2.read(instrument_agent_instance_id)
+        #instrument_agent_instance_obj = self.RR2.read(instrument_agent_instance_id)
 
-
-        self.record_instrument_producer_activation(config_builder._get_device()._id, instrument_agent_instance_obj.agent_config)
-
+        self.record_instrument_producer_activation(config_builder._get_device()._id, config)
 
         launcher.await_launch(self._agent_launch_timeout("start_instrument_agent_instance"))
 
@@ -515,15 +531,24 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         """
         Deactivate the instrument agent instance
         """
+        instrument_agent_instance_obj = self.RR2.read(instrument_agent_instance_id)
+        if instrument_agent_instance_obj.type_ == RT.ExternalDatasetAgentInstance:
+            log.info("IMS.stop_instrument_agent_instance() id=%s is ExternalDatasetAgentInstance - forwarding to DAMS", instrument_agent_instance_id)
+            return self.DAMS.stop_external_dataset_agent_instance(instrument_agent_instance_id)
+        elif instrument_agent_instance_obj.type_ != RT.InstrumentAgentInstance:
+            raise BadRequest("Expected a InstrumentAgentInstance for the resource %s, but received type %s" %
+                            (instrument_agent_instance_id, instrument_agent_instance_obj.type_))
+
         try:
-            instance_obj, device_id = self.stop_agent_instance(instrument_agent_instance_id, RT.InstrumentDevice)
+            instance_obj, device_id = self._stop_agent_instance(instrument_agent_instance_id,
+                                                                RT.InstrumentDevice, instrument_agent_instance_obj)
 
         except BadRequest as e:
             #
             # stopping the instrument agent instance failed, but try at least
             # to stop the port agent:
             #
-            log.error("Exception in stop_agent_instance: %s", e)
+            log.error("Exception in _stop_agent_instance: %s", e)
             log.debug("Trying to stop the port agent anyway ...")
             instance_obj = self.RR2.read(instrument_agent_instance_id)
             self._stop_port_agent(instance_obj.port_agent_config)
@@ -540,12 +565,12 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             self.RR2.update(producer_obj)
 
 
-
-    def stop_agent_instance(self, agent_instance_id, device_type):
+    def _stop_agent_instance(self, agent_instance_id, device_type, agent_instance_obj=None):
         """
         Deactivate an agent instance, return device ID
         """
-        agent_instance_obj = self.RR2.read(agent_instance_id)
+        if agent_instance_obj is None:
+            agent_instance_obj = self.RR2.read(agent_instance_id)
 
         device_id = self.RR2.find_subject(subject_type=device_type,
                                           predicate=PRED.hasAgentInstance,
@@ -572,6 +597,13 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         if "pagent_pid" in agent_instance_obj.driver_config:
             agent_instance_obj.driver_config['pagent_pid'] = None
         self.RR2.update(agent_instance_obj)
+
+        try:
+            obj_id = "agent_spawncfg_%s" % agent_instance_id
+            self.container.object_store.delete_doc(obj_id)
+        except Exception as ex:
+            log.warn("Cannot delete agent spawn config for instance %s: %s", agent_instance_id, ex)
+
 
         return agent_instance_obj, device_id
 
@@ -946,10 +978,17 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         Agent instance must first be created and associated with a platform device
         Launch the platform agent instance and return the id
         """
+        platform_agent_instance_obj = self.RR2.read(platform_agent_instance_id)
+        if platform_agent_instance_obj.type_ == RT.ExternalDatasetAgentInstance:
+            log.info("IMS.start_platform_agent_instance() id=%s with ExternalDatasetAgentInstance - forwarding to DAMS", platform_agent_instance_id)
+            return self.DAMS.start_external_dataset_agent_instance(platform_agent_instance_id)
+        elif platform_agent_instance_obj.type_ != RT.PlatformAgentInstance:
+            raise BadRequest("Expected a InstrumentAgentInstance for the resource %s, but received type %s" %
+                            (platform_agent_instance_id, platform_agent_instance_obj.type_))
+
         configuration_builder = PlatformAgentConfigurationBuilder(self.clients)
         launcher = AgentLauncher(self.clients.process_dispatcher)
 
-        platform_agent_instance_obj = self.read_platform_agent_instance(platform_agent_instance_id)
 
         configuration_builder.set_agent_instance_object(platform_agent_instance_obj)
         config = configuration_builder.prepare()
@@ -958,31 +997,28 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         log.debug("start_platform_agent_instance: device is %s connected to platform agent instance %s (L4-CI-SA-RQ-363)",
                   str(platform_device_obj._id),  str(platform_agent_instance_id))
 
-        #retrive the stream info for this model
-        #todo: add stream info to the platform model create
-        #        streams_dict = platform_model_obj.custom_attributes['streams']
-        #        if not streams_dict:
-        #            raise BadRequest("Device model does not contain stream configuation used in launching the agent. Model: '%s", str(platform_models_objs[0]) )
-
-        #save the config into spawn_config which will be passed to the agent by the container.
+        # Save the config into an object in the object store which will be passed to the agent by the container.
         configuration_builder.record_launch_parameters(config)
 
-        config_ref = "resources:%s/agent_spawn_config" % platform_agent_instance_id
-        launch_config = {'process':{'config_ref':config_ref}}
-
-        process_id = launcher.launch(launch_config, configuration_builder._get_process_definition()._id)
+        process_id = launcher.launch(config, configuration_builder._get_process_definition()._id)
 
         launcher.await_launch(self._agent_launch_timeout("start_platform_agent_instance"))
 
         return process_id
 
-
-
     def stop_platform_agent_instance(self, platform_agent_instance_id=''):
         """
         Deactivate the platform agent instance
         """
-        self.stop_agent_instance(platform_agent_instance_id, RT.PlatformDevice)
+        platform_agent_instance_obj = self.RR2.read(platform_agent_instance_id)
+        if platform_agent_instance_obj.type_ == RT.ExternalDatasetAgentInstance:
+            log.info("IMS.stop_platform_agent_instance() id=%s is ExternalDatasetAgentInstance - forwarding to DAMS", platform_agent_instance_id)
+            return self.DAMS.stop_external_dataset_agent_instance(platform_agent_instance_id)
+        elif platform_agent_instance_obj.type_ != RT.PlatformAgentInstance:
+            raise BadRequest("Expected a InstrumentAgentInstance for the resource %s, but received type %s" %
+                            (platform_agent_instance_id, platform_agent_instance_obj.type_))
+
+        self._stop_agent_instance(platform_agent_instance_id, RT.PlatformDevice, platform_agent_instance_obj)
 
 
 
@@ -1560,14 +1596,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         # retrieve the statuses for the instrument
         self.agent_status_builder.add_device_rollup_statuses_to_computed_attributes(instrument_device_id,
                                                                                     extended_instrument.computed)
-        #TODO: THIS SHOULD BE REFACTORED IN R3 when devices are aligned!!!
-        #if there is no instrument agent then check if there is a dataset agent linked and put that link in this slot
-        if not extended_instrument.instrument_agent and extended_instrument.instrument_model:
-            datasetagent_objs, _ = self.clients.resource_registry.find_subjects(subject_type=RT.ExternalDatasetAgent, predicate=PRED.hasModel, object=extended_instrument.instrument_model, id_only=False)
-            if datasetagent_objs:
-                extended_instrument.instrument_agent = datasetagent_objs[0]
-
-        #retrieve the aggregate status for the instrument
+        # retrieve the aggregate status for the instrument
         status_values = [ extended_instrument.computed.communications_status_roll_up,
                           extended_instrument.computed.data_status_roll_up,
                           extended_instrument.computed.location_status_roll_up,
@@ -1586,15 +1615,10 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             t.complete_step('ims.instrument_device_extension.deploy')
             stats.add(t)
 
-        # Fix OOIION-1356. Agent instance contains very large stream and parameter info, unused in the UI.
-        if extended_instrument.agent_instance:
-            extended_instrument.agent_instance.agent_spawn_config = {}
-            extended_instrument.agent_instance.agent_config = {}
-
         return extended_instrument
 
 
-    #functions for INSTRUMENT computed attributes -- currently bogus values returned
+    # functions for INSTRUMENT computed attributes -- currently bogus values returned
 
     def get_last_data_received_datetime(self, instrument_device_id):
         # not currently available from device or agent
@@ -1803,6 +1827,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             extended_platform.connected_device_info.append(info_dict)
 
         # JIRA OOIION948: REMOVE THIS BLOCK WHEN FIXED
+        # Note: probably fixed by now, add back special decorator
         # add portals, sites related to platforms (SHOULD HAPPEN AUTOMATICALLY USING THE COMPOUND ASSOCIATION)
         if extended_platform.deployed_site and not extended_platform.portals:
             extended_platform.portals = RR2.find_objects(subject=extended_platform.deployed_site._id, predicate=PRED.hasSite, id_only=False)
@@ -1823,7 +1848,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
 
         log.debug('have portal instruments %s', [i._id if i else "None" for i in extended_platform.portal_instruments])
 
-        # Building status
+        # Building status - for PlatformAgents only (not ExternalDatasetAgent)
         # @TODO: clean this UP!!!
         child_device_ids = device_relations.keys()
         self.agent_status_builder.add_device_rollup_statuses_to_computed_attributes(platform_device_id,
@@ -1845,7 +1870,8 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         # TODO: why don't we just use the immediate device children? child_objs
         ids =[i._id if i else None for i in extended_platform.portal_instruments]
         extended_platform.computed.portal_status = csl(ids)
-        log.debug('%d portals, %d instruments, %d status: %r', len(extended_platform.portals), len(extended_platform.portal_instruments), len(extended_platform.computed.portal_status.value), ids)
+        log.debug('%d portals, %d instruments, %d status: %r', len(extended_platform.portals),
+                  len(extended_platform.portal_instruments), len(extended_platform.computed.portal_status.value), ids)
 
         rollx_builder = RollXBuilder(self)
         top_platformnode_id = rollx_builder.get_toplevel_network_node(platform_device_id)
@@ -1879,15 +1905,11 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             t.complete_step('ims.platform_device_extension.crush')
 
         # add UI details for deployments
-        extended_platform.deployment_info = describe_deployments(extended_platform.deployments, self.clients, instruments=extended_platform.instrument_devices, instrument_status=extended_platform.computed.instrument_status.value)
+        extended_platform.deployment_info = describe_deployments(extended_platform.deployments, self.clients,
+                instruments=extended_platform.instrument_devices, instrument_status=extended_platform.computed.instrument_status.value)
         if t:
             t.complete_step('ims.platform_device_extension.deploy')
             stats.add(t)
-
-        # Fix OOIION-1356. Agent instance contains very large stream and parameter info, unused in the UI.
-        if extended_platform.agent_instance:
-            extended_platform.agent_instance.agent_spawn_config = {}
-            extended_platform.agent_instance.agent_config = {}
 
         return extended_platform
 
@@ -2159,6 +2181,26 @@ class InstrumentManagementService(BaseInstrumentManagementService):
 
         resource_data.associations['PlatformAgentInstance'].group = {'group_by': 'PlatformModel',
                                                                      'resources': {papmassoc.o:pa_to_pai[papmassoc.s] for papmassoc in pa_to_pm}}
+
+        # prepare grouping for EDAI
+        eda_to_pm   = [a for a in self.RR2.find_associations(predicate='hasModel') if a.st=='ExternalDatasetAgent']
+        edai_to_eda  = self.RR2.find_associations(predicate='hasAgentDefinition')
+        all_edai, _ = self.RR2.find_resources('ExternalDatasetAgentInstance', id_only=True)
+
+        # discussions indicate we want to only show unassociated PAIs or PAIs associated with this PD
+        # this is a list of all PAIs resids currently associated to an PD, not including this current PD we're preparing for
+        cur_pd_to_edai_without_this = [a.o for a in self.RR2.find_associations(predicate='hasAgentInstance') if a.st=='PlatformDevice' and a.s != platform_device_id]
+        allowed_list = list(set(all_edai).difference(set(cur_pd_to_edai_without_this)))
+        def allowed(edai):
+            return edai in allowed_list
+
+        eda_to_edai = defaultdict(list)
+        for a in edai_to_eda:
+            if allowed(a.s):
+                eda_to_edai[a.o].append(a.s)
+
+        resource_data.associations['ExternalDatasetAgentInstance'].group = {'group_by': 'PlatformModel',
+                                                                     'resources': {edapmassoc.o:eda_to_edai[edapmassoc.s] for edapmassoc in eda_to_pm}}
 
         return resource_data
 
