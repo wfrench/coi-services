@@ -7,18 +7,22 @@ __author__ = 'Ian Katz, Michael Meisinger'
 
 import copy
 import tempfile
+import calendar
+import time
 
 from ooi import logging
 from ooi.logging import log
 
+from pyon.core import bootstrap
 from pyon.core.exception import NotFound, BadRequest
-from pyon.ion.resource import PRED, RT
+from pyon.core.object import IonObjectSerializer
+from pyon.ion.resource import PRED, RT, OT
 from pyon.util.containers import get_ion_ts, dict_merge
 
 from ion.agents.instrument.driver_process import DriverProcessType
 from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
-
+from ion.core.ooiref import OOIReferenceDesignator
 
 
 class AgentConfigurationBuilderFactory(object):
@@ -73,12 +77,14 @@ class AgentConfigurationBuilder(object):
                 PRED.hasDevice,
                 PRED.hasNetworkParent,
                 #PRED.hasParameterContext,
+                PRED.hasDeployment,
                 ]
 
     def _resources_to_cache(self):
         return [#RT.StreamDefinition,
                 RT.ParameterDictionary,
                 #RT.ParameterContext,
+                RT.Deployment,
                 ]
 
     def _update_cached_predicates(self):
@@ -201,7 +207,8 @@ class AgentConfigurationBuilder(object):
                                  str(agent_process_id))
 
         self.will_launch = will_launch
-        return self.generate_config()
+        config = self.generate_config()
+        return config
 
 
     def _generate_org_governance_name(self):
@@ -309,8 +316,13 @@ class AgentConfigurationBuilder(object):
 
     def _generate_agent_config(self):
         log.debug("_generate_agent_config for %s", self.agent_instance_obj.name)
-        # should override this
-        return {}
+        agent_config = {}
+
+        # Set the agent state vector from the prior agent run
+        if self.agent_instance_obj.saved_agent_state:
+            agent_config["prior_state"] = self.agent_instance_obj.saved_agent_state
+
+        return agent_config
 
     def _generate_alerts_config(self):
         log.debug("_generate_alerts_config for %s", self.agent_instance_obj.name)
@@ -334,6 +346,7 @@ class AgentConfigurationBuilder(object):
         agent_config = dict_merge(self._get_agent().agent_default_config, self.agent_instance_obj.agent_config, True)
 
         # Create agent_config.
+        agent_config['instance_id']        = self.agent_instance_obj._id
         agent_config['instance_name']        = self.agent_instance_obj.name
         agent_config['org_governance_name']  = self._generate_org_governance_name()
         agent_config['device_type']          = self._generate_device_type()
@@ -393,18 +406,67 @@ class AgentConfigurationBuilder(object):
         return agent_config
 
 
-
     def record_launch_parameters(self, agent_config):
         """
         record process id of the launch
         """
-        log.debug("add the process id, the generated config, and update the resource")
-        self.agent_instance_obj.agent_config = agent_config
-        self.agent_instance_obj.agent_spawn_config = agent_config
-        self.RR2.update(self.agent_instance_obj)
+        #self.RR2.update(self.agent_instance_obj)
 
         log.debug('completed agent start')
 
+    def _collect_deployment(self, device_id=None):
+
+        deployment_objs = self.RR2.find_objects(device_id, PRED.hasDeployment, RT.Deployment)
+
+        # find current deployment using time constraints
+        current_time =  int( calendar.timegm(time.gmtime()) )
+
+        for d in deployment_objs:
+            # find deployment start and end time
+            time_constraint = None
+            for constraint in d.constraint_list:
+                if constraint.type_ == OT.TemporalBounds:
+                    if time_constraint:
+                        log.warn('deployment %s has more than one time constraint (using first)', d.name)
+                    else:
+                        time_constraint = constraint
+            if time_constraint:
+                # a time constraint was provided, check if the current time is in this window
+                if int(time_constraint.start_datetime) < current_time < int(time_constraint.end_datetime) :
+                    log.debug('_collect_deployment found current deployment start time: %s, end time: %s   current time:  %s    deployment: %s ',
+                              time_constraint.start_datetime, time_constraint.end_datetime, current_time, d)
+                    return d
+
+        return None
+
+    def _validate_reference_designator(self, port_assignments):
+        #validate that each reference designator is valid / parseable
+        # otherwise the platform cannot pull out the port number for power mgmt
+        if not port_assignments:
+            return
+
+        if not isinstance(port_assignments, dict):
+            log.error('Deployment for device has invalid port assignments.  device id: %s ', self._get_device()._id)
+            return
+
+        for device_id, platform_port in port_assignments.iteritems():
+            if platform_port.type_ != OT.PlatformPort:
+                log.error('Deployment for device has invalid port assignments for device.  device id: %s', device_id)
+            ooi_rd = OOIReferenceDesignator(platform_port.reference_designator)
+            if ooi_rd.error:
+                log.error('Agent configuration includes a invalid reference designator for a device in this deployment.  device id: %s  reference designator: %s', device_id, platform_port.reference_designator)
+
+        return
+
+    def _serialize_port_assigments(self, port_assignments=None):
+        serializer = IonObjectSerializer()
+        serialized_port_assignments = {}
+        if isinstance(port_assignments, dict):
+            for device_id, platform_port in port_assignments.iteritems():
+                flatpp = serializer.serialize(platform_port)
+                serialized_port_assignments[device_id] = flatpp
+
+        return serialized_port_assignments
 
     def _collect_agent_instance_associations(self):
         """
@@ -432,18 +494,30 @@ class AgentConfigurationBuilder(object):
         ret = {}
 
         log.debug("retrieve the associated device")
-        device_obj = self.RR2.find_subject(subject_type=lu[PRED.hasAgentInstance],
-                                           predicate=PRED.hasAgentInstance,
-                                           object=self.agent_instance_obj._id)
+        res_types = lu[PRED.hasAgentInstance]
+        if not hasattr(res_types, "__iter__"):
+            res_types = [res_types]
 
-        ret[lu[PRED.hasAgentInstance]]= device_obj
+        device_obj = None
+        for res_type in res_types:
+            try:
+                device_obj = self.RR2.find_subject(subject_type=res_type,
+                                                   predicate=PRED.hasAgentInstance,
+                                                   object=self.agent_instance_obj._id)
+                break
+            except NotFound:
+                pass
+        if not device_obj:
+            raise NotFound("Could not find a Device for AgentInstance %s" % self.agent_instance_obj._id)
+
+        ret[lu[PRED.hasAgentInstance]] = device_obj   # Note: can be a tuple key
         device_id = device_obj._id
 
         log.debug("%s '%s' connected to %s '%s' (L4-CI-SA-RQ-363)",
                   lu[PRED.hasAgentInstance],
                   str(device_id),
-                  type(self.agent_instance_obj).__name__,
-                  str(self.agent_instance_obj._id))
+                  self.agent_instance_obj.type_,
+                  self.agent_instance_obj._id)
 
 #        log.debug("retrieve the model associated with the device")
 #        model_obj = self.RR2.find_object(subject=device_id,
@@ -481,6 +555,7 @@ class AgentConfigurationBuilder(object):
 
         #retrieve the output products
         data_product_objs = self.RR2.find_objects(device_id, PRED.hasOutputProduct, RT.DataProduct, id_only=False)
+        ret[RT.DataProduct] = data_product_objs
 
         if not data_product_objs:
             raise NotFound("No output Data Products attached to this Device " + str(device_id))
@@ -531,8 +606,8 @@ class ExternalDatasetAgentConfigurationBuilder(AgentConfigurationBuilder):
 
     def _lookup_means(self):
         agent_lookup_means = {}
-        agent_lookup_means[PRED.hasAgentInstance]   = RT.InstrumentDevice
-        agent_lookup_means[PRED.hasModel]           = RT.InstrumentModel
+        agent_lookup_means[PRED.hasAgentInstance]   = (RT.InstrumentDevice, RT.PlatformDevice)
+        agent_lookup_means[PRED.hasModel]           = (RT.InstrumentModel, RT.PlatformModel)
         agent_lookup_means[PRED.hasAgentDefinition] = RT.ExternalDatasetAgent
 
         return agent_lookup_means
@@ -587,12 +662,22 @@ class InstrumentAgentConfigurationBuilder(AgentConfigurationBuilder):
         # get default config
         driver_config = super(InstrumentAgentConfigurationBuilder, self)._generate_driver_config()
 
+        #add port assignments
+        port_assignments = {}
+
+        #find the associated Deployment resource for this device
+        deployment_obj = self._collect_deployment(self._get_device()._id)
+        if deployment_obj:
+            self._validate_reference_designator(deployment_obj.port_assignments)
+            port_assignments = self._serialize_port_assigments(deployment_obj.port_assignments )
+
         instrument_agent_instance_obj = self.agent_instance_obj
 
         # Create driver config.
         add_driver_config = {
             'comms_config' : instrument_agent_instance_obj.driver_config.get('comms_config'),
             'pagent_pid'   : instrument_agent_instance_obj.driver_config.get('pagent_pid'),
+            'ports' : port_assignments,
         }
 
         self._augment_dict("Instrument Agent driver_config", driver_config, add_driver_config)
@@ -627,6 +712,38 @@ class PlatformAgentConfigurationBuilder(AgentConfigurationBuilder):
 
         return False
 
+    def _generate_driver_config(self):
+        # get default config
+        driver_config = super(PlatformAgentConfigurationBuilder, self)._generate_driver_config()
+
+        #add port assignments
+        port_assignments_raw = {}
+
+        #find the associated Deployment resource for this device
+        deployment_obj = self._collect_deployment(self._get_device()._id)
+        if deployment_obj:
+            self._validate_reference_designator(deployment_obj.port_assignments)
+            port_assignments_raw.update( deployment_obj.port_assignments)
+
+        child_device_ids = self._build_child_list()
+
+        #Deployment info for all children must be added to the driver_config of the platform
+        for dev_id in child_device_ids:
+            deployment_obj = self._collect_deployment(dev_id)
+            if deployment_obj:
+                self._validate_reference_designator(deployment_obj.port_assignments)
+                port_assignments_raw.update(deployment_obj.port_assignments)
+
+        port_assignments = self._serialize_port_assigments(port_assignments_raw)
+        log.debug(' port assignments for platform  %s', port_assignments)
+
+        # Create driver config.
+        add_driver_config = {
+            'ports' : port_assignments,
+        }
+        self._augment_dict("Platform Agent driver_config", driver_config, add_driver_config)
+
+        return driver_config
 
     def _generate_children(self):
         """
@@ -634,25 +751,7 @@ class PlatformAgentConfigurationBuilder(AgentConfigurationBuilder):
         """
         log.debug("_generate_children for %s", self.agent_instance_obj.name)
 
-        dev_id = self._get_device()._id
-
-        log.debug("Getting child platform device ids")
-        if self._use_network_parent():
-            log.debug("Using hasNetworkParnet")
-            assocs = self.RR2.filter_cached_associations(PRED.hasNetworkParent, lambda a: dev_id == a.o)
-            child_pdevice_ids = [a.s for a in assocs]
-        else:
-            log.debug("Using hasDevice")
-            child_pdevice_ids = self.RR2.find_platform_device_ids_of_device_using_has_device(self._get_device()._id)
-        log.debug("found platform device ids: %s", child_pdevice_ids)
-
-        log.debug("Getting child instrument device ids")
-        child_idevice_ids = self.RR2.find_instrument_device_ids_of_device_using_has_device(self._get_device()._id)
-        log.debug("found instrument device ids: %s", child_idevice_ids)
-
-        child_device_ids = child_idevice_ids + child_pdevice_ids
-
-        log.debug("combined device ids: %s", child_device_ids)
+        child_device_ids = self._build_child_list()
 
         ConfigurationBuilder_factory = AgentConfigurationBuilderFactory(self.clients, self.RR2)
 
@@ -683,3 +782,26 @@ class PlatformAgentConfigurationBuilder(AgentConfigurationBuilder):
             ret[d] = ConfigurationBuilder.prepare(will_launch=False)
 
         return ret
+
+
+    def _build_child_list(self):
+        dev_id = self._get_device()._id
+
+        log.debug("Getting child platform device ids")
+        if self._use_network_parent():
+            log.debug("Using hasNetworkParnet")
+            assocs = self.RR2.filter_cached_associations(PRED.hasNetworkParent, lambda a: dev_id == a.o)
+            child_pdevice_ids = [a.s for a in assocs]
+        else:
+            log.debug("Using hasDevice")
+            child_pdevice_ids = self.RR2.find_platform_device_ids_of_device_using_has_device(self._get_device()._id)
+        log.debug("found platform device ids: %s", child_pdevice_ids)
+
+        log.debug("Getting child instrument device ids")
+        child_idevice_ids = self.RR2.find_instrument_device_ids_of_device_using_has_device(self._get_device()._id)
+        log.debug("found instrument device ids: %s", child_idevice_ids)
+
+        child_device_ids = child_idevice_ids + child_pdevice_ids
+
+        log.debug("combined device ids: %s", child_device_ids)
+        return child_device_ids
