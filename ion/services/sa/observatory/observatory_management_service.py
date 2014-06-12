@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 
-"""Observatory Management Service to keep track of observatories sites, logical platform sites, instrument sites,
-and the relationships between them"""
+"""Service managing marine facility sites and deployments"""
 
 import string
 import time
+import logging
 from collections import defaultdict
+from pyon.core.governance import ORG_MANAGER_ROLE, DATA_OPERATOR, OBSERVATORY_OPERATOR, INSTRUMENT_OPERATOR, GovernanceHeaderValues, has_org_role
 
 from ooi.logging import log
 
@@ -13,18 +14,20 @@ from pyon.core.exception import NotFound, BadRequest, Inconsistent
 from pyon.public import CFG, IonObject, RT, PRED, LCS, LCE, OT
 from pyon.ion.resource import ExtendedResourceContainer
 
-from ion.services.sa.instrument.rollx_builder import RollXBuilder
 from ion.services.sa.instrument.status_builder import AgentStatusBuilder
-from ion.services.sa.observatory.deployment_activator import DeploymentActivatorFactory, DeploymentResourceCollectorFactory
+from ion.services.sa.observatory.deployment_activator import DeploymentPlanner
 from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
 from ion.services.sa.observatory.observatory_util import ObservatoryUtil
+from ion.services.sa.observatory.deployment_util import DeploymentUtil
+from ion.processes.event.device_state import DeviceStateManager
 from ion.util.geo_utils import GeoUtils
 from ion.util.related_resources_crawler import RelatedResourcesCrawler
-from ion.services.sa.observatory.deployment_util import describe_deployments
+from ion.util.datastore.resources import ResourceRegistryUtil
 
 from interface.services.sa.iobservatory_management_service import BaseObservatoryManagementService
-from interface.objects import OrgTypeEnum, ComputedValueAvailability, ComputedIntValue, ComputedListValue, ComputedDictValue, AggregateStatusType, DeviceStatusType
-from interface.objects import MarineFacilityOrgExtension, NegotiationStatusEnum, NegotiationTypeEnum, ProposalOriginatorEnum
+from interface.objects import OrgTypeEnum, ComputedValueAvailability, ComputedIntValue, ComputedListValue, ComputedDictValue, AggregateStatusType, DeviceStatusType, TemporalBounds, DatasetWindow
+from interface.objects import MarineFacilityOrgExtension, NegotiationStatusEnum, NegotiationTypeEnum, ProposalOriginatorEnum, GeospatialBounds
+
 
 INSTRUMENT_OPERATOR_ROLE  = 'INSTRUMENT_OPERATOR'
 OBSERVATORY_OPERATOR_ROLE = 'OBSERVATORY_OPERATOR'
@@ -35,11 +38,7 @@ STATUS_UNKNOWN = {1:1, 2:1, 3:1, 4:1}
 class ObservatoryManagementService(BaseObservatoryManagementService):
 
     def on_init(self):
-        IonObject("Resource")  # suppress pyflakes error
-        CFG, log, RT, PRED, LCS, LCE, NotFound, BadRequest, log  #suppress pyflakes errors about "unused import"
-
         self.override_clients(self.clients)
-        self.outil = ObservatoryUtil(self)
         self.agent_status_builder = AgentStatusBuilder(process=self)
 
 
@@ -48,10 +47,10 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
                                 RT.Subsite: 1,
                                 RT.Observatory: 0,
                                 }
-        
-        self.HIERARCHY_LOOKUP = [RT.Observatory, 
-                                 RT.Subsite, 
-                                 RT.PlatformSite, 
+
+        self.HIERARCHY_LOOKUP = [RT.Observatory,
+                                 RT.Subsite,
+                                 RT.PlatformSite,
                                  RT.InstrumentSite]
 
         #todo: add lcs methods for these??
@@ -77,7 +76,7 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         #shortcut names for the import sub-services
         if hasattr(new_clients, "resource_registry"):
             self.RR = new_clients.resource_registry
-            
+
         if hasattr(new_clients, "instrument_management"):
             self.IMS = new_clients.instrument_management
 
@@ -112,7 +111,7 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         @throws NotFound    object with specified id does not exist
         """
         log.debug("ObservatoryManagementService.create_marine_facility(): %s", org)
-        
+
         # create the org
         org.org_type = OrgTypeEnum.MARINE_FACILITY
         org_id = self.clients.org_management.create_org(org)
@@ -133,7 +132,7 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
                                        name='Facility Data Operator',  # previously Data Operator
                                        description='Manipulate and post events related to Facility Data products')
         self.clients.org_management.add_user_role(org_id, data_operator_role)
-        
+
         return org_id
 
     def create_virtual_observatory(self, org=None):
@@ -202,10 +201,10 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         @param observatory_id    str
         @throws NotFound    object with specified id does not exist
         """
-        return self.RR2.retire(observatory_id, RT.Observatory)
+        return self.RR2.lcs_delete(observatory_id, RT.Observatory)
 
     def force_delete_observatory(self, observatory_id=''):
-        return self.RR2.pluck_delete(observatory_id, RT.Observatory)
+        return self.RR2.force_delete(observatory_id, RT.Observatory)
 
 
 
@@ -255,10 +254,10 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         @param subsite_id    str
         @throws NotFound    object with specified id does not exist
         """
-        self.RR2.retire(subsite_id, RT.Subsite)
+        self.RR2.lcs_delete(subsite_id, RT.Subsite)
 
     def force_delete_subsite(self, subsite_id=''):
-        self.RR2.pluck_delete(subsite_id, RT.Subsite)
+        self.RR2.force_delete(subsite_id, RT.Subsite)
 
 
 
@@ -309,10 +308,10 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         @param platform_site_id    str
         @throws NotFound    object with specified id does not exist
         """
-        self.RR2.retire(platform_site_id, RT.PlatformSite)
+        self.RR2.lcs_delete(platform_site_id, RT.PlatformSite)
 
     def force_delete_platform_site(self, platform_site_id=''):
-        self.RR2.pluck_delete(platform_site_id, RT.PlatformSite)
+        self.RR2.force_delete(platform_site_id, RT.PlatformSite)
 
 
     def create_instrument_site(self, instrument_site=None, parent_id=''):
@@ -361,11 +360,10 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         @param instrument_site_id    str
         @throws NotFound    object with specified id does not exist
         """
-        # todo: give InstrumentSite a lifecycle in COI so that we can remove the "True" argument here
-        self.RR2.retire(instrument_site_id, RT.InstrumentSite)
+        self.RR2.lcs_delete(instrument_site_id, RT.InstrumentSite)
 
     def force_delete_instrument_site(self, instrument_site_id=''):
-        self.RR2.pluck_delete(instrument_site_id, RT.InstrumentSite)
+        self.RR2.force_delete(instrument_site_id, RT.InstrumentSite)
 
 
 
@@ -405,11 +403,10 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         """
         Delete a Deployment resource
         """
-
-        self.RR2.retire(deployment_id, RT.Deployment)
+        self.RR2.lcs_delete(deployment_id, RT.Deployment)
 
     def force_delete_deployment(self, deployment_id=''):
-        self.RR2.pluck_delete(deployment_id, RT.Deployment)
+        self.RR2.force_delete(deployment_id, RT.Deployment)
 
 
     ############################
@@ -461,6 +458,57 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
 
         self.RR2.unassign_device_from_site_with_has_device(device_id, site_id)
 
+    def _update_device_add_geo_add_temporal(self, device_id='', site_id='', deployment_obj=''):
+        """Assigns to device:
+               temporal extent from deployment
+               geo location from site
+
+        @param device_id    str
+        @param site_id    str
+        @param deployment_obj Deployment
+        @throws NotFound    object with specified id does not exist
+        """
+        device_obj = self.RR.read(device_id)
+        site_obj = self.RR.read(site_id)
+        for constraint in site_obj.constraint_list:
+            if constraint.type_ == OT.GeospatialBounds:
+                device_obj.geospatial_bounds = GeoUtils.calc_geo_bounds_for_geo_bounds_list(
+                    [device_obj.geospatial_bounds, constraint])
+        for constraint in deployment_obj.constraint_list:
+            if constraint.type_ == OT.TemporalBounds:
+                device_obj.temporal_bounds = GeoUtils.calc_temp_bounds_for_temp_bounds_list(
+                    [device_obj.temporal_bounds, constraint])
+        self.RR.update(device_obj)
+
+    def _update_device_remove_geo_update_temporal(self, device_id='', temporal_constraint=None):
+        """Remove the geo location and update temporal extent (end) from the device
+
+        @param device_id    str
+        @param site_id    str
+        @throws NotFound    object with specified id does not exist
+        """
+        device_obj = self.RR.read(device_id)
+        bounds = GeospatialBounds(geospatial_latitude_limit_north=float(0),
+                                  geospatial_latitude_limit_south=float(0),
+                                  geospatial_longitude_limit_west=float(0),
+                                  geospatial_longitude_limit_east=float(0),
+                                  geospatial_vertical_min=float(0),
+                                  geospatial_vertical_max=float(0))
+        device_obj.geospatial_bounds = bounds
+        if temporal_constraint:
+            device_obj.temporal_bounds.end_datetime = GeoUtils.calc_temp_bounds_for_temp_bounds_list(
+                [device_obj.temporal_bounds, temporal_constraint])
+        self.RR.update(device_obj)
+
+    def _get_bounds_from_object(self, obj=''):
+        temporal   = None
+        geographic = None
+        for constraint in obj.constraint_list:
+            if constraint.type_ == OT.TemporalBounds:
+                temporal = constraint
+            if constraint.type_ == OT.GeospatialBounds:
+                geographic = constraint
+        return temporal, geographic
 
     def assign_device_to_network_parent(self, child_device_id='', parent_device_id=''):
         """Connects a device (any type) to parent in the RSN network
@@ -489,7 +537,7 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         self.RR2.assign_instrument_model_to_instrument_site_with_has_model(instrument_model_id, instrument_site_id)
 
     def unassign_instrument_model_from_instrument_site(self, instrument_model_id='', instrument_site_id=''):
-        self.RR2.unassign_instrument_model_from_instrument_site_with_has_model(self, instrument_model_id, instrument_site_id)
+        self.RR2.unassign_instrument_model_from_instrument_site_with_has_model(instrument_model_id, instrument_site_id)
 
     def assign_platform_model_to_platform_site(self, platform_model_id='', platform_site_id=''):
         self.RR2.assign_platform_model_to_platform_site_with_has_model(platform_model_id, platform_site_id)
@@ -523,22 +571,6 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
     #
     ##########################################################################
 
-
-    def deploy_instrument_site(self, instrument_site_id='', deployment_id=''):
-        # OBSOLETE - Move calls to assign/unassign
-        self.RR2.assign_deployment_to_instrument_site_with_has_deployment(deployment_id, instrument_site_id)
-
-    def undeploy_instrument_site(self, instrument_site_id='', deployment_id=''):
-        # OBSOLETE - Move calls to assign/unassign
-        self.RR2.unassign_deployment_from_instrument_site_with_has_deployment(deployment_id, instrument_site_id)
-
-    def deploy_platform_site(self, platform_site_id='', deployment_id=''):
-        # OBSOLETE - Move calls to assign/unassign
-        self.RR2.assign_deployment_to_platform_site_with_has_deployment(deployment_id, platform_site_id)
-
-    def undeploy_platform_site(self, platform_site_id='', deployment_id=''):
-        # OBSOLETE - Move calls to assign/unassign
-        self.RR2.unassign_deployment_from_platform_site_with_has_deployment(deployment_id, platform_site_id)
 
     def _get_deployment_assocs(self, deployment_id):
         res_ids, assocs = self.RR.find_subjects(predicate=PRED.hasDeployment, object=deployment_id, id_only=True)
@@ -607,32 +639,121 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         else:
             raise BadRequest("Illegal resource type to assign to Deployment: %s" % site.type_)
 
-
-
     def activate_deployment(self, deployment_id='', activate_subscriptions=False):
         """
         Make the devices on this deployment the primary devices for the sites
         """
-        #Verify that the deployment exists
-        depl_obj = self.RR2.read(deployment_id)
-        log.debug("Activating deployment '%s' (%s)", depl_obj.name, deployment_id)
+        dep_util = DeploymentUtil(self.container)
 
-        deployment_activator_factory = DeploymentActivatorFactory(self.clients)
-        deployment_activator = deployment_activator_factory.create(depl_obj)
-        deployment_activator.prepare()
+        # Verify that the deployment exists
+        deployment_obj = self.RR2.read(deployment_id)
+        log.info("Activating deployment %s '%s'", deployment_id, deployment_obj.name)
+
+        # Find an existing primary deployment
+        dep_site_id, dep_dev_id = dep_util.get_deployment_relations(deployment_id)
+        active_dep = dep_util.get_site_primary_deployment(dep_site_id)
+        if active_dep and active_dep._id == deployment_id:
+            raise BadRequest("Deployment %s already active for site %s" % (deployment_id, dep_site_id))
+
+        self.deploy_planner = DeploymentPlanner(self.clients)
+
+        pairs_to_remove, pairs_to_add = self.deploy_planner.prepare_activation(deployment_obj)
+        log.debug("activate_deployment  pairs_to_add: %s", pairs_to_add)
+        log.debug("activate_deployment  pairs_to_remove: %s", pairs_to_remove)
+
+        if not pairs_to_add:
+            log.warning('No Site and Device pairs were added to activate this deployment')
+
+        temp_constraint = dep_util.get_temporal_constraint(deployment_obj)
 
         # process any removals
-        for site_id, device_id in deployment_activator.hasdevice_associations_to_delete():
+        for site_id, device_id in pairs_to_remove:
             log.info("Unassigning hasDevice; device '%s' from site '%s'", device_id, site_id)
             self.unassign_device_from_site(device_id, site_id)
+            log.info("Removing geo and updating temporal attrs for device '%s'", device_id)
+            self._update_device_remove_geo_update_temporal(device_id, temp_constraint)
+
+            # Sever the connection between dev/site and the primary deployment
+            assocs = self.clients.resource_registry.find_associations(device_id, PRED.hasPrimaryDeployment, deployment_id)
+            for assoc in assocs:
+                self.RR.delete_association(assoc)
+            assocs = self.clients.resource_registry.find_associations(site_id, PRED.hasPrimaryDeployment, deployment_id)
+            for assoc in assocs:
+                self.RR.delete_association(assoc)
 
         # process the additions
-        for site_id, device_id in deployment_activator.hasdevice_associations_to_create():
+        for site_id, device_id in pairs_to_add:
             log.info("Setting primary device '%s' for site '%s'", device_id, site_id)
             self.assign_device_to_site(device_id, site_id)
+            log.info("Adding geo and updating temporal attrs for device '%s'", device_id)
+            self._update_device_add_geo_add_temporal(device_id, site_id, deployment_obj)
 
+            # Make this deployment Primary for every device and site
+            self.RR.create_association(subject=device_id, predicate=PRED.hasPrimaryDeployment, object=deployment_id, assoc_type=RT.Deployment)
+            self.RR.create_association(subject=site_id,   predicate=PRED.hasPrimaryDeployment, object=deployment_id, assoc_type=RT.Deployment)
 
-        #        self.RR.execute_lifecycle_transition(deployment_id, LCE.DEPLOY)
+            # Add a withinDeployment association from Device to Deployment
+            # so the entire history of a Device can be found.
+            self.RR.create_association(subject=device_id, predicate=PRED.withinDeployment, object=deployment_id, assoc_type=RT.Deployment)
+
+            sdps_ids, _  = self.RR.find_objects(subject=site_id, predicate=PRED.hasOutputProduct, object_type=RT.DataProduct, id_only=True)
+            sdps_streams, _ = self.RR.find_objects_mult(subjects=sdps_ids, predicate=PRED.hasStream, id_only=False)
+
+            dps_ids, _ = self.RR.find_objects(subject=device_id, predicate=PRED.hasOutputProduct, object_type=RT.DataProduct, id_only=True)
+            dps_streams, _ = self.RR.find_objects_mult(subjects=dps_ids, predicate=PRED.hasStream, id_only=False)
+
+            # Match SDPs to DDPs to get dataset_id and update the dataset_windows.
+            if not sdps_ids and log.isEnabledFor(logging.DEBUG):
+                log.debug("Not updating data_windows on Site '%s'... no SiteDataProducts were found." % site_id)
+
+            for i, sstream in enumerate(sdps_streams):
+                # Find matching DeviceDataProduct (ddp), based on the assumption
+                # that they have matching stream_names.
+                matched_ddp_id = None
+                for i, dstream in enumerate(dps_streams):
+                    if sstream.stream_name == dstream.stream_name:
+                        matched_ddp_id = self.RR2.find_subject(predicate=PRED.hasStream, object=dstream._id, subject_type=RT.DataProduct, id_only=True)
+
+                if not matched_ddp_id:
+                    # No matching ddp found.  Not a problem, as this device
+                    # could not measure all quantities that the Site has/can
+                    if log.isEnabledFor(logging.DEBUG):
+                        log.debug("Could not match the SDP to a DDP using the stream_name.  Can not set dataset_window without a dataset_id!")
+                        log.debug("SDP stream_name: %s" % sstream.stream_name)
+                        log.debug("DDP stream_names to match against: %s" % map(lambda x: x.stream_name, dps_streams))
+                    continue
+                else:
+                    if log.isEnabledFor(logging.DEBUG):
+                        log.debug("Matched SDP to a DDP using the stream_name '%s'" % sstream.stream_name)
+                        log.debug("Updating data_windows on Site '%s'..." % site_id)
+                    dataset_id = self.RR2.find_object(subject=matched_ddp_id, predicate=PRED.hasDataset, id_only=True)
+                    # Add the new window
+                    bounds = TemporalBounds(start_datetime=temp_constraint.start_datetime, end_datetime='')
+                    window = DatasetWindow(dataset_id=dataset_id, bounds=bounds)
+                    sdp = self.RR2.find_subject(predicate=PRED.hasStream, object=sstream._id, subject_type=RT.DataProduct, id_only=False)
+                    sdp.dataset_windows.append(window)
+                    self.RR2.update(sdp)
+
+        if deployment_obj.lcstate != LCS.DEPLOYED:
+            self.RR.execute_lifecycle_transition(deployment_id, LCE.DEPLOY)
+        else:
+            log.warn("Deployment %s was already DEPLOYED when activated", deployment_obj._id)
+
+        if active_dep:
+            log.info("activate_deployment(): Deactivating prior Deployment %s at site %s" % (active_dep._id, dep_site_id))
+            # Set Deployment end date
+            olddep_tc = dep_util.get_temporal_constraint(active_dep)
+            newdep_tc = dep_util.get_temporal_constraint(deployment_obj)
+            if float(olddep_tc.end_datetime) > float(newdep_tc.start_datetime):
+                # Set to new deployment start date
+                dep_util.set_temporal_constraint(active_dep, end_time=newdep_tc.start_datetime)
+                self.RR.update(active_dep)
+
+            # Change LCS
+            if active_dep.lcstate == LCS.DEPLOYED:
+                self.RR.execute_lifecycle_transition(active_dep._id, LCE.INTEGRATE)
+            else:
+                log.warn("Prior Deployment %s was not in DEPLOYED lcstate", active_dep._id)
 
 
     def deactivate_deployment(self, deployment_id=''):
@@ -645,43 +766,76 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
 
         #Verify that the deployment exists
         deployment_obj = self.RR2.read(deployment_id)
+        dep_util = DeploymentUtil(self.container)
 
-#        if LCS.DEPLOYED != deployment_obj.lcstate:
-#            raise BadRequest("This deploment is not active")
+        if deployment_obj.lcstate != LCS.DEPLOYED:
+            log.warn("deactivate_deployment(): Deployment %s is not DEPLOYED" % deployment_id)
+#            raise BadRequest("This deployment is not active")
 
         # get all associated components
-        collector_factory = DeploymentResourceCollectorFactory(self.clients)
-        resource_collector = collector_factory.create(deployment_obj)
-        resource_collector.collect()
+        self.deploy_planner = DeploymentPlanner(self.clients)
+        site_ids, device_ids = self.deploy_planner.get_deployment_sites_devices(deployment_obj)
 
-        # must only remove from sites that are not deployed under a different active deployment
-        # must only remove    devices that are not deployed under a different active deployment
-        def filter_alternate_deployments(resource_list):
-            # return the list of ids for devices or sites not connected to an alternate lcs.deployed deployment
-            ret = []
-            for r in resource_list:
-                depls, _ = self.RR.find_objects(r, PRED.hasDeployment, RT.Deployment)
-                keep = True
-                for d in depls:
-                    if d._id != deployment_id and LCS.DEPLOYED == d.lcstate:
-                        keep = False
-                if keep:
-                    ret.append(r)
-            return ret
-
-        device_ids = filter_alternate_deployments(resource_collector.collected_device_ids())
-        site_ids   = filter_alternate_deployments(resource_collector.collected_site_ids())
+        dep_util.set_temporal_constraint(deployment_obj, end_time=DeploymentUtil.DATE_NOW)
+        self.RR.update(deployment_obj)
+        temp_constraint = dep_util.get_temporal_constraint(deployment_obj)
 
         # delete only associations where both site and device have passed the filter
         for s in site_ids:
+            dataset_ids = []
             ds, _ = self.RR.find_objects(s, PRED.hasDevice, id_only=True)
             for d in ds:
                 if d in device_ids:
                     a = self.RR.get_association(s, PRED.hasDevice, d)
                     self.RR.delete_association(a)
-#
-#        # mark deployment as not deployed (developed seems appropriate)
-#        self.RR.execute_lifecycle_transition(deployment_id, LCE.DEVELOPED)
+                    log.info("Removing geo and updating temporal attrs for device '%s'", d)
+                    self._update_device_remove_geo_update_temporal(d, temp_constraint)
+                    try:
+                        self.RR.execute_lifecycle_transition(d, LCE.INTEGRATE)
+                    except BadRequest:
+                        log.warn("Could not set device %s lcstate to INTEGRATED", d)
+
+                    primary_d = self.RR.find_associations(subject=d,  predicate=PRED.hasPrimaryDeployment, object=deployment_id)
+                    if primary_d:
+                        self.RR.delete_association(primary_d[0])
+                    primary_s = self.RR.find_associations(subject=s,  predicate=PRED.hasPrimaryDeployment, object=deployment_id)
+                    if primary_s:
+                        self.RR.delete_association(primary_s[0])
+
+                    # Get Dataset IDs for a Device
+                    dps, _         = self.RR.find_objects(subject=d, predicate=PRED.hasOutputProduct, id_only=True)
+                    dataset_ids, _ = self.RR.find_objects_mult(subjects=dps, predicate=PRED.hasDataset, id_only=True)
+
+            dataset_ids = list(set(dataset_ids))
+
+            # Get the Deployment time bounds as datetime objects
+            temporal, geographc = self._get_bounds_from_object(obj=deployment_obj)
+
+            # Set the ending of the appropriate dataset_windows.  Have to search by dataset_id because we are
+            # not creating any new resources for the dataset_window logic!
+            site_dps, _ = self.RR.find_objects(s, PRED.hasOutputProduct, id_only=True)
+            for dp in site_dps:
+                site_data_product = self.RR.read(dp)
+                # This is assuming that data_windows is ALWAYS kept IN ORDER (Ascending).
+                # There should NEVER be a situation where there are two dataset_window
+                # attribute missing an 'ending' value.  If there is, it wasn't deactivated
+                # properly.
+                for window in site_data_product.dataset_windows:
+                    if window.dataset_id in dataset_ids:
+                        window.bounds.end_datetime = temporal.end_datetime
+                        break
+                self.RR.update(object=site_data_product)
+
+        # This should set the deployment resource to retired.
+        # Michael needs to fix the RR retire logic so it does not
+        # retire all associations before we can use it. Currently we switch
+        # back to INTEGRATE.
+        #self.RR.execute_lifecycle_transition(deployment_id, LCE.RETIRE)
+        # mark deployment as not deployed (developed seems appropriate)
+        if deployment_obj.lcstate == LCS.DEPLOYED:
+            self.RR.execute_lifecycle_transition(deployment_id, LCE.INTEGRATE)
+        else:
+            log.warn("Deployment %s was not in DEPLOYED lcstate", deployment_id)
 
     def prepare_deployment_support(self, deployment_id=''):
         extended_resource_handler = ExtendedResourceContainer(self)
@@ -798,8 +952,8 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
 
         return retval
 
-
-    def find_related_sites(self, parent_resource_id='', exclude_site_types=None, include_parents=False, id_only=False):
+    def find_related_sites(self, parent_resource_id='', exclude_site_types=None, include_parents=False,
+                           include_devices=False, id_only=False):
         if not parent_resource_id:
             raise BadRequest("Must provide a parent parent_resource_id")
         exclude_site_types = exclude_site_types or []
@@ -816,10 +970,30 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         else:
             raise BadRequest("Illegal parent_resource_id type. Expected Org/Site, given:%s" % parent_resource.type_)
 
-        site_resources, site_children = self.outil.get_child_sites(site_id, org_id,
+        RR2 = EnhancedResourceRegistryClient(self.RR)
+        RR2.cache_resources(RT.Observatory)
+        RR2.cache_resources(RT.PlatformSite)
+        RR2.cache_resources(RT.InstrumentSite)
+        if include_devices:
+            RR2.cache_resources(RT.PlatformDevice)
+            RR2.cache_resources(RT.InstrumentDevice)
+        outil = ObservatoryUtil(self, enhanced_rr=RR2)
+
+        site_resources, site_children = outil.get_child_sites(site_id, org_id,
                                    exclude_types=exclude_site_types, include_parents=include_parents, id_only=id_only)
 
-        return site_resources, site_children
+        site_devices, device_resources = None, None
+        if include_devices:
+            site_devices = outil.get_device_relations(site_children.keys())
+            device_list = list({tup[1] for key,dev_list in site_devices.iteritems() if dev_list for tup in dev_list})
+            device_resources = RR2.read_mult(device_list)
+
+            # HACK:
+            dev_by_id = {dev._id: dev for dev in device_resources}
+            site_resources.update(dev_by_id)
+
+
+        return site_resources, site_children, site_devices, device_resources
 
 
     def get_sites_devices_status(self, parent_resource_ids=None, include_sites=False, include_devices=False, include_status=False):
@@ -834,7 +1008,7 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         RR2.cache_resources(RT.InstrumentSite)
         RR2.cache_resources(RT.PlatformDevice)
         RR2.cache_resources(RT.InstrumentDevice)
-        outil = ObservatoryUtil(self, enhanced_rr=RR2)
+        outil = ObservatoryUtil(self, enhanced_rr=RR2, device_status_mgr=DeviceStateManager())
         parent_resource_objs = RR2.read_mult(parent_resource_ids)
         res_by_id = dict(zip(parent_resource_ids, parent_resource_objs))
 
@@ -860,7 +1034,7 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
             if include_devices or include_status:
                 RR2.cache_predicate(PRED.hasSite)
                 RR2.cache_predicate(PRED.hasDevice)
-                all_device_statuses = self._get_master_status_table(RR2, site_children.keys())
+                all_device_statuses = outil.get_status_roll_ups(parent_resource_id)
 
             if include_status:
                 #add code to grab the master status table to pass in to the get_status_roll_ups calc
@@ -870,15 +1044,16 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
                 #create the aggreagate_status for each device and site
 
                 log.debug("calculate site aggregate status")
-                site_status = self._get_site_rollup_list(RR2, all_device_statuses, [s for s in site_children.keys()])
+                site_status = [all_device_statuses.get(x,{}).get('agg',DeviceStatusType.STATUS_UNKNOWN) for x in site_children.keys()]
                 site_status_dict = dict(zip(site_children.keys(), site_status))
+
                 log.debug('get_sites_devices_status  site_status_dict:   %s ', site_status_dict)
                 site_result_dict["site_aggregate_status"] = site_status_dict
 
+
             if include_devices:
                 log.debug("calculate device aggregate status")
-                inst_status = [self.agent_status_builder._crush_status_dict(all_device_statuses.get(k, {}))
-                               for k in all_device_statuses.keys()]
+                inst_status = [all_device_statuses.get(x,{}).get('agg',DeviceStatusType.STATUS_UNKNOWN) for x in all_device_statuses.keys()]
                 device_agg_status_dict = dict(zip(all_device_statuses.keys(), inst_status))
                 log.debug('get_sites_devices_status  device_agg_status_dict:   %s ', device_agg_status_dict)
                 site_result_dict["device_aggregate_status"] = device_agg_status_dict
@@ -892,7 +1067,8 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         if not parent_resource_id:
             raise BadRequest("Must provide a parent parent_resource_id")
 
-        res_dict = self.outil.get_site_data_products(parent_resource_id, include_sites=include_sites,
+        outil = ObservatoryUtil(self)
+        res_dict = outil.get_site_data_products(parent_resource_id, include_sites=include_sites,
                                                      include_devices=include_devices,
                                                      include_data_products=include_data_products)
 
@@ -925,6 +1101,11 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
 
         else:
             raise BadRequest("Unknown site type '%s' for site %s" % (site_type, site_id))
+
+        from ion.util.extresource import strip_resource_extension, get_matchers, matcher_DataProduct, matcher_DeviceModel, \
+            matcher_Device, matcher_UserInfo
+        matchers = get_matchers([matcher_DataProduct, matcher_DeviceModel, matcher_Device, matcher_UserInfo])
+        strip_resource_extension(site_extension, matchers=matchers)
 
         return site_extension
 
@@ -980,8 +1161,8 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
                 ext_exclude=ext_exclude,
                 user_id=user_id)
 
-            RR2 = EnhancedResourceRegistryClient(self.RR)
-            outil = ObservatoryUtil(self, enhanced_rr=RR2)
+            RR2 = EnhancedResourceRegistryClient(self.clients.resource_registry)
+            outil = ObservatoryUtil(self, enhanced_rr=RR2, device_status_mgr=DeviceStateManager())
 
             # Find all subsites and devices
             site_resources, site_children = outil.get_child_sites(parent_site_id=site_id, include_parents=False, id_only=False)
@@ -1020,6 +1201,10 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
             deployment_ids = [a.o for a in deployment_assocs]
             deployment_objs = RR2.read_mult(list(set(deployment_ids)))
             extended_site.deployments = deployment_objs
+
+            # Get current active deployment. May be site or parent sites
+            dep_util = DeploymentUtil(self.container)
+            extended_site.deployment = dep_util.get_active_deployment(site_id, is_site=True, rr2=RR2)
 
             # Set data products
             RR2.cache_predicate(PRED.hasSource)
@@ -1061,15 +1246,14 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
             extended_site.platform_assembly_sites  = fs(RT.PlatformSite, lambda s: s.alt_resource_type == "PlatformAssemblySite")
             extended_site.instrument_sites         = fs(RT.InstrumentSite, lambda _: True)
 
-            #from pyon.util.breakpoint import breakpoint; breakpoint(locals())
-
             context = dict(
                 extended_site=extended_site,
                 enhanced_RR=RR2,
                 site_device_id=primary_device_id,
                 site_resources=site_resources,
                 site_children=site_children,
-                device_relations=device_relations
+                device_relations=device_relations,
+                outil=outil
             )
             return context
         except:
@@ -1080,31 +1264,32 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         """Creates a SiteExtension and status for platforms and higher level sites"""
         log.debug("_get_platform_site_extension")
         context = self._get_site_extension(site_id, ext_associations, ext_exclude, user_id)
-        extended_site, RR2, platform_device_id, site_resources, site_children, device_relations = \
+        extended_site, RR2, platform_device_id, site_resources, site_children, device_relations, outil = \
             context["extended_site"], context["enhanced_RR"], context["site_device_id"], \
-            context["site_resources"], context["site_children"], context["device_relations"]
+            context["site_resources"], context["site_children"], context["device_relations"], context["outil"]
 
-        RR2.cache_predicate(PRED.hasDevice)
+        statuses = outil.get_status_roll_ups(site_id, include_structure=True)
+        portal_status = []
+        if extended_site.portal_instruments:
+            for x in extended_site.portal_instruments:
+                if x:
+                    portal_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    portal_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_site.computed.portal_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=portal_status)
+        else:
+            extended_site.computed.portal_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
-        # prepare to make a lot of rollups
-        log.debug("Found these site children: %s", site_children.keys())
-
-        devices_for_status = set(site_children.keys())
-        for dev in extended_site.sites_devices:
-            if dev:
-                devices_for_status.add(dev._id)
-
-        all_device_statuses = self._get_master_status_table(RR2, devices_for_status)
-        log.debug("Found all device statuses: %s", all_device_statuses)
-
-        # portal status rollup
-        portal_status = [self.agent_status_builder._crush_status_dict(all_device_statuses.get(k._id, {})) if k else DeviceStatusType.STATUS_UNKNOWN for k in extended_site.portal_instruments]
-        extended_site.computed.portal_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=portal_status)
-
-        log.debug("generating site status rollup")
-        site_status = self._get_site_rollup_list(RR2, all_device_statuses, [s._id for s in extended_site.sites])
-        extended_site.computed.site_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED,
-                                                               value=site_status)
+        site_status = []
+        if extended_site.sites:
+            for x in extended_site.sites:
+                if x:
+                    site_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    site_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_site.computed.site_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=site_status)
+        else:
+            extended_site.computed.site_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
         # create the list of station status from the overall status list
         subset_status = []
@@ -1114,91 +1299,83 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
                 break
             idx =   extended_site.sites.index( site )
             subset_status.append( site_status[idx] )
-        extended_site.computed.station_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED,
-                                                               value=subset_status)
+        extended_site.computed.station_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=subset_status)
 
-        log.debug("generating instrument status rollup") # (is easy)
-        inst_status = [self.agent_status_builder._crush_status_dict(all_device_statuses.get(k._id, {}))
-                       for k in extended_site.instrument_devices]
-        extended_site.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED,
-                                                                     value=inst_status)
-
-        log.debug("generating platform status rollup")
-        plat_status = self._get_platform_rollup_list(RR2, all_device_statuses, [s._id for s in extended_site.platform_devices])
-        extended_site.computed.platform_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED,
-                                                                   value=plat_status)
-
-        log.debug("generating rollup of this site")
-        #site_aggregate = self._get_site_rollup_dict(RR2, all_device_statuses, site_id)
-
-        #we know all the devices on this site, use prev located ids
-        all_device_ids = set([s._id for s in extended_site.instrument_devices]   + [s._id for s in extended_site.platform_devices])
-        #create one list with all the relavant status dicts
-        all_status = []
-        for device_id in all_device_ids:
-            all_status.append( all_device_statuses.get(device_id, STATUS_UNKNOWN) )
-
-        log.debug('_get_platform_site_extension all_status: %s', all_status )
-        if all_status:
-            rollup_status = {}
-            #for each status type extract a vector from the status set
-            for stype, svalue in AggregateStatusType._str_map.iteritems():
-                type_list = []
-                for status in all_status:
-                    type_list.append(status.get(stype, DeviceStatusType.STATUS_UNKNOWN))
-                #take the max valus as the status of this type
-                rollup_status[stype] = max(type_list)
+        inst_status = []
+        if extended_site.instrument_devices:
+            for x in extended_site.instrument_devices:
+                if x:
+                    inst_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    inst_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_site.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=inst_status)
         else:
-            # no devices on this site
-            rollup_status = STATUS_UNKNOWN
-        log.debug('_get_platform_site_extension rollup_status: %s', rollup_status )
+            extended_site.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
-        self.agent_status_builder.set_status_computed_attributes(extended_site.computed,
-                                                                rollup_status,
-                                                                 ComputedValueAvailability.PROVIDED)
+        plat_status = []
+        if extended_site.platform_devices:
+            for x in extended_site.platform_devices:
+                    if x:
+                        plat_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                    else:
+                        plat_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_site.computed.platform_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=plat_status)
+        else:
+            extended_site.computed.platform_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
-        extended_site.deployment_info = describe_deployments(extended_site.deployments, self.clients,
-                                                             instruments=extended_site.instrument_devices,
-                                                             instrument_status=extended_site.computed.instrument_status.value)
+        comms_rollup = statuses.get(site_id,{}).get(AggregateStatusType.AGGREGATE_COMMS,DeviceStatusType.STATUS_UNKNOWN)
+        power_rollup = statuses.get(site_id,{}).get(AggregateStatusType.AGGREGATE_POWER,DeviceStatusType.STATUS_UNKNOWN)
+        data_rollup = statuses.get(site_id,{}).get(AggregateStatusType.AGGREGATE_DATA,DeviceStatusType.STATUS_UNKNOWN)
+        location_rollup = statuses.get(site_id,{}).get(AggregateStatusType.AGGREGATE_LOCATION,DeviceStatusType.STATUS_UNKNOWN)
+
+        extended_site.computed.communications_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=comms_rollup)
+        extended_site.computed.data_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=power_rollup)
+        extended_site.computed.location_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=data_rollup)
+        extended_site.computed.power_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=location_rollup)
+
+        dep_util = DeploymentUtil(self.container)
+        extended_site.deployment_info = dep_util.describe_deployments(extended_site.deployments,
+                                                                      status_map=statuses)
 
         return extended_site
 
     def _get_instrument_site_extension(self, site_id='', ext_associations=None, ext_exclude=None, user_id=''):
         """Creates a SiteExtension and status for instruments"""
         context = self._get_site_extension(site_id, ext_associations, ext_exclude, user_id)
-        extended_site, RR2, inst_device_id, site_resources, site_children, device_relations = \
+        extended_site, RR2, inst_device_id, site_resources, site_children, device_relations, outil = \
             context["extended_site"], context["enhanced_RR"], context["site_device_id"], \
-            context["site_resources"], context["site_children"], context["device_relations"]
+            context["site_resources"], context["site_children"], context["device_relations"], context["outil"]
 
-        if inst_device_id:
-            log.debug("Reading status for device '%s'", inst_device_id)
-            self.agent_status_builder.add_device_rollup_statuses_to_computed_attributes(inst_device_id,
-                                                                                        extended_site.computed,
-                                                                                        None)
+        statuses = outil.get_status_roll_ups(site_id, include_structure=True)
+
+        comms_rollup = statuses.get(site_id,{}).get(AggregateStatusType.AGGREGATE_COMMS,DeviceStatusType.STATUS_UNKNOWN)
+        power_rollup = statuses.get(site_id,{}).get(AggregateStatusType.AGGREGATE_POWER,DeviceStatusType.STATUS_UNKNOWN)
+        data_rollup = statuses.get(site_id,{}).get(AggregateStatusType.AGGREGATE_DATA,DeviceStatusType.STATUS_UNKNOWN)
+        location_rollup = statuses.get(site_id,{}).get(AggregateStatusType.AGGREGATE_LOCATION,DeviceStatusType.STATUS_UNKNOWN)
+
+        extended_site.computed.communications_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=comms_rollup)
+        extended_site.computed.data_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=power_rollup)
+        extended_site.computed.location_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=data_rollup)
+        extended_site.computed.power_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=location_rollup)
+
+        instrument_status = []
+        if  extended_site.instrument_devices:
+            for x in extended_site.instrument_devices:
+                if x:
+                    instrument_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    instrument_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_site.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=instrument_status)
         else:
-            log.debug("No device ID, so filling in ''Status unknown if device not present''")
-            all_unknown = dict([(k, DeviceStatusType.STATUS_UNKNOWN) for k in AggregateStatusType._str_map.keys()])
-            self.agent_status_builder.set_status_computed_attributes(extended_site.computed,
-                                                                     all_unknown,
-                                                                     ComputedValueAvailability.PROVIDED)
+            extended_site.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
-        instrument_status_list = [self.agent_status_builder.get_aggregate_status_of_device(d._id)
-                                  for d in extended_site.instrument_devices]
+        extended_site.computed.platform_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=[])
+        extended_site.computed.site_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=[])
+        extended_site.computed.portal_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=[])
 
-        def clv(value=None):
-            return ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=value if value is not None else [])
-
-        # there are no child sites, and therefore no child statuses
-        extended_site.computed.platform_status   = clv()
-        extended_site.computed.site_status       = clv()
-        extended_site.computed.instrument_status = clv(instrument_status_list)
-
-        extended_site.deployment_info = describe_deployments(extended_site.deployments, self.clients,
-                                                             instruments=extended_site.instrument_devices,
-                                                             instrument_status=extended_site.computed.instrument_status.value)
-
-        # have portals but need to reduce to appropriate subset...
-        extended_site.computed.portal_status = clv()
+        dep_util = DeploymentUtil(self.container)
+        extended_site.deployment_info = dep_util.describe_deployments(extended_site.deployments,
+                                                                      status_map=statuses)
 
         return extended_site
 
@@ -1221,7 +1398,7 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
             return extended_deployment
             #raise Inconsistent('deployment %s should be associated with a device and a site' % deployment_id)
 
-        log.info('have device: %r\nand site: %r', extended_deployment.device.__dict__, extended_deployment.site.__dict__)
+        log.debug('have device: %r\nand site: %r', extended_deployment.device.__dict__, extended_deployment.site.__dict__)
         RR2 = EnhancedResourceRegistryClient(self.clients.resource_registry)
         finder = RelatedResourcesCrawler()
         get_assns = finder.generate_related_resources_partial(RR2, [PRED.hasDevice])
@@ -1304,6 +1481,11 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         #instrument_status: !ComputedListValue
         #platform_status: !ComputedListValue
 
+        from ion.util.extresource import strip_resource_extension, get_matchers, matcher_DataProduct, matcher_DeviceModel, \
+            matcher_Device, matcher_UserInfo
+        matchers = get_matchers([matcher_DataProduct, matcher_DeviceModel, matcher_Device, matcher_UserInfo])
+        strip_resource_extension(extended_deployment, matchers=matchers)
+
         return extended_deployment
 
 
@@ -1340,6 +1522,7 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         RR2 = EnhancedResourceRegistryClient(self.RR)
         RR2.cache_predicate(PRED.hasModel)
         RR2.cache_predicate(PRED.hasDevice)
+        outil = ObservatoryUtil(self, enhanced_rr=RR2, device_status_mgr=DeviceStateManager())
 
         #Fill out service request information for requesting data products
         extended_org.data_products_request.service_name = 'resource_registry'
@@ -1353,22 +1536,9 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
             'skip': 0
         }
 
-
-        # clients.resource_registry may return us the container's resource_registry instance
-        self._rr = self.clients.resource_registry
-
-        # extended object contains list of member actors, so need to change to user info
-        actors_list = extended_org.members
-        user_list = []
-        for actor in actors_list:
-            log.debug("get_marine_facility_extension: actor:  %s ", actor)
-            user_info_objs, _ = self._rr.find_objects(subject=actor._id, predicate=PRED.hasInfo, object_type=RT.UserInfo, id_only=False)
-            if user_info_objs:
-                log.debug("get_marine_facility_extension: user_info_obj  %s ", user_info_objs[0])
-                user_list.append( user_info_objs[0] )
-
-        extended_org.members = user_list
-
+        # extended object contains list of member ActorIdentity, so need to change to user info
+        rr_util = ResourceRegistryUtil(self.container)
+        extended_org.members = rr_util.get_actor_users(extended_org.members)
 
         #Convert Negotiations to OrgUserNegotiationRequest
         extended_org.open_requests = self._convert_negotiations_to_requests(extended_org, extended_org.open_requests)
@@ -1394,46 +1564,78 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
         extended_org.instrument_models = retrieve_model_objs(extended_org.instruments, RT.InstrumentDevice)
         extended_org.platform_models = retrieve_model_objs(extended_org.platforms, RT.PlatformDevice)
 
-        log.debug("time to make the rollups")
-        outil = ObservatoryUtil(self, enhanced_rr=RR2)
-        _, site_children = outil.get_child_sites(org_id=org_id, id_only=False)
-        all_device_statuses = self._get_master_status_table(RR2, site_children.keys())
 
-        log.debug("site status rollup")
-        site_status = self._get_site_rollup_list(RR2, all_device_statuses, [s._id for s in extended_org.sites])
-        extended_org.computed.site_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED,
-                                                              value=site_status)
+        statuses = outil.get_status_roll_ups(org_id, include_structure=True)
 
-        log.debug("instrument status rollup") # (is easy)
-        inst_status = [self.agent_status_builder._crush_status_dict(all_device_statuses.get(k._id, {}))
-                       for k in extended_org.instruments]
-        extended_org.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED,
-                                                                    value=inst_status)
+        site_status = []
+        if extended_org.sites:
+            for x in extended_org.sites:
+                if x:
+                    site_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    site_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_org.computed.site_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=site_status)
+        else:
+            extended_org.computed.site_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
-        log.debug("platform status rollup")
-        plat_status = self._get_platform_rollup_list(RR2, all_device_statuses, [s._id for s in extended_org.platforms])
-        extended_org.computed.platform_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED,
-                                                                  value=plat_status)
+        inst_status = []
+        if extended_org.instruments:
+            for x in extended_org.instruments:
+                if x:
+                    inst_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    inst_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_org.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=inst_status)
+        else:
+            extended_org.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
-        log.debug("rollup of this org includes all found devices")
-        org_aggregate = {}
-        for k, v in AggregateStatusType._str_map.iteritems():
-            aggtype_list = [a.get(k, DeviceStatusType.STATUS_UNKNOWN) for a in all_device_statuses.values()]
-            org_aggregate[k] = self.agent_status_builder._crush_status_list(aggtype_list)
+        plat_status = []
+        if extended_org.platforms:
+            for x in extended_org.platforms:
+                if x:
+                    plat_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    plat_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_org.computed.platform_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=plat_status)
+        else:
+            extended_org.computed.platform_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
-        self.agent_status_builder.set_status_computed_attributes(extended_org.computed,
-                                                                 org_aggregate,
-                                                                 ComputedValueAvailability.PROVIDED)
 
-        # station_site is currently all PlatformSites, need to limit to those with alt_resource_type
         subset = []
         for site in extended_org.station_sites:
             if site.alt_resource_type=='StationSite':
                 subset.append(site)
         extended_org.station_sites = subset
-        station_status = self._get_site_rollup_list(RR2, all_device_statuses, [s._id for s in extended_org.station_sites])
-        extended_org.computed.station_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=station_status)
-        extended_org.deployment_info = describe_deployments(extended_org.deployments, self.clients, instruments=extended_org.instruments, instrument_status=extended_org.computed.instrument_status.value)
+
+        station_status = []
+        if extended_org.station_sites:
+            for x in extended_org.station_sites:
+                if x:
+                    station_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    station_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_org.computed.station_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=station_status)
+        else:
+            extended_org.computed.station_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
+
+        comms_rollup = statuses.get(org_id,{}).get(AggregateStatusType.AGGREGATE_COMMS,DeviceStatusType.STATUS_UNKNOWN)
+        power_rollup = statuses.get(org_id,{}).get(AggregateStatusType.AGGREGATE_POWER,DeviceStatusType.STATUS_UNKNOWN)
+        data_rollup = statuses.get(org_id,{}).get(AggregateStatusType.AGGREGATE_DATA,DeviceStatusType.STATUS_UNKNOWN)
+        location_rollup = statuses.get(org_id,{}).get(AggregateStatusType.AGGREGATE_LOCATION,DeviceStatusType.STATUS_UNKNOWN)
+
+        extended_org.computed.communications_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=comms_rollup)
+        extended_org.computed.data_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=power_rollup)
+        extended_org.computed.location_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=data_rollup)
+        extended_org.computed.power_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=location_rollup)
+
+        dep_util = DeploymentUtil(self.container)
+        extended_org.deployment_info = dep_util.describe_deployments(extended_org.deployments,
+                                                                     status_map=statuses)
+
+        from ion.util.extresource import strip_resource_extension, get_matchers, matcher_DataProduct, matcher_DeviceModel, \
+            matcher_Device, matcher_UserInfo
+        matchers = get_matchers([matcher_DataProduct, matcher_DeviceModel, matcher_Device, matcher_UserInfo])
+        strip_resource_extension(extended_org, matchers=matchers)
 
         return extended_org
 
@@ -1594,3 +1796,23 @@ class ObservatoryManagementService(BaseObservatoryManagementService):
                     request.name    = udict[k].name
 
         return ret_list
+
+    def check_deployment_activation_policy(self, process, message, headers):
+        try:
+            gov_values = GovernanceHeaderValues(headers=headers, process=process, resource_id_required=False)
+
+        except Inconsistent, ex:
+            return False, ex.message
+
+        resource_id = message.get("deployment_id", None)
+        if not resource_id:
+            return False, '%s(%s) has been denied - no deployment_id argument provided' % (process.name, gov_values.op)
+
+        # Allow actor to activate/deactivate deployment in an org where the actor has the appropriate role
+        orgs,_ = self.clients.resource_registry.find_subjects(subject_type=RT.Org, predicate=PRED.hasResource, object=resource_id, id_only=False)
+        for org in orgs:
+            if (has_org_role(gov_values.actor_roles, org.org_governance_name, [ORG_MANAGER_ROLE, OBSERVATORY_OPERATOR])):
+                log.error("returning true: "+str(gov_values.actor_roles))
+                return True, ''
+
+        return False, '%s(%s) has been denied since the user is not a member in any org to which the deployment id %s belongs ' % (process.name, gov_values.op, resource_id)

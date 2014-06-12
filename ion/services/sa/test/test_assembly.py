@@ -6,6 +6,7 @@ from ion.agents.port.port_agent_process import PortAgentProcessType
 
 from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
 from pyon.public import IonObject
+from interface.objects import PortTypeEnum
 from pyon.util.containers import DotDict
 #from pyon.util.int_test import IonIntegrationTestCase
 from pyon.util.containers import create_unique_identifier
@@ -147,10 +148,13 @@ class TestAssembly(GenericIntHelperTestCase):
                                                      extra_fn=add_to_org_fn)
         
         log.info("Create instrument site")
+        instSite_obj = IonObject(RT.InstrumentSite,
+                                 name="instrument_site",
+                                 reference_designator="GA01SUMO-FI003-01-CTDMO0999")
         instrument_site_id = self.perform_fcruf_script(RT.InstrumentSite,
                                                        "instrument_site",
                                                        self.client.OMS,
-                                                       actual_obj=None,
+                                                       actual_obj=instSite_obj,
                                                        extra_fn=add_to_org_fn)
         
         ###############################################
@@ -216,7 +220,7 @@ class TestAssembly(GenericIntHelperTestCase):
                                                     actual_obj=None,
                                                     extra_fn=add_to_org_fn)
         log.info("Create an instrument device")
-        instrument_device_id = self.perform_fcruf_script(RT.InstrumentDevice, 
+        instrument_device_id = self.perform_fcruf_script(RT.InstrumentDevice,
                                                          "instrument_device", 
                                                          self.client.IMS,
                                                          actual_obj=None,
@@ -489,19 +493,21 @@ class TestAssembly(GenericIntHelperTestCase):
         c.DAMS.assign_data_product(input_resource_id=instrument_device_id,
                                    data_product_id=inst_data_product_id)
 
-        deployment_obj = any_old(RT.Deployment, {"context": IonObject(OT.CabledNodeDeploymentContext)})
+        port_assignments={}
+        pp_obj = IonObject(OT.PlatformPort, reference_designator='GA01SUMO-FI003-01-CTDMO0999', port_type= PortTypeEnum.PAYLOAD, ip_address='1' )
+        port_assignments[instrument_device_id] = pp_obj
+
+        deployment_obj = IonObject(RT.Deployment,
+                                   name='deployment',
+                                   port_assignments=port_assignments,
+                                   context=IonObject(OT.CabledNodeDeploymentContext))
         deployment_id = self.perform_fcruf_script(RT.Deployment, "deployment", c.OMS, actual_obj=deployment_obj,
                                                   extra_fn=add_to_org_fn)
 
-        c.OMS.deploy_platform_site(platform_site_id, deployment_id)
+        c.OMS.assign_site_to_deployment(platform_site_id, deployment_id)
         self.RR2.find_deployment_id_of_platform_site_using_has_deployment(platform_site_id)
-        c.IMS.deploy_platform_device(platform_device_id, deployment_id)
+        c.OMS.assign_device_to_deployment(platform_device_id, deployment_id)
         self.RR2.find_deployment_of_platform_device_using_has_deployment(platform_device_id)
-
-        c.OMS.deploy_instrument_site(instrument_site_id, deployment_id)
-        self.RR2.find_deployment_id_of_instrument_site_using_has_deployment(instrument_site_id)
-        c.IMS.deploy_instrument_device(instrument_device_id, deployment_id)
-        self.RR2.find_deployment_id_of_instrument_device_using_has_deployment(instrument_device_id)
 
 
         c.OMS.activate_deployment(deployment_id, True)
@@ -550,9 +556,9 @@ class TestAssembly(GenericIntHelperTestCase):
         deployment_id2 = self.perform_fcruf_script(RT.Deployment, "deployment", c.OMS, actual_obj=deployment_obj,
                                                    extra_fn=add_to_org_fn)
         log.debug("Associating instrument site with new deployment")
-        c.OMS.deploy_instrument_site(instrument_site_id, deployment_id2)
+        c.OMS.assign_site_to_deployment(instrument_site_id, deployment_id2)
         log.debug("Associating instrument device with new deployment")
-        c.IMS.deploy_instrument_device(instrument_device_id2, deployment_id2)
+        c.OMS.assign_device_to_deployment(instrument_device_id2, deployment_id2)
 
         # activate the new deployment -- changing the primary device -- but don't switch subscription
         log.debug("Activating new deployment")
@@ -580,15 +586,15 @@ class TestAssembly(GenericIntHelperTestCase):
 
         c.IMS.delete_instrument_agent(instrument_agent_id)
         instr_agent_obj_read = self.client.RR.read(instrument_agent_id)
-        self.assertEquals(instr_agent_obj_read.lcstate,LCS.RETIRED)
+        self.assertEquals(instr_agent_obj_read.lcstate, LCS.DELETED)
         log.info("L4-CI-SA-RQ-382: Instrument activation shall manage the life cycle of Instrument Agents")
 
         c.IMS.delete_instrument_device(instrument_device_id)
         # Check whether the instrument device has been retired
         instrument_obj_read = self.client.RR.read(instrument_device_id)
         log.debug("The instruments lcs state has been set to %s after the delete operation" % instrument_obj_read.lcstate)
-        self.assertEquals(instrument_obj_read.lcstate, LCS.RETIRED)
-        log.debug("L4-CI-SA-RQ-334 RETIRE")
+        self.assertEquals(instrument_obj_read.lcstate, LCS.DELETED)
+        log.debug("L4-CI-SA-RQ-334 DELETED")
         log.debug("L4-CI-SA-RQ-335: Instrument activation shall support transition to the retired state of instruments")
 
         #----------------------------------------------
@@ -625,13 +631,9 @@ class TestAssembly(GenericIntHelperTestCase):
     def create_data_product_obj(self):
 
         # Construct temporal and spatial Coordinate Reference System objects
-        tdom, sdom = time_series_domain()
-
-        sdom = sdom.dump()
-        tdom = tdom.dump()
 
         # creates an IonObject of RT.DataProduct and adds custom fields specified by dict
-        return any_old(RT.DataProduct, dict(temporal_domain=tdom, spatial_domain=sdom))
+        return any_old(RT.DataProduct)
 
 
     def create_inst_agent_instance(self, agent_id, device_id):
@@ -727,8 +729,8 @@ class TestAssembly(GenericIntHelperTestCase):
         deployment_obj = any_old(RT.Deployment, dict(context=context))
         deployment_id = c.OMS.create_deployment(deployment_obj)
 
-        c.OMS.deploy_instrument_site(instrument_site_id, deployment_id)
-        c.IMS.deploy_instrument_device(instrument_device_id, deployment_id)
+        c.OMS.assign_site_to_deployment(instrument_site_id, deployment_id)
+        c.OMS.assign_device_to_deployment(instrument_device_id, deployment_id)
 
         c.OMS.activate_deployment(deployment_id, True)
 

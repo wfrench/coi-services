@@ -389,7 +389,7 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
 #        #
 #        log.debug("Deleting data_producer id: %s" % data_producer_id)
 #
-#        return self.clients.resource_registry.retire(data_producer_id)
+#        return self.clients.resource_registry.lcs_delete(data_producer_id)
 #
 #
 #    def force_delete_data_producer(self, data_producer_id=''):
@@ -419,10 +419,10 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
         return self.RR2.read(external_data_provider_id, RT.ExternalDataProvider)
 
     def delete_external_data_provider(self, external_data_provider_id=''):
-        self.RR2.retire(external_data_provider_id, RT.ExternalDataProvider)
+        self.RR2.lcs_delete(external_data_provider_id, RT.ExternalDataProvider)
 
     def force_delete_external_data_provider(self, external_data_provider_id=''):
-        self.RR2.pluck_delete(external_data_provider_id, RT.ExternalDataProvider)
+        self.RR2.force_delete(external_data_provider_id, RT.ExternalDataProvider)
 
     ##########################################################################
     #
@@ -447,11 +447,11 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
     def delete_data_source(self, data_source_id=''):
         # Read and delete specified DataSource object
         log.debug("Deleting DataSource id: %s" % data_source_id)
-        self.RR2.retire(data_source_id, RT.DataSource)
+        self.RR2.lcs_delete(data_source_id, RT.DataSource)
         return
 
     def force_delete_data_source(self, data_source_id=''):
-        self.RR2.pluck_delete(data_source_id, RT.DataSource)
+        self.RR2.force_delete(data_source_id, RT.DataSource)
 
 
     def create_data_source_model(self, data_source_model=None):
@@ -468,11 +468,11 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
 
     def delete_data_source_model(self, data_source_model_id=''):
         # Read and delete specified ExternalDatasetModel object
-        self.RR2.retire(data_source_model_id, RT.DataSourceModel)
+        self.RR2.lcs_delete(data_source_model_id, RT.DataSourceModel)
         return
 
     def force_delete_data_source_model(self, data_source_model_id=''):
-        self.RR2.pluck_delete(data_source_model_id, RT.DataSourceModel)
+        self.RR2.force_delete(data_source_model_id, RT.DataSourceModel)
 
     def create_data_source_agent(self, data_source_agent=None, data_source_model_id='' ):
         # Persist ExternalDataSourcAgent object and return object _id as OOI id
@@ -493,10 +493,10 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
 
     def delete_data_source_agent(self, data_source_agent_id=''):
         # Read and delete specified DataSourceAgent object
-        self.RR2.retire(data_source_agent_id, RT.DataSourceAgent)
+        self.RR2.lcs_delete(data_source_agent_id, RT.DataSourceAgent)
 
     def force_delete_data_source_agent(self, data_source_agent_id=''):
-        self.RR2.pluck_delete(data_source_agent_id, RT.DataSourceAgent)
+        self.RR2.force_delete(data_source_agent_id, RT.DataSourceAgent)
 
 
     def create_data_source_agent_instance(self, data_source_agent_instance=None, data_source_agent_id='', data_source_id=''):
@@ -522,10 +522,10 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
 
     def delete_data_source_agent_instance(self, data_source_agent_instance_id=''):
         # Read and delete specified DataSourceAgentInstance object
-        self.RR2.retire(data_source_agent_instance_id, RT.DataSourceAgentInstance)
+        self.RR2.lcs_delete(data_source_agent_instance_id, RT.DataSourceAgentInstance)
 
     def force_delete_data_source_agent_instance(self, data_source_agent_instance_id=''):
-        self.RR2.pluck_delete(data_source_agent_instance_id, RT.DataSourceAgentInstance)
+        self.RR2.force_delete(data_source_agent_instance_id, RT.DataSourceAgentInstance)
 
     def start_data_source_agent_instance(self, data_source_agent_instance_id=''):
         """Launch an data source agent instance process and return its process id. Agent instance resource
@@ -572,10 +572,10 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
     def delete_external_dataset(self, external_dataset_id=''):
         # Read and delete specified ExternalDataSet object
 
-        self.RR2.retire(external_dataset_id, RT.ExternalDataset)
+        self.RR2.lcs_delete(external_dataset_id, RT.ExternalDataset)
 
     def force_delete_external_dataset(self, external_dataset_id=''):
-        self.RR2.pluck_delete(external_dataset_id, RT.ExternalDataset)
+        self.RR2.force_delete(external_dataset_id, RT.ExternalDataset)
 
     def create_external_dataset_model(self, external_dataset_model=None):
         # Persist ExternalDatasetModel object and return object _id as OOI id
@@ -593,10 +593,10 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
 
     def delete_external_dataset_model(self, external_dataset_model_id=''):
         # Read and delete specified ExternalDatasetModel object
-        self.RR2.retire(external_dataset_model_id, RT.ExternalDatasetModel)
+        self.RR2.lcs_delete(external_dataset_model_id, RT.ExternalDatasetModel)
 
     def force_delete_external_dataset_model(self, external_dataset_model_id=''):
-        self.RR2.pluck_delete(external_dataset_model_id, RT.ExternalDatasetModel)
+        self.RR2.force_delete(external_dataset_model_id, RT.ExternalDatasetModel)
 
     #
     # ExternalDatasetAgent
@@ -636,11 +636,11 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
     def delete_external_dataset_agent(self, external_dataset_agent_id=''):
         # Read and delete specified ExternalDataAgent object
 
-        self.RR2.retire(external_dataset_agent_id, RT.ExternalDatasetAgent)
+        self.RR2.lcs_delete(external_dataset_agent_id, RT.ExternalDatasetAgent)
 
     def force_delete_external_dataset_agent(self, external_dataset_agent_id=''):
 
-        self.RR2.pluck_delete(external_dataset_agent_id, RT.ExternalDatasetAgent)
+        self.RR2.force_delete(external_dataset_agent_id, RT.ExternalDatasetAgent)
 
     def assign_model_to_external_dataset_agent(self, model_id='', external_dataset_agent_id=''):
         self.clients.resource_registry.create_association(external_dataset_agent_id, PRED.hasModel, model_id)
@@ -758,10 +758,10 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
         return external_dataset_agent_instance
 
     def delete_external_dataset_agent_instance(self, external_dataset_agent_instance_id=''):
-        self.RR2.retire(external_dataset_agent_instance_id, RT.ExternalDatasetAgentInstance)
+        self.RR2.lcs_delete(external_dataset_agent_instance_id, RT.ExternalDatasetAgentInstance)
 
     def force_delete_external_dataset_agent_instance(self, external_dataset_agent_instance_id=''):
-        self.RR2.pluck_delete(external_dataset_agent_instance_id, RT.ExternalDatasetAgentInstance)
+        self.RR2.force_delete(external_dataset_agent_instance_id, RT.ExternalDatasetAgentInstance)
 
     def assign_external_dataset_agent_instance_to_device(self, external_dataset_agent_instance_id='', device_id=''):
         self.clients.resource_registry.create_association(device_id, PRED.hasAgentInstance, external_dataset_agent_instance_id)
@@ -773,16 +773,22 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
         if not config_builder or RT.DataProduct not in config_builder.associated_objects:
            return
         data_products = config_builder.associated_objects[RT.DataProduct]
-        parsed_dp_id = None
-        for dp in data_products:
-            if dp.processing_level_code == "Parsed":
-                parsed_dp_id = dp._id
-                break
-        if parsed_dp_id:
-            if not self.DPMS.is_persisted(parsed_dp_id):
-                raise BadRequest("Cannot start agent - data product persistence is not activated!")
+        if config_builder._get_device().type_ == RT.PlatformDevice:
+            for dp in data_products:
+                if self.DPMS.is_persisted(dp._id):
+                    return
+            raise BadRequest("Cannot start agent - data product persistence is not activated!")
         else:
-            log.warn("Cannot determine if persistence is activated for agent instance=%s", config_builder.agent_instance_obj._id)
+            parsed_dp_id = None
+            for dp in data_products:
+                if dp.processing_level_code == "Parsed":
+                    parsed_dp_id = dp._id
+                    break
+            if parsed_dp_id:
+                if not self.DPMS.is_persisted(parsed_dp_id):
+                    raise BadRequest("Cannot start agent - data product persistence is not activated!")
+            else:
+                log.warn("Cannot determine if persistence is activated for agent instance=%s", config_builder.agent_instance_obj._id)
 
     def start_external_dataset_agent_instance(self, external_dataset_agent_instance_id=''):
         """Launch an external dataset agent instance process and return its process id.
@@ -841,31 +847,27 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
 
         agent_process_id = ResourceAgentClient._get_agent_process_id(external_dataset_device_ids[0])
 
-        # Cancels the execution of the given process id.
-        self.clients.process_dispatcher.cancel_process(agent_process_id)
-
-        # Save the process state
-        agent_instance_res = self.clients.resource_registry.read(external_dataset_agent_instance_id)
-        old_state = None
         try:
-            old_state,_ = self.container.state_repository.get_state(agent_process_id)
-            old_state["_prior_agent_process_id"] = agent_process_id
-        except NotFound:
-            log.warn("Could not find process state for agent instance %s", external_dataset_agent_instance_id)
+            # Cancels the execution of the given process id.
+            self.clients.process_dispatcher.cancel_process(agent_process_id)
 
-        if old_state and isinstance(old_state, dict):
+        finally:
+            # Save the process state
+            agent_instance_res = self.clients.resource_registry.read(external_dataset_agent_instance_id)
+            old_state = None
+            try:
+                old_state,_ = self.container.state_repository.get_state(agent_process_id)
+                old_state["_prior_agent_process_id"] = agent_process_id
+            except NotFound:
+                log.warn("Could not find process state for agent instance %s", external_dataset_agent_instance_id)
+
+            if old_state and isinstance(old_state, dict):
+                agent_instance_res.saved_agent_state = old_state
+            else:
+                agent_instance_res.saved_agent_state = {}
+
             agent_instance_res.saved_agent_state = old_state
-        else:
-            agent_instance_res.saved_agent_state = {}
-
-        agent_instance_res.saved_agent_state = old_state
-        self.clients.resource_registry.update(agent_instance_res)
-
-        try:
-            obj_id = "agent_spawncfg_%s" % external_dataset_agent_instance_id
-            self.container.object_store.delete_doc(obj_id)
-        except Exception as ex:
-            log.warn("Cannot delete agent spawn config for instance %s: %s", external_dataset_agent_instance_id, ex)
+            self.clients.resource_registry.update(agent_instance_res)
 
     def prepare_external_dataset_agent_instance_support(self, external_dataset_agent_instance_id=''):
         #TODO - does this have to be filtered by Org ( is an Org parameter needed )

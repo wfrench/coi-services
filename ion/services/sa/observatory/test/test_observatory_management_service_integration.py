@@ -1,17 +1,22 @@
-#from interface.services.icontainer_agent import ContainerAgentClient
-#from pyon.ion.endpoint import ProcessRPCClient
+#!/usr/bin/env python
 
 import unittest
-from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
+from nose.plugins.attrib import attr
+import os
 
-from pyon.util.containers import DotDict, get_ion_ts
 from pyon.util.int_test import IonIntegrationTestCase
+from pyon.util.containers import DotDict, get_ion_ts
 from pyon.util.context import LocalContextMixin
-from pyon.public import RT, PRED, OT, log
-from pyon.public import IonObject
+from pyon.public import RT, PRED, OT, log, CFG, IonObject
 from pyon.event.event import EventPublisher
 from pyon.agent.agent import ResourceAgentState
+from pyon.core.governance import get_actor_header
+
 from ion.services.dm.utility.granule_utils import time_series_domain
+from ion.services.sa.test.helpers import any_old
+from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
+
+from interface.objects import ComputedValueAvailability
 from interface.services.coi.iresource_registry_service import ResourceRegistryServiceClient
 from interface.services.sa.iinstrument_management_service import InstrumentManagementServiceClient
 from interface.services.coi.iorg_management_service import OrgManagementServiceClient
@@ -20,11 +25,7 @@ from interface.services.sa.idata_product_management_service import DataProductMa
 from interface.services.sa.idata_acquisition_management_service import DataAcquisitionManagementServiceClient
 from interface.services.dm.ipubsub_management_service import PubsubManagementServiceClient
 from interface.services.dm.idataset_management_service import DatasetManagementServiceClient
-from pyon.core.governance import get_actor_header
-from nose.plugins.attrib import attr
-from interface.objects import ComputedValueAvailability
 
-from ion.services.sa.test.helpers import any_old
 
 
 
@@ -97,7 +98,7 @@ class TestObservatoryManagementServiceIntegration(IonIntegrationTestCase):
 
     def _do_test_find_related_sites(self, resources):
 
-        site_resources, site_children = self.OMS.find_related_sites(resources.org_id)
+        site_resources, site_children, _, _ = self.OMS.find_related_sites(resources.org_id)
 
         #import sys, pprint
         #print >> sys.stderr, pprint.pformat(site_resources)
@@ -127,6 +128,7 @@ class TestObservatoryManagementServiceIntegration(IonIntegrationTestCase):
         self.assertEquals(len(site_children[resources.subsite_id]), 2)
 
     def _do_test_get_sites_devices_status(self, resources):
+        #bin/nosetests -s -v --nologcapture ion/services/sa/observatory/test/test_observatory_management_service_integration.py:TestObservatoryManagementServiceIntegration.test_observatory_management
 
         full_result_dict = self.OMS.get_sites_devices_status(parent_resource_ids=[resources.org_id], include_sites=True)
 
@@ -549,7 +551,10 @@ class TestObservatoryManagementServiceIntegration(IonIntegrationTestCase):
 
 
     @attr('EXT')
+    @unittest.skipIf(os.getenv('CEI_LAUNCH_TEST', False), 'Skip test while in CEI LAUNCH mode as it depends on modifying CFG on service side')
     def test_observatory_extensions(self):
+        self.patch_cfg(CFG["container"], {"extended_resources": {"strip_results": False}})
+
         obs_id = self.RR2.create(any_old(RT.Observatory))
         pss_id = self.RR2.create(any_old(RT.PlatformSite, dict(alt_resource_type="StationSite")))
         pas_id = self.RR2.create(any_old(RT.PlatformSite, dict(alt_resource_type="PlatformAssemblySite")))
@@ -589,7 +594,9 @@ class TestObservatoryManagementServiceIntegration(IonIntegrationTestCase):
     #@unittest.skip("in development...")
     @attr('EXT')
     @attr('EXT1')
+    @unittest.skipIf(os.getenv('CEI_LAUNCH_TEST', False), 'Skip test while in CEI LAUNCH mode as it depends on modifying CFG on service side')
     def test_observatory_org_extended(self):
+        self.patch_cfg(CFG["container"], {"extended_resources": {"strip_results": False}})
 
         stuff = self._make_associations()
 
@@ -598,14 +605,9 @@ class TestObservatoryManagementServiceIntegration(IonIntegrationTestCase):
 
         parsed_stream_def_id = self.pubsubcli.create_stream_definition(name='parsed',
                                                                        parameter_dictionary_id=parsed_pdict_id)
-        tdom, sdom = time_series_domain()
-        sdom = sdom.dump()
-        tdom = tdom.dump()
         dp_obj = IonObject(RT.DataProduct,
             name='the parsed data',
-            description='ctd stream test',
-            temporal_domain = tdom,
-            spatial_domain = sdom)
+            description='ctd stream test')
 
 
         data_product_id1 = self.dpclient.create_data_product(data_product=dp_obj,
@@ -639,7 +641,6 @@ class TestObservatoryManagementServiceIntegration(IonIntegrationTestCase):
         #--------------------------------------------------------------------------------
         # Get the extended Site (platformSite)
         #--------------------------------------------------------------------------------
-
 
         try:
             extended_site = self.OMS.get_site_extension(stuff.platform_site_id)

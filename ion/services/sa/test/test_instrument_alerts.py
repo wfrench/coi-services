@@ -287,7 +287,6 @@ class TestInstrumentAlerts(IonIntegrationTestCase):
         instDevice_id = self._create_instrument_device(instModel_id)
 
         # It is necessary for the instrument device to be associated with atleast one output data product
-        tdom, sdom = time_series_domain()
         parsed_pdict_id = self.dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
         parsed_stream_def_id = self.pubsubclient.create_stream_definition(name='parsed', parameter_dictionary_id=parsed_pdict_id)
 
@@ -298,15 +297,11 @@ class TestInstrumentAlerts(IonIntegrationTestCase):
         # We are creating two data products here, one for parsed and another raw
         dp_obj_parsed = IonObject(RT.DataProduct,
             name='parsed_data_product',
-            description='Parsed output data product for instrument',
-            temporal_domain = tdom.dump(),
-            spatial_domain = sdom.dump())
+            description='Parsed output data product for instrument')
 
         dp_obj_raw = IonObject(RT.DataProduct,
             name='raw_data_prod',
-            description='Raw output data product for instrument',
-            temporal_domain = tdom.dump(),
-            spatial_domain = sdom.dump())
+            description='Raw output data product for instrument')
 
 
         parsed_out_data_prod_id = self.dataproductclient.create_data_product(data_product=dp_obj_parsed, stream_definition_id=parsed_stream_def_id)
@@ -371,25 +366,33 @@ class TestInstrumentAlerts(IonIntegrationTestCase):
         #-------------------------------------------------------------------------------------
 
         cmd = AgentCommand(command=ResourceAgentEvent.INITIALIZE)
-        reply = self._ia_client.execute_agent(cmd)
+        # Prevent this test from hanging indefinitely until
+        # OOIION-1313 is resolved
+        timeout_val = 60
+        with gevent.Timeout(timeout_val, Exception('Agent failed to initialize after %fs' % timeout_val)):
+            reply = self._ia_client.execute_agent(cmd)
         self.assertTrue(reply.status == 0)
 
         cmd = AgentCommand(command=ResourceAgentEvent.GO_ACTIVE)
-        reply = self._ia_client.execute_agent(cmd)
+        with gevent.Timeout(timeout_val, Exception('Agent failed to go active after %fs' % timeout_val)):
+            reply = self._ia_client.execute_agent(cmd)
         self.assertTrue(reply.status == 0)
 
         cmd = AgentCommand(command=ResourceAgentEvent.GET_RESOURCE_STATE)
-        retval = self._ia_client.execute_agent(cmd)
+        with gevent.Timeout(timeout_val, Exception('Agent failed to get resource after %fs' % timeout_val)):
+            retval = self._ia_client.execute_agent(cmd)
         state = retval.result
         log.debug("(L4-CI-SA-RQ-334): current state after sending go_active command %s", str(state))
         self.assertTrue(state, 'DRIVER_STATE_COMMAND')
 
         cmd = AgentCommand(command=ResourceAgentEvent.RUN)
-        reply = self._ia_client.execute_agent(cmd)
+        with gevent.Timeout(timeout_val, Exception('Agent failed to run after %fs' % timeout_val)):
+            reply = self._ia_client.execute_agent(cmd)
         self.assertTrue(reply.status == 0)
 
         cmd = AgentCommand(command=SBE37ProtocolEvent.START_AUTOSAMPLE)
-        retval = self._ia_client.execute_resource(cmd)
+        with gevent.Timeout(timeout_val, Exception('Agent failed to start autosample after %fs' % timeout_val)):
+            retval = self._ia_client.execute_resource(cmd)
 
         got_bad_temp = [False, False, False, False]
         got_late_data = False

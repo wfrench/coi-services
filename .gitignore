@@ -19,6 +19,7 @@ eggs/
 parts/
 develop-eggs/
 downloads/
+deployment
 bin/
 .installed.cfg
 .idea
@@ -45,3 +46,4 @@ coverage_results
 *.cov
 tags
 *.DS_Store
+dsadriver

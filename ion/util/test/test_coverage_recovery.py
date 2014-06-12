@@ -24,7 +24,6 @@ from ion.processes.data.last_update_cache import CACHE_DATASTORE_NAME
 from ion.services.dm.utility.granule_utils import time_series_domain
 from ion.services.dm.utility.granule import RecordDictionaryTool
 from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
-from ion.util.parameter_yaml_IO import get_param_dict
 from interface.services.dm.iuser_notification_service import UserNotificationServiceClient
 from interface.services.cei.iprocess_dispatcher_service import ProcessDispatcherServiceClient
 from interface.services.coi.iresource_registry_service import ResourceRegistryServiceClient
@@ -143,16 +142,10 @@ class TestCoverageModelRecoveryInt(IonIntegrationTestCase):
         pubsub_management       = PubsubManagementServiceClient()
         data_product_management = DataProductManagementServiceClient()
         resource_registry       = self.container.instance.resource_registry
-
-        tdom, sdom = time_series_domain()
-        tdom = tdom.dump()
-        sdom = sdom.dump()
         dp_obj = DataProduct(
             name='instrument_data_product_%i' % dset_i,
             description='ctd stream test',
-            processing_level_code='Parsed_Canonical',
-            temporal_domain = tdom,
-            spatial_domain = sdom)
+            processing_level_code='Parsed_Canonical')
         pdict_id = dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
         stream_def_id = pubsub_management.create_stream_definition(name='parsed', parameter_dictionary_id=pdict_id)
         self.addCleanup(pubsub_management.delete_stream_definition, stream_def_id)
@@ -188,6 +181,7 @@ class TestCoverageModelRecoveryInt(IonIntegrationTestCase):
         gevent.sleep(1)
 
     @attr('LOCOINT')
+    @unittest.skip('Coverage metadata is now stored in Postgres.  Recovery may no longer make sense.')
     @unittest.skipIf(os.getenv('CEI_LAUNCH_TEST', False), 'Host requires file-system access to coverage files, CEI mode does not support.')
     @unittest.skipIf(not_have_h5stat, 'h5stat is not accessible in current PATH')
     @unittest.skipIf(not not_have_h5stat and not h5stat_correct_version, 'HDF is the incorrect version: %s' % version_str)

@@ -21,17 +21,26 @@ from pyon.agent.agent import ResourceAgentClient
 from pyon.event.event import EventSubscriber
 
 from pyon.core.exception import NotFound, Inconsistent
+from pyon.core.exception import BadRequest
 
 from pyon.core.governance import ORG_MANAGER_ROLE, GovernanceHeaderValues, has_org_role, get_valid_resource_commitments, ION_MANAGER
 from ion.services.sa.observatory.observatory_management_service import INSTRUMENT_OPERATOR_ROLE, OBSERVATORY_OPERATOR_ROLE
 
+from ion.agents.platform.platform_agent_enums import PlatformAgentState
+from ion.agents.platform.platform_agent_enums import PlatformAgentEvent
+from ion.agents.platform.platform_agent_enums import PlatformAgentCapability
+from ion.agents.platform.platform_agent_enums import ResourceInterfaceCapability
+
 from ion.agents.platform.exceptions import PlatformDriverException
 from ion.agents.platform.exceptions import PlatformException
+from ion.agents.platform.exceptions import PlatformConfigurationException
 from ion.agents.platform.platform_driver_event import AttributeValueDriverEvent
+from ion.agents.platform.platform_driver_event import ExternalEventDriverEvent
 from ion.agents.platform.platform_driver_event import StateChangeDriverEvent
 from ion.agents.platform.platform_driver_event import AsyncAgentEvent
 from ion.agents.platform.exceptions import CannotInstantiateDriverException
 from ion.agents.platform.util.network_util import NetworkUtil
+from ion.agents.platform.util.network_util import NetworkDefinitionException
 from ion.agents.agent_alert_manager import AgentAlertManager
 
 from ion.agents.platform.platform_driver import PlatformDriverEvent, PlatformDriverState
@@ -40,8 +49,8 @@ from ion.core.includes.mi import DriverEvent
 
 from pyon.util.containers import DotDict
 
-from pyon.agent.common import BaseEnum
 from pyon.agent.instrument_fsm import FSMStateError
+from pyon.agent.instrument_fsm import FSMError
 
 from ion.agents.platform.launcher import Launcher
 
@@ -49,6 +58,8 @@ from ion.agents.platform.platform_resource_monitor import PlatformResourceMonito
 
 from ion.agents.platform.status_manager import StatusManager
 from ion.agents.platform.platform_agent_stream_publisher import PlatformAgentStreamPublisher
+
+from ion.agents.platform.mission_manager import MissionManager
 
 from ion.agents.instrument.instrument_agent import InstrumentAgentState
 from ion.agents.instrument.instrument_agent import InstrumentAgentEvent
@@ -68,83 +79,6 @@ import pprint
 
 PA_MOD = 'ion.agents.platform.platform_agent'
 PA_CLS = 'PlatformAgent'
-
-
-class PlatformAgentState(BaseEnum):
-    """
-    Platform agent state enum.
-    """
-    UNINITIALIZED     = ResourceAgentState.UNINITIALIZED
-    INACTIVE          = ResourceAgentState.INACTIVE
-    IDLE              = ResourceAgentState.IDLE
-    STOPPED           = ResourceAgentState.STOPPED
-    COMMAND           = ResourceAgentState.COMMAND
-    MONITORING        = 'PLATFORM_AGENT_STATE_AUTOSAMPLE'
-    LAUNCHING         = 'PLATFORM_AGENT_STATE_LAUNCHING'
-    LOST_CONNECTION   = ResourceAgentState.LOST_CONNECTION
-
-
-class PlatformAgentEvent(BaseEnum):
-    ENTER                     = ResourceAgentEvent.ENTER
-    EXIT                      = ResourceAgentEvent.EXIT
-
-    INITIALIZE                = ResourceAgentEvent.INITIALIZE
-    RESET                     = ResourceAgentEvent.RESET
-    GO_ACTIVE                 = ResourceAgentEvent.GO_ACTIVE
-    GO_INACTIVE               = ResourceAgentEvent.GO_INACTIVE
-    RUN                       = ResourceAgentEvent.RUN
-    SHUTDOWN                  = 'PLATFORM_AGENT_SHUTDOWN_CHILDREN'
-
-    CLEAR                     = ResourceAgentEvent.CLEAR
-    PAUSE                     = ResourceAgentEvent.PAUSE
-    RESUME                    = ResourceAgentEvent.RESUME
-
-    GET_RESOURCE_CAPABILITIES = ResourceAgentEvent.GET_RESOURCE_CAPABILITIES
-    PING_RESOURCE             = ResourceAgentEvent.PING_RESOURCE
-    GET_RESOURCE              = ResourceAgentEvent.GET_RESOURCE
-    SET_RESOURCE              = ResourceAgentEvent.SET_RESOURCE
-    EXECUTE_RESOURCE          = ResourceAgentEvent.EXECUTE_RESOURCE
-    GET_RESOURCE_STATE        = ResourceAgentEvent.GET_RESOURCE_STATE
-
-    START_MONITORING          = 'PLATFORM_AGENT_START_AUTOSAMPLE'
-    STOP_MONITORING           = 'PLATFORM_AGENT_STOP_AUTOSAMPLE'
-    LAUNCH_COMPLETE           = 'PLATFORM_AGENT_LAUNCH_COMPLETE'
-
-    LOST_CONNECTION           = ResourceAgentEvent.LOST_CONNECTION
-    AUTORECONNECT             = ResourceAgentEvent.AUTORECONNECT
-
-
-class PlatformAgentCapability(BaseEnum):
-    INITIALIZE                = PlatformAgentEvent.INITIALIZE
-    RESET                     = PlatformAgentEvent.RESET
-    GO_ACTIVE                 = PlatformAgentEvent.GO_ACTIVE
-    GO_INACTIVE               = PlatformAgentEvent.GO_INACTIVE
-    RUN                       = PlatformAgentEvent.RUN
-    SHUTDOWN                  = PlatformAgentEvent.SHUTDOWN
-
-    CLEAR                     = PlatformAgentEvent.CLEAR
-    PAUSE                     = PlatformAgentEvent.PAUSE
-    RESUME                    = PlatformAgentEvent.RESUME
-
-    # These are not agent capabilities but interface capabilities.
-    #GET_RESOURCE_CAPABILITIES = PlatformAgentEvent.GET_RESOURCE_CAPABILITIES
-    #PING_RESOURCE             = PlatformAgentEvent.PING_RESOURCE
-    #GET_RESOURCE              = PlatformAgentEvent.GET_RESOURCE
-    #SET_RESOURCE              = PlatformAgentEvent.SET_RESOURCE
-    #EXECUTE_RESOURCE          = PlatformAgentEvent.EXECUTE_RESOURCE
-    #GET_RESOURCE_STATE        = PlatformAgentEvent.GET_RESOURCE_STATE
-
-    START_MONITORING          = PlatformAgentEvent.START_MONITORING
-    STOP_MONITORING           = PlatformAgentEvent.STOP_MONITORING
-
-
-class ResourceInterfaceCapability(BaseEnum):
-    #GET_RESOURCE_CAPABILITIES = PlatformAgentEvent.GET_RESOURCE_CAPABILITIES
-    PING_RESOURCE             = PlatformAgentEvent.PING_RESOURCE
-    GET_RESOURCE              = PlatformAgentEvent.GET_RESOURCE
-    SET_RESOURCE              = PlatformAgentEvent.SET_RESOURCE
-    EXECUTE_RESOURCE          = PlatformAgentEvent.EXECUTE_RESOURCE
-    GET_RESOURCE_STATE        = PlatformAgentEvent.GET_RESOURCE_STATE
 
 
 class PlatformAgentAlertManager(AgentAlertManager):
@@ -258,6 +192,19 @@ class PlatformAgent(ResourceAgent):
         self._status_manager = None
 
         #####################################
+        # mission execution handling:
+
+        # MissionManager created in _initialize_this_platform and destroyed in
+        # _reset_this_platform
+        self._mission_manager = None
+
+        # state to return to after mission termination
+        self._pre_mission_state = None
+
+        # to sync with mission execution
+        self._mission_greenlet = None
+
+        #####################################
         # lost_connection handling:
 
         # Autoreconnect thread.
@@ -285,6 +232,9 @@ class PlatformAgent(ResourceAgent):
 
         self._agent_schema = get_schema()
 
+        self._provider_id = None
+        self._actor_id = None
+
         #####################################
         log.info("PlatformAgent constructor complete.")
 
@@ -292,10 +242,14 @@ class PlatformAgent(ResourceAgent):
         self._pp = pprint.PrettyPrinter()
 
     def on_init(self):
+        """
+        - Validates the given configuration and does related preparations.
+        - configures aparams if not already config'ed (see _configure_aparams)
+        """
         super(PlatformAgent, self).on_init()
         log.trace("on_init")
 
-        platform_id = self.CFG.get_safe('platform_config.platform_id', '??')
+        platform_id = self._validate_configuration()
 
         #######################################################################
         # CFG.endpoint.receive.timeout: if the value is less than the one we
@@ -318,7 +272,6 @@ class PlatformAgent(ResourceAgent):
         self._timeout = cfg_timeout
         #######################################################################
 
-        self._plat_config = self.CFG.get("platform_config", None)
         self._plat_config_processed = False
 
         self._launcher = Launcher(self._timeout)
@@ -334,16 +287,12 @@ class PlatformAgent(ResourceAgent):
 
     def on_start(self):
         """
-        - Validates the given configuration and does related preparations.
         - creates AgentAlertManager and StatusManager
-        - configures aparams if not already config'ed (see _configure_aparams)
         - Children agents (platforms and instruments) are launched here (in a
           separate greenlet).
         """
         super(PlatformAgent, self).on_start()
         log.info('platform agent is running: on_start called.')
-
-        self._validate_configuration()
 
         # Set up alert manager.
         self._aam = PlatformAgentAlertManager(self)
@@ -371,107 +320,99 @@ class PlatformAgent(ResourceAgent):
         @raises PlatformException if the verification fails for some reason.
         """
 
-        if self._plat_config is None:
-            msg = "PlatformAgent._validate_configuration: 'platform_config' entry not provided in agent configuration"
-            log.error(msg)
-
         if self._plat_config_processed:
-            # nothing else to do here
             return
 
         log.debug("verifying/processing platform config configuration ...")
 
+        self._plat_config = self.CFG.get("platform_config", None)
+        if self._plat_config is None:
+            msg = "'platform_config' entry not provided in agent configuration"
+            log.error(msg)
+            raise PlatformConfigurationException(msg=msg)
+
+        platform_id = self._plat_config.get('platform_id', None)
+        if platform_id is None:
+            msg = "'platform_id' entry not found in 'platform_config'"
+            log.error(msg)
+            raise PlatformConfigurationException(msg=msg)
+
+        self._platform_id = platform_id
+
         stream_info = self.CFG.get('stream_config', None)
         if stream_info is None:
-            msg = "PlatformAgent._validate_configuration: 'stream_config' key not in configuration"
+            msg = "%r: 'stream_config' key not in configuration" % self._platform_id
             log.error(msg)
         for stream_name, stream_config in stream_info.iteritems():
             if 'stream_def_dict' not in stream_config:
-                msg = "PlatformAgent._validate_configuration: 'stream_def_dict' key not in configuration for stream %r" % stream_name
+                msg = "%r: 'stream_def_dict' key not in configuration for stream %r" % (
+                    self._platform_id, stream_name)
                 log.error(msg)
 
         self._driver_config = self.CFG.get('driver_config', None)
         if None is self._driver_config:
-            msg = "PlatformAgent._validate_configuration: 'driver_config' key not in configuration"
+            msg = "'driver_config' key not in configuration"
             log.error(msg)
+            raise PlatformConfigurationException(msg=msg)
 
         log.debug("driver_config: %s", self._driver_config)
 
-        for k in ['platform_id']:
-            if not k in self._plat_config:
-                msg = "'%s' key not given in configuration" % k
-                log.error(msg)
-
-        self._platform_id = self._plat_config['platform_id']
-
         for k in ['dvr_mod', 'dvr_cls']:
             if not k in self._driver_config:
-                msg = "PlatformAgent._validate_configuration: (%r) '%s' key not given in driver_config: %s" % (
+                msg = "%r: %r key not given in driver_config: %s" % (
                     self._platform_id, k, self._driver_config)
                 log.error(msg)
+                raise PlatformConfigurationException(msg=msg)
 
-        # Create network definition from the provided CFG:
-        try:
-            self._network_definition = NetworkUtil.create_network_definition_from_ci_config(self.CFG)
-            log.debug("%r: created network_definition from CFG", self._platform_id)
-        except:
-            log.exception("PlatformAgent._validate_configuration: exception raised while calling NetworkUtil.create_network_definition_from_ci_config")
+        self._create_network_definition_from_CFG()
 
         # verify the given platform_id is contained in the NetworkDefinition:
         if not self._platform_id in self._network_definition.pnodes:
-            msg = "PlatformAgent._validate_configuration: (%r) this platform_id not found in network definition." % self._platform_id
+            msg = "platform_id=%r not found in network definition." % self._platform_id
             log.error(msg)
+            raise PlatformConfigurationException(msg=msg)
 
         # get PlatformNode corresponding to this agent:
         self._pnode = self._network_definition.pnodes[self._platform_id]
-        if self._pnode.platform_id != self._platform_id:
-            msg = "PlatformAgent._validate_configuration: platform ID %r not equal to ID %r of node." % (self._platform_id, self._pnode.platform_id)
-            log.error(msg)
-
-        log.debug("PlatformAgent._validate_configuration: self._pnode = %s" %self._pnode)
+        log.debug("PlatformAgent._validate_configuration: _pnode = %s", self._pnode)
 
         self._children_resource_ids = self._get_children_resource_ids()
 
-        #
-        # set platform attributes:
-        #
-        if 'attributes' in self._driver_config:
-            attrs = self._driver_config['attributes']
-            self._platform_attributes = attrs
-            log.debug("%r: platform attributes taken from driver_config: %s",
-                      self._platform_id, self._platform_attributes)
-        else:
-            self._platform_attributes = dict((attr.attr_id, attr.defn) for attr
-                                             in self._pnode.attrs.itervalues())
-            log.warn("%r: platform attributes taken from network definition: %s",
-                     self._platform_id, self._platform_attributes)
-
-        #
-        # set platform ports:
-        # TODO the ports may probably be applicable only in particular
-        # drivers (like in RSN), so move these there if that's the case.
-        #
         if 'ports' in self._driver_config:
-            ports = self._driver_config['ports']
-            self._platform_ports = ports
-            log.debug("%r: platform ports taken from driver_config: %s",
-                      self._platform_id, self._platform_ports)
-        else:
-            self._platform_ports = {}
-            for port_id, port in self._pnode.ports.iteritems():
-                self._platform_ports[port_id] = dict(port_id=port_id,
-                                                     network=port.network)
-            log.warn("%r: platform ports taken from network definition: %s",
-                     self._platform_id, self._platform_ports)
+            # Remove this device from the ports information, the driver does not use this
+            platform_port = self._driver_config['ports'].pop(self.resource_id, None)
+            log.debug('_validate_configuration removed platform port info from ports config for driver.  dev_id:  %s   platform_port: %s', self.resource_id, platform_port)
 
         ppid = self._plat_config.get('parent_platform_id', None)
         if ppid:
             self._parent_platform_id = ppid
             log.debug("_parent_platform_id set to: %s", self._parent_platform_id)
 
+        self._provider_id = self.CFG.get('provider_id', None)
+        if self._provider_id is None:
+            log.warn("%r: [xa] 'provider_id' key not in configuration", self._platform_id)
+        self._actor_id = self.CFG.get('actor_id', None)
+        if self._actor_id is None:
+            log.warn("%r: [xa] 'actor_id' key not in configuration", self._platform_id)
+
         self._plat_config_processed = True
 
-        log.debug("%r: _validate_configuration complete",  self._platform_id)
+        log.debug("%r: _validate_configuration complete", self._platform_id)
+        return self._platform_id
+
+    def _create_network_definition_from_CFG(self):
+        """
+        @raises PlatformException if any exception
+        """
+        try:
+            self._network_definition = NetworkUtil.create_network_definition_from_ci_config(self.CFG)
+            log.debug("%r: created network_definition from CFG", self._platform_id)
+        except NetworkDefinitionException as ex:
+            # just re-raise as PlatformConfigurationException
+            raise PlatformConfigurationException(msg=ex.msg)
+        except Exception as ex:
+            log.exception("unexpected exception in NetworkUtil.create_network_definition_from_ci_config")
+            raise PlatformException(reason=ex)
 
     def _children_launch(self):
         """
@@ -484,7 +425,7 @@ class PlatformAgent(ResourceAgent):
         # launch the sub-platform agents:
         try:
             self._subplatforms_launch()
-        except:
+        except Exception:
             log.exception("PlatformAgent %r: _children_launch greenlet, exception while launching sub-platform agents", self._platform_id)
         log.info("PlatformAgent %r: _children_launch greenlet, launching sub-platform agents completed", self._platform_id)
 
@@ -492,20 +433,20 @@ class PlatformAgent(ResourceAgent):
         # launch the instrument agents:
         try:
             self._instruments_launch()
-        except:
+        except Exception:
             log.exception("PlatformAgent %r: _children_launch greenlet, exception while launching instrument agents", self._platform_id)
         log.info("PlatformAgent %r: _children_launch greenlet, launching instrument agents completed", self._platform_id)
 
         # Ready, children launched and event subscribers in place
         try:
             self._async_children_launched.set()
-        except:
+        except Exception:
             log.exception("PlatformAgent %r: _children_launch greenlet, exception while trying to set self._async_children_launched", self._platform_id)
 
         #processing complete so unblock fsm and accept cmds
         try:
             self._fsm.on_event(PlatformAgentEvent.LAUNCH_COMPLETE)
-        except:
+        except Exception:
             log.exception("PlatformAgent %r: _children_launch greenlet, fsm exception for LAUNCH_COMPLETE event", self._platform_id)
 
         log.info("PlatformAgent %r: _children_launch greenlet stopping", self._platform_id)
@@ -615,37 +556,42 @@ class PlatformAgent(ResourceAgent):
                   self._platform_id, attempts, curr_state)
 
     ##############################################################
-    # Operations on "this platform," that is, operations that act on the
-    # platform itself (and that are called by operations that also dispatch
+    # *_this_platform operations are operations that act on the
+    # platform itself (these are called by operations that also dispatch
     # the associated command on the children)
     ##############################################################
 
     def _initialize_this_platform(self):
         """
         Does the main initialize sequence for this platform: creation of
-        publishers and creation/configuration of the driver.
+        publishers, creation/configuration of the driver, creation of mission
+        manager.
         """
         self._asp = PlatformAgentStreamPublisher(self)
         self._create_driver()
         self._configure_driver()
+        self._mission_manager = MissionManager(self)
         log.debug("%r: _initialize_this_platform completed.", self._platform_id)
 
-    def _go_active_this_platform(self):
+    def _go_active_this_platform(self, recursion=None):
         """
         Connects the driver
         and resets stream publisher connection id and index.
         """
         log.debug("%r: triggering driver event CONNECT", self._platform_id)
-        self._trigger_driver_event(PlatformDriverEvent.CONNECT)
+
+        kwargs = dict(recursion=recursion)
+        self._trigger_driver_event(PlatformDriverEvent.CONNECT, **kwargs)
 
         self._asp.reset_connection()
 
-    def _go_inactive_this_platform(self):
+    def _go_inactive_this_platform(self, recursion=None):
         """
         Disconnects the driver.
         """
         log.debug("%r: triggering driver event DISCONNECT")
-        self._trigger_driver_event(PlatformDriverEvent.DISCONNECT)
+        kwargs = dict(recursion=recursion)
+        self._trigger_driver_event(PlatformDriverEvent.DISCONNECT, **kwargs)
 
     def _run_this_platform(self):
         """
@@ -657,7 +603,8 @@ class PlatformAgent(ResourceAgent):
 
     def _reset_this_platform(self):
         """
-        Resets this platform agent (stops resource monitoring, destroys driver).
+        Resets this platform agent: stops resource monitoring,
+        destroys driver, resets publishers, destroys mission manager.
 
         The "platform_config" configuration object provided via self.CFG
         (see on_init) is kept. This allows to issue the INITIALIZE command
@@ -681,6 +628,10 @@ class PlatformAgent(ResourceAgent):
 
         if self._asp:
             self._asp.reset()
+
+        if self._mission_manager:
+            self._mission_manager.destroy()
+            self._mission_manager = None
 
     def _shutdown_this_platform(self):
         """
@@ -879,7 +830,9 @@ class PlatformAgent(ResourceAgent):
         try:
             module = __import__(driver_module, fromlist=[driver_class])
             classobj = getattr(module, driver_class)
-            driver = classobj(self._pnode, self.evt_recv)
+            driver = classobj(self._pnode, self.evt_recv,
+                              self._create_event_subscriber,
+                              self._destroy_event_subscriber)
 
         except Exception as e:
             msg = '%r: could not import/construct driver: module=%r, class=%r' % (
@@ -920,7 +873,6 @@ class PlatformAgent(ResourceAgent):
         if log.isEnabledFor(logging.DEBUG):
             log.debug("%r: driver configured." % self._platform_id)
 
-
     def _get_attribute_values(self, attrs):
         """
         The callback for resource monitoring.
@@ -932,15 +884,6 @@ class PlatformAgent(ResourceAgent):
             raise PlatformDriverException(msg)
         kwargs = dict(attrs=attrs)
         result = self._plat_driver.get_resource(**kwargs)
-        return result
-
-    def _set_attribute_values(self, attrs):
-        if self._plat_driver is None:
-            msg = "PlatformAgent._set_attribute_values: _create_driver must be called first"
-            log.error(msg)
-            raise PlatformDriverException(msg)
-        kwargs = dict(attrs=attrs)
-        result = self._plat_driver.set_resource(**kwargs)
         return result
 
     ##############################################################
@@ -955,6 +898,10 @@ class PlatformAgent(ResourceAgent):
 
         if isinstance(driver_event, AttributeValueDriverEvent):
             self._asp.handle_attribute_value_event(driver_event)
+            return
+
+        if isinstance(driver_event, ExternalEventDriverEvent):
+            self._handle_external_event_driver_event(driver_event)
             return
 
         if isinstance(driver_event, StateChangeDriverEvent):
@@ -981,7 +928,7 @@ class PlatformAgent(ResourceAgent):
                                                 origin_type=self.ORIGIN_TYPE,
                                                 origin=self.resource_id,
                                                 **event_data)
-        except:
+        except Exception:
             log.exception('%r: platform agent could not publish driver state change event',
                           self._platform_id)
 
@@ -1000,6 +947,16 @@ class PlatformAgent(ResourceAgent):
                 self._aam.process_alerts(stream_name=stream_name,
                                          value=value, value_id=param_name)
 
+    def _handle_external_event_driver_event(self, driver_event):
+        """
+        Dispatches any needed handling arising from the external the event.
+        """
+        # TODO any needed external event dispatch handling.
+
+        evt = driver_event.event_instance
+
+        # log.debug("%r: handling external platform event: %s", self._platform_id, evt)
+
     def _async_driver_event_agent_event(self, event):
         """
         Driver initiated agent FSM event.
@@ -1010,7 +967,7 @@ class PlatformAgent(ResourceAgent):
         try:
             self._fsm.on_event(event)
 
-        except:
+        except Exception:
             log.warn("%r/%s: error processing asynchronous agent event %s",
                      self._platform_id, self.get_agent_state(), event)
 
@@ -1204,6 +1161,12 @@ class PlatformAgent(ResourceAgent):
     def _get_recursion_parameter(self, method_name, *args, **kwargs):
         """
         Utility to extract the 'recursion' parameter.
+
+        @param method_name   for logging purposes
+        @param *args         as received by FSM handler (not used)
+        @param *kwargs       as received by FSM handler
+        @return              The boolean value of the 'recursion' parameter in
+                             kwargs; True by default.
         """
         recursion = kwargs.get('recursion', None)
         if recursion is None:
@@ -1303,9 +1266,10 @@ class PlatformAgent(ResourceAgent):
 
     def _launch_platform_agent(self, subplatform_id):
         """
-        Launches a sub-platform agent (f not already running) and waits until
+        Launches a sub-platform agent (if not already running) and waits until
         the sub-platform transitions to UNINITIALIZED state.
         It creates corresponding ResourceAgentClient,
+        set entry self._pa_clients[subplatform_id],
         and publishes device_added event.
 
         The mechanism to detect whether the sub-platform agent is already
@@ -1334,8 +1298,7 @@ class PlatformAgent(ResourceAgent):
             # it is actually running.
 
             # get PID:
-            # TODO is there a more public method to get the pid?
-            pid = ResourceAgentClient._get_agent_process_id(sub_resource_id)
+            pid = pa_client.get_agent_process_id()
 
             log.debug("%r: [LL] my child is already running: %r. pid=%s",
                       self._platform_id, subplatform_id, pid)
@@ -1478,19 +1441,13 @@ class PlatformAgent(ResourceAgent):
                                                                      err_msg)
         return err_msg
 
-    def _get_subplatform_ids(self):
-        """
-        Gets the IDs of my sub-platforms.
-        """
-        return self._pnode.subplatforms.keys()
-
     def _subplatforms_launch(self):
         """
-        Launches all my sub-platforms storing the corresponding
+        Launches all my configured sub-platforms storing the corresponding
         ResourceAgentClient objects in _pa_clients.
         """
         self._pa_clients.clear()
-        subplatform_ids = self._get_subplatform_ids()
+        subplatform_ids = self._pnode.subplatforms.keys()
         if len(subplatform_ids):
             log.debug("%r: launching subplatforms %s", self._platform_id, subplatform_ids)
             for subplatform_id in subplatform_ids:
@@ -1501,7 +1458,8 @@ class PlatformAgent(ResourceAgent):
 
     def _subplatforms_initialize(self):
         """
-        Initializes all my sub-platforms.
+        Initializes all my sub-platforms that have been launched and not
+        currently invalidated.
 
         Note that invalidated children are ignored.
 
@@ -1510,7 +1468,7 @@ class PlatformAgent(ResourceAgent):
         log.debug("%r: _subplatforms_initialize. _pa_clients=%s",
                   self._platform_id, self._pa_clients)
 
-        subplatform_ids = self._get_subplatform_ids()
+        subplatform_ids = self._pa_clients.keys()
         children_with_errors = {}
 
         if not len(subplatform_ids):
@@ -1542,6 +1500,8 @@ class PlatformAgent(ResourceAgent):
                                     expected_state=None):
         """
         Supporting routine for various commands sent to sub-platforms.
+        Executes a command on sub-platforms that have been launched and not
+        currently invalidated
 
         Note that invalidated children are ignored.
 
@@ -1557,10 +1517,7 @@ class PlatformAgent(ResourceAgent):
         @return dict with children having caused some error. Empty if all
                 children were processed OK.
         """
-        subplatform_ids = self._get_subplatform_ids()
-        if set(subplatform_ids) != set(self._pa_clients.keys()) :
-            raise PlatformException("PlatformAgent._subplatforms_execute_agent: platform ids %s does not equal pa client ids %s ",
-                                    subplatform_ids, self._pa_clients.keys())
+        subplatform_ids = self._pa_clients.keys()
 
         children_with_errors = {}
 
@@ -1745,7 +1702,6 @@ class PlatformAgent(ResourceAgent):
 
         return children_with_errors
 
-
     def _shutdown_and_terminate_subplatform(self, subplatform_id):
         """
         Executes SHUTDOWN with recursion=True on the given sub-platform and
@@ -1774,7 +1730,7 @@ class PlatformAgent(ResourceAgent):
             # execute command:
             try:
                 retval = self._execute_platform_agent(dd.pa_client, cmd, subplatform_id)
-            except:
+            except Exception:
                 err_msg = "%r: exception executing command %r in subplatform %r" % (
                           self._platform_id, cmd, subplatform_id)
                 log.exception(err_msg)
@@ -1789,7 +1745,7 @@ class PlatformAgent(ResourceAgent):
                               self._platform_id, expected_state, state)
                     log.error(err_msg)
                     return err_msg
-            except:
+            except Exception:
                 err_msg = "%r: exception while calling get_agent_state to subplatform %r" % (
                           self._platform_id, subplatform_id)
                 log.exception(err_msg)
@@ -1813,7 +1769,7 @@ class PlatformAgent(ResourceAgent):
 
                 return None
 
-            except:
+            except Exception:
                 if log.isEnabledFor(logging.TRACE):
                     err_msg = "%r: Exception in cancel_process for subplatform_id=%r, pid=%r" % (
                               self._platform_id, subplatform_id, pid)
@@ -1841,16 +1797,14 @@ class PlatformAgent(ResourceAgent):
 
     def _subplatforms_shutdown_and_terminate(self):
         """
-        Executes SHUTDOWN with recursion=True on all sub-platform and then
-        terminates those sub-platform process.
+        Executes SHUTDOWN with recursion=True on all sub-platforms that have
+        been launched and not currently invalidated, and then
+        terminates those sub-platform processes.
 
         @return dict with children having caused some error. Empty if all
                 children were processed OK.
         """
-        subplatform_ids = self._get_subplatform_ids()
-        if set(subplatform_ids) != set(self._pa_clients.keys()) :
-            raise PlatformException("PlatformAgent._subplatforms_shutdown_and_terminate: platform ids %s does not equal pa client ids %s ",
-                                    subplatform_ids, self._pa_clients.keys())
+        subplatform_ids = self._pa_clients.keys()
 
         children_with_errors = {}
         if len(subplatform_ids):
@@ -1915,12 +1869,6 @@ class PlatformAgent(ResourceAgent):
 
     def _execute_instrument_agent(self, a_client, cmd, sub_id):
         return self._execute_agent("instrument", a_client, cmd, sub_id)
-
-    def _get_instrument_ids(self):
-        """
-        Gets the IDs of my instruments.
-        """
-        return self._pnode.instruments.keys()
 
     def _ping_instrument(self, instrument_id):
         log.debug("%r: _ping_instrument -> %r",
@@ -1992,7 +1940,7 @@ class PlatformAgent(ResourceAgent):
 
     def _launch_instrument_agent(self, instrument_id):
         """
-        Launches an instrument agent (f not already running).
+        Launches an instrument agent (if not already running).
         It creates corresponding ResourceAgentClient,
         and publishes device_added event.
 
@@ -2005,7 +1953,8 @@ class PlatformAgent(ResourceAgent):
         # get InstrumentsNode, corresponding CFG, and resource_id:
         inode = self._pnode.instruments[instrument_id]
         i_CFG = inode.CFG
-        i_resource_id = i_CFG.get("agent", {}).get("resource_id", None)
+        agent_CFG = i_CFG.get("agent", {})
+        i_resource_id = agent_CFG.get("resource_id", None)
 
         if i_resource_id is None:
             log.error("PlatformAgent._launch_instrument_agent: agent.resource_id must be present for child %r" % instrument_id)
@@ -2024,8 +1973,7 @@ class PlatformAgent(ResourceAgent):
             # it is running.
 
             # get PID:
-            # TODO is there a more public method to get the pid?
-            pid = ResourceAgentClient._get_agent_process_id(i_resource_id)
+            pid = ia_client.get_agent_process_id()
 
         except NotFound:
             # not running.
@@ -2073,17 +2021,18 @@ class PlatformAgent(ResourceAgent):
 
         self._ia_clients[instrument_id] = DotDict(ia_client=ia_client,
                                                   pid=pid,
-                                                  resource_id=i_resource_id)
+                                                  resource_id=i_resource_id,
+                                                  alt_ids=agent_CFG.get("alt_ids", []))
 
         self._status_manager.instrument_launched(ia_client, i_resource_id)
 
     def _instruments_launch(self):
         """
-        Launches all my instruments storing the corresponding
+        Launches all my configured instruments storing the corresponding
         ResourceAgentClient objects in _ia_clients.
         """
         self._ia_clients.clear()
-        instrument_ids = self._get_instrument_ids()
+        instrument_ids = self._pnode.instruments.keys()
         if len(instrument_ids):
             log.debug("%r: launching instruments %s", self._platform_id, instrument_ids)
             for instrument_id in instrument_ids:
@@ -2093,13 +2042,13 @@ class PlatformAgent(ResourceAgent):
 
     def _instruments_initialize(self):
         """
-        Initializes all my instruments.
+        Initializes all my launched not-invalidated instruments.
 
         Note that invalidated children are ignored.
 
         @return dict with failing children. Empty if all ok.
         """
-        instrument_ids = self._get_instrument_ids()
+        instrument_ids = self._ia_clients.keys()
         children_with_errors = {}
 
         if not len(instrument_ids):
@@ -2127,42 +2076,127 @@ class PlatformAgent(ResourceAgent):
 
         return children_with_errors
 
-    def _instruments_execute_agent(self, command=None, create_command=None,
-                                   expected_state=None):
+    def _instruments_execute_agent(self, command, expected_state):
         """
         Supporting routine for various commands sent to instruments.
+        Executes a command on instruments that have been launched and not
+        currently invalidated.
+
+        If expected_state is not None, the command will actually NOT be issued
+        against a child agent if that child is already in this state,
+        or if its current state is already at a "level of activation" in the
+        "direction" of the command. The level of activation for this purpose
+        is given by the following ordering of relevant states:
+
+         UNINITIALIZED < INACTIVE < IDLE < COMMAND < STREAMING
+
+        Example: If command = CLEAR (which "decreases" level of activation)
+        and expected_state = IDLE, then the command is *not* issued if child's
+        current state is UNINITIALIZED, INACTIVE, or IDLE.
 
         Note that invalidated children are ignored.
 
-        @param create_command invoked as create_command(instrument_id) for each
-                              instrument to create the command to be executed.
-
-        @param expected_state  If given, it is checked that the child gets to
-                               this state.
+        @param command
+                    Command to be issued
+        @param expected_state
+                    Desired state to determine if current state is acceptable
+                    (in which case the command is not actually issued).
 
         @return dict with children having caused some error. Empty if all
                 children were processed OK.
         """
-        instrument_ids = self._get_instrument_ids()
-        if set(instrument_ids) != set(self._ia_clients.keys()) :
-            raise PlatformException("PlatformAgent._instruments_execute_agent: instrument ids %s does not equal ia client ids %s ",
-                                    instrument_ids, self._ia_clients.keys())
+
+        # act only on the children that are not invalidated:
+        valid_clients = dict((k, v) for k, v in self._ia_clients.iteritems()
+                             if v != _INVALIDATED_CHILD)
+
+        instrument_ids = valid_clients.keys()
 
         children_with_errors = {}
 
         if not len(instrument_ids):
             return children_with_errors
 
-        # act only on the children that are not invalidated:
-        valid_clients = dict((k, v) for k, v in self._ia_clients.iteritems()
-                             if v != _INVALIDATED_CHILD)
-
         if not len(valid_clients):
             log.warn("%r: OOIION-1077 all instrument children (%s) are "
                      "invalidated or could not be re-validated. Not executing"
-                     " command. command=%r, create_command=%r",
-                     self._platform_id, instrument_ids, command, create_command)
+                     " command. command=%r",
+                     self._platform_id, instrument_ids, command)
             return children_with_errors   # that is, none.
+
+        def acceptable_state(current_state, expected_state, command):
+            """
+            Returns true only if the instrument's current state is acceptable
+            for the desired expected state.
+            """
+            def activation_level(state):
+                """
+                Returns number for ordering purposes; None if state is not
+                associated with any activation level.
+                """
+                order = [
+                    ResourceAgentState.UNINITIALIZED,
+                    ResourceAgentState.INACTIVE,
+                    ResourceAgentState.IDLE,
+                    ResourceAgentState.COMMAND,
+                    ResourceAgentState.STREAMING,
+                ]
+                return order.index(state) if state in order else None
+
+            def compare_states(state1, state2):
+                """
+                Returns numeric result of comparison; None if the states are
+                not comparable.
+                """
+                al1 = activation_level(state1)
+                al2 = activation_level(state2)
+                if al1 is None or al2 is None:
+                    return None
+                else:
+                    return int(al1) - int(al2)
+
+            def activation_level_direction(command):
+                """
+                Returns 'incr' or 'decr' if command increases or
+                decreases activation level; otherwise None.
+                """
+                incr_commands = [
+                    ResourceAgentEvent.GO_ACTIVE,
+                    ResourceAgentEvent.RUN,
+                    DriverEvent.START_AUTOSAMPLE,
+                ]
+                decr_commands = [
+                    ResourceAgentEvent.RESET,
+                    ResourceAgentEvent.GO_INACTIVE,
+                    DriverEvent.STOP_AUTOSAMPLE,
+                    ResourceAgentEvent.CLEAR,
+                ]
+                if command in incr_commands:
+                    return 'incr'
+                elif command in decr_commands:
+                    return 'decr'
+                else:
+                    return None
+
+            acceptable = False
+
+            if current_state == expected_state:
+                log.trace("%r: instrument %r already in state: %r",
+                          self._platform_id, instrument_id, expected_state)
+                acceptable = True
+            else:
+                comp = compare_states(current_state, expected_state)
+                actl = activation_level_direction(command)
+                if comp is not None:
+                    acceptable = (comp <= 0 and actl == 'decr') or \
+                                 (comp > 0  and actl == 'incr')
+
+                log.debug("%r: instrument %r: current_state=%r expected_state=%r"
+                          " command=%r, comp=%s, actl=%s, acceptable_state=%s",
+                          self._platform_id, instrument_id,
+                          current_state, expected_state,
+                          command, comp, actl, acceptable)
+            return acceptable
 
         def execute_cmd(instrument_id, cmd):
             ia_client = valid_clients[instrument_id].ia_client
@@ -2199,26 +2233,17 @@ class PlatformAgent(ResourceAgent):
 
             return None
 
-        if command:
-            log.debug("%r: executing command %r on my instruments: %s",
-                      self._platform_id, command, valid_clients.keys())
-        else:
-            log.debug("%r: executing command on my instruments: %s",
-                      self._platform_id, valid_clients.keys())
+        log.debug("%r: executing command %r on my instruments: %s",
+                  self._platform_id, command, valid_clients.keys())
 
         for instrument_id in valid_clients:
             if expected_state:
                 ia_client = valid_clients[instrument_id].ia_client
-                sub_state = ia_client.get_agent_state()
-                if expected_state == sub_state:
-                    #
-                    # already in the desired state; do nothing for this child:
-                    #
-                    log.trace("%r: instrument %r already in state: %r",
-                              self._platform_id, instrument_id, expected_state)
+                current_state = ia_client.get_agent_state()
+                if acceptable_state(current_state, expected_state, command):
                     continue
 
-            cmd = AgentCommand(command=command) if command else create_command(instrument_id)
+            cmd = AgentCommand(command=command)
             err_msg = execute_cmd(instrument_id, cmd)
 
             if err_msg is not None:
@@ -2285,7 +2310,6 @@ class PlatformAgent(ResourceAgent):
 
         return children_with_errors
 
-
     def _instruments_start_streaming(self):
         """
         Executes START_AUTOSAMPLE on all my instruments.
@@ -2349,7 +2373,7 @@ class PlatformAgent(ResourceAgent):
             try:
                 retval = self._execute_instrument_agent(ia_client, cmd,
                                                         instrument_id)
-            except:
+            except Exception:
                 err_msg = "%r: exception executing command %r in instrument %r" % (
                           self._platform_id, cmd, instrument_id)
                 log.exception(err_msg) #, exc_Info=True)
@@ -2367,7 +2391,7 @@ class PlatformAgent(ResourceAgent):
 
                 return None
 
-            except:
+            except Exception:
                 err_msg = "%r: exception while calling get_agent_state to instrument %r" % (
                           self._platform_id, instrument_id)
                 log.exception(err_msg) #, exc_Info=True)
@@ -2391,7 +2415,7 @@ class PlatformAgent(ResourceAgent):
 
                 return None
 
-            except:
+            except Exception:
                 log.exception("%r: exception in cancel_process for instrument_id=%r, pid=%r",
                               self._platform_id, instrument_id, pid)  # , exc_Info=True)
 
@@ -2410,23 +2434,22 @@ class PlatformAgent(ResourceAgent):
 
     def _instruments_shutdown_and_terminate(self):
         """
-        Executes RESET and terminates all my instruments.
+        Executes RESET and terminates all my currently valid instruments.
         ("shutting down" the instruments is just resetting them.)
 
         @return dict with children having caused some error. Empty if all
                 children were processed OK.
         """
-        instrument_ids = self._get_instrument_ids()
-        if set(instrument_ids) != set(self._ia_clients.keys()) :
-            raise PlatformException("PlatformAgent._instruments_shutdown_and_terminate: instrument ids %s does not equal ia client ids %s ",
-                                    instrument_ids, self._ia_clients.keys())
-
         instruments_with_errors = {}
-        if len(instrument_ids):
-            for instrument_id in instrument_ids:
-                err_msg = self._shutdown_and_terminate_instrument(instrument_id)
-                if err_msg is not None:
-                    instruments_with_errors[instrument_id] = err_msg
+
+        # Act only on the children that are not invalidated:
+        valid_clients = dict((k, v) for k, v in self._ia_clients.iteritems()
+                             if v != _INVALIDATED_CHILD)
+
+        for instrument_id in valid_clients:
+            err_msg = self._shutdown_and_terminate_instrument(instrument_id)
+            if err_msg is not None:
+                instruments_with_errors[instrument_id] = err_msg
 
         return instruments_with_errors
 
@@ -2485,10 +2508,6 @@ class PlatformAgent(ResourceAgent):
         @param recursion   True to initialize children.
 
         """
-        if self._plat_config is None:
-            msg = "PlatformAgent._initialize: 'platform_config must have been provided"
-            log.error(msg)
-            raise PlatformConfigurationException(msg)
 
         log.info("%r: _initializing with provided platform_config...",
                  self._plat_config['platform_id'])
@@ -2508,7 +2527,7 @@ class PlatformAgent(ResourceAgent):
                 self._async_children_launched.get(timeout=self._timeout)
                 log.debug("%r: _children_launch: LAUNCHED. Continuing with initialization",
                           self._platform_id)
-            except:
+            except Exception:
                 #
                 # Do not proceed further with initialization of children.
                 #
@@ -2525,7 +2544,7 @@ class PlatformAgent(ResourceAgent):
                 # initialize sub-platforms
                 self._subplatforms_initialize()
 
-            except:
+            except Exception:
                 log.exception("%r: unexpected exception while initializing children: "
                               "any errors during this initialization should have "
                               "been handled with event notifications.", self._platform_id)
@@ -2545,7 +2564,7 @@ class PlatformAgent(ResourceAgent):
         """
 
         # first myself
-        self._go_active_this_platform()
+        self._go_active_this_platform(recursion=recursion)
 
         # then instruments and sub-platforms
         if recursion:
@@ -2553,7 +2572,7 @@ class PlatformAgent(ResourceAgent):
                 self._instruments_go_active()
                 self._subplatforms_go_active()
 
-            except:
+            except Exception:
                 log.exception("%r: unexpected exception while sending go_active to children: "
                               "any errors during this sequence should have "
                               "been handled with event notifications.", self._platform_id)
@@ -2606,7 +2625,7 @@ class PlatformAgent(ResourceAgent):
                             instruments_with_errors=instruments_with_errors)
 
         # then myself:
-        self._go_inactive_this_platform()
+        self._go_inactive_this_platform(recursion=recursion)
         return None
 
     def _run(self, recursion):
@@ -2626,7 +2645,7 @@ class PlatformAgent(ResourceAgent):
                 self._instruments_run()
                 self._subplatforms_run()
 
-            except:
+            except Exception:
                 log.exception("%r: unexpected exception while sending RUN to children: "
                               "any errors during this sequence should have "
                               "been handled with event notifications.", self._platform_id)
@@ -2873,7 +2892,6 @@ class PlatformAgent(ResourceAgent):
         self._clear_this_platform()
         return None
 
-
     def _start_resource_monitoring(self, recursion):
         """
         Starts resource monitoring.
@@ -2893,6 +2911,10 @@ class PlatformAgent(ResourceAgent):
                 the corresp children.
         """
 
+        if self._plat_driver is None:
+            msg = "%r: _start_resource_monitoring: _create_driver must be called first" % self._platform_id
+            log.error(msg)
+            raise PlatformDriverException(msg)
 
         if recursion:
             # first sub-platforms:
@@ -2909,13 +2931,9 @@ class PlatformAgent(ResourceAgent):
                           "instruments_with_errors=%s",
                           self._platform_id, subplatforms_with_errors, instruments_with_errors)
 
-        if self._plat_driver is None:
-            msg = "PlatformAgent._start_resource_monitoring: _create_driver must be called first"
-            log.error(msg)
-            raise PlatformDriverException(msg)
-
+        platform_attributes = self._plat_driver.get_attributes()
         self._platform_resource_monitor = PlatformResourceMonitor(
-            self._platform_id, self._platform_attributes,
+            self._platform_id, platform_attributes,
             self._get_attribute_values, self.evt_recv)
 
         self._platform_resource_monitor.start_resource_monitoring()
@@ -2974,7 +2992,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_uninitialized_initialize", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_uninitialized_initialize", *args, **kwargs)
 
         next_state = PlatformAgentState.INACTIVE
         result = self._initialize(recursion)
@@ -2992,7 +3010,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_inactive_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_inactive_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -3009,7 +3027,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_inactive_go_active", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_inactive_go_active", *args, **kwargs)
 
         next_state = PlatformAgentState.IDLE
         result = self._go_active(recursion)
@@ -3027,7 +3045,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_idle_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_idle_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -3044,7 +3062,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_idle_go_inactive", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_idle_go_inactive", *args, **kwargs)
 
         next_state = PlatformAgentState.INACTIVE
         result = self._go_inactive(recursion)
@@ -3061,7 +3079,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_idle_run", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_idle_run", *args, **kwargs)
 
         next_state = PlatformAgentState.COMMAND
         result = self._run(recursion)
@@ -3079,7 +3097,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_stopped_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_stopped_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -3096,7 +3114,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                       self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_stopped_go_inactive", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_stopped_go_inactive", *args, **kwargs)
 
         next_state = PlatformAgentState.INACTIVE
         result = self._go_inactive(recursion)
@@ -3114,7 +3132,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_stopped_resume", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_stopped_resume", *args, **kwargs)
 
         next_state = PlatformAgentState.COMMAND
         result = self._resume(recursion)
@@ -3132,7 +3150,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_stopped_clear", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_stopped_clear", *args, **kwargs)
 
         next_state = PlatformAgentState.IDLE
         result = self._clear(recursion)
@@ -3153,7 +3171,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_command_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_command_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -3171,7 +3189,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_command_clear", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_command_clear", *args, **kwargs)
 
         next_state = PlatformAgentState.IDLE
         result = self._clear(recursion)
@@ -3189,7 +3207,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_command_pause", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_command_pause", *args, **kwargs)
 
         next_state = PlatformAgentState.STOPPED
         result = self._pause(recursion)
@@ -3306,14 +3324,14 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_command_start_resource_monitoring", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_start_resource_monitoring", *args, **kwargs)
 
         try:
             result = self._start_resource_monitoring(recursion)
 
             next_state = PlatformAgentState.MONITORING
 
-        except:
+        except Exception:
             log.exception("error in _start_resource_monitoring") #, exc_Info=True)
             raise
 
@@ -3327,14 +3345,14 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                 self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_command_stop_resource_monitoring", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_stop_resource_monitoring", *args, **kwargs)
 
         try:
             result = self._stop_resource_monitoring(recursion)
 
             next_state = PlatformAgentState.COMMAND
 
-        except:
+        except Exception:
             log.exception("error in _stop_resource_monitoring") #, exc_Info=True)
             raise
 
@@ -3379,7 +3397,7 @@ class PlatformAgent(ResourceAgent):
             if self._autoreconnect_greenlet:
                 try:
                     self._fsm.on_event(ResourceAgentEvent.AUTORECONNECT)
-                except:
+                except Exception:
                     pass
 
         log.debug("%r: (LC) _autoreconnect ended", self._platform_id)
@@ -3404,7 +3422,7 @@ class PlatformAgent(ResourceAgent):
             return None, None
 
         if self._state_when_lost == PlatformAgentState.MONITORING:
-            recursion = self._get_recursion_parameter("_handler_lost_connection_autoreconnect", args, kwargs)
+            recursion = self._get_recursion_parameter("_handler_lost_connection_autoreconnect", *args, **kwargs)
             self._start_resource_monitoring(recursion)
 
         next_state = self._state_when_lost
@@ -3421,7 +3439,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                       self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_lost_connection_reset", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_lost_connection_reset", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._reset(recursion)
@@ -3438,7 +3456,7 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                       self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_lost_connection_go_inactive", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_lost_connection_go_inactive", *args, **kwargs)
 
         next_state = PlatformAgentState.INACTIVE
         result = self._go_inactive(recursion)
@@ -3476,12 +3494,127 @@ class PlatformAgent(ResourceAgent):
             log.trace("%r/%s args=%s kwargs=%s",
                       self._platform_id, self.get_agent_state(), str(args), str(kwargs))
 
-        recursion = self._get_recursion_parameter("_handler_shutdown", args, kwargs)
+        recursion = self._get_recursion_parameter("_handler_shutdown", *args, **kwargs)
 
         next_state = PlatformAgentState.UNINITIALIZED
         result = self._shutdown(recursion)
         if result is not None:
             # problems with children; do not make transition:
+            next_state = None
+
+        return next_state, result
+
+    ##############################################################
+    # mission related handlers
+    ##############################################################
+
+    def _run_mission(self, mission_id, mission_loader, mission_scheduler, instrument_objs):
+        """
+        Method launched in a separate greenlet to run a mission that has been
+        already loaded sucessfully. At the end of the execution, if no remaining
+        missions are executing, EXIT_MISSION is triggered to return to saved state.
+        """
+        time_start = time.time()
+        log.debug('[mm] _run_mission: running mission_id=%r ...', mission_id)
+        self._mission_manager.run_mission(mission_id, mission_loader, mission_scheduler, instrument_objs)
+
+        elapsed_time = time.time() - time_start
+        log.debug('[mm] _run_mission: completed mission_id=%s. elapsed_time=%s',
+                  mission_id, elapsed_time)
+
+        remaining = self._mission_manager.get_number_of_running_missions()
+        if remaining == 0:
+            # check state before attempting the EXIT_MISSION.
+            # (but we could still have a "check-then-act" race condition here)
+            curr_state = self.get_agent_state()
+            if curr_state in [PlatformAgentState.MISSION_COMMAND,
+                              PlatformAgentState.MISSION_STREAMING]:
+                log.debug('[mm] _run_mission: triggering EXIT_MISSION')
+                self._fsm.on_event(PlatformAgentEvent.EXIT_MISSION)
+            else:
+                log.warn('[mm] _run_mission: not triggering EXIT_MISSION: FSM not in '
+                         'mission substate (%s)', curr_state)
+
+    def _handler_mission_run(self, *args, **kwargs):
+        """
+        Loads and executes mission indicated with the kwargs 'mission_id' and 'mission_yml'.
+        The load is done in current thread with an immediate failure (BadRequest) if
+        there's any problem with the mission plan.
+        The execution is started in a separate thread.
+        If not already in a mission state, it saves current state to return to
+        upon all mission executions are completed, and transitions to the
+        appropriate mission substate.
+        """
+        if log.isEnabledFor(logging.TRACE):  # pragma: no cover
+            log.trace("%r/%s args=%s kwargs=%s",
+                      self._platform_id, self.get_agent_state(), str(args), str(kwargs))
+
+        mission_id = kwargs.get('mission_id', None)
+        if mission_id is None:
+            raise FSMError('mission_run: missing mission_id argument')
+        mission_yml = kwargs.get('mission_yml', None)
+        if mission_yml is None:
+            raise FSMError('mission_run: missing mission_yml argument')
+
+        # immediately fail if any problem with the mission plan itself:
+        try:
+            exec_args = self._mission_manager.load_mission(mission_id, mission_yml)
+        except BadRequest as ex:
+            raise
+        except Exception as ex:
+            raise BadRequest('load_mission: %s', ex)
+
+        curr_state = self.get_agent_state()
+        if curr_state in [PlatformAgentState.COMMAND, PlatformAgentState.MONITORING]:
+            # save state to return to when all mission executions are completed
+            self._pre_mission_state = curr_state
+
+            next_state = PlatformAgentState.MISSION_COMMAND if curr_state == \
+                PlatformAgentState.COMMAND else PlatformAgentState.MISSION_STREAMING
+        else:
+            # just stay in the current state:
+            next_state = None
+
+        self._mission_greenlet = spawn(self._run_mission, *exec_args)
+        log.info("%r: started mission execution, mission_id=%r", self._platform_id, mission_id)
+
+        result = None
+        return next_state, result
+
+    def _handler_mission_exit(self, *args, **kwargs):
+        """
+        Simply transitions to saved state prior to mission execution.
+        """
+        if log.isEnabledFor(logging.TRACE):  # pragma: no cover
+            log.trace("%r/%s args=%s kwargs=%s",
+                      self._platform_id, self.get_agent_state(), str(args), str(kwargs))
+
+        next_state = self._pre_mission_state
+        self._pre_mission_state = None
+        result = None
+
+        return next_state, result
+
+    def _handler_mission_abort(self, *args, **kwargs):
+        """
+        Aborts the execution of the mission indicated with the kwarg 'mission_id'.
+        Transitions to saved state if no remaining missions are left running.
+        """
+        if log.isEnabledFor(logging.TRACE):  # pragma: no cover
+            log.trace("%r/%s args=%s kwargs=%s",
+                      self._platform_id, self.get_agent_state(), str(args), str(kwargs))
+
+        mission_id = kwargs.get('mission_id', None)
+        if mission_id is None:
+            raise FSMError('mission_run: missing mission_id argument')
+
+        result = self._mission_manager.abort_mission(mission_id)
+
+        remaining = self._mission_manager.get_number_of_running_missions()
+        if remaining == 0:
+            next_state = self._pre_mission_state
+            self._pre_mission_state = None
+        else:
             next_state = None
 
         return next_state, result
@@ -3608,6 +3741,8 @@ class PlatformAgent(ResourceAgent):
             self._fsm.add_handler(state, PlatformAgentEvent.EXECUTE_RESOURCE, self._handler_execute_resource)
             self._fsm.add_handler(state, PlatformAgentEvent.LOST_CONNECTION, self._handler_connection_lost_driver_event)
 
+            self._fsm.add_handler(state, PlatformAgentEvent.RUN_MISSION, self._handler_mission_run)
+
         # additional COMMAND state event handlers.
         self._fsm.add_handler(PlatformAgentState.COMMAND, PlatformAgentEvent.GO_INACTIVE, self._handler_idle_go_inactive)
         self._fsm.add_handler(PlatformAgentState.COMMAND, PlatformAgentEvent.PAUSE, self._handler_command_pause)
@@ -3624,3 +3759,15 @@ class PlatformAgent(ResourceAgent):
         self._fsm.add_handler(PlatformAgentState.LOST_CONNECTION, PlatformAgentEvent.AUTORECONNECT, self._handler_lost_connection_autoreconnect)
         self._fsm.add_handler(PlatformAgentState.LOST_CONNECTION, PlatformAgentEvent.GO_INACTIVE, self._handler_lost_connection_go_inactive)
         self._fsm.add_handler(PlatformAgentState.LOST_CONNECTION, PlatformAgentEvent.GET_RESOURCE_STATE, self._handler_get_resource_state)
+
+        # MISSION_COMMAND state event handlers.
+        self._fsm.add_handler(PlatformAgentState.MISSION_COMMAND, PlatformAgentEvent.RUN_MISSION, self._handler_mission_run)
+        self._fsm.add_handler(PlatformAgentState.MISSION_COMMAND, PlatformAgentEvent.EXIT_MISSION, self._handler_mission_exit)
+        self._fsm.add_handler(PlatformAgentState.MISSION_COMMAND, PlatformAgentEvent.ABORT_MISSION, self._handler_mission_abort)
+        self._fsm.add_handler(PlatformAgentState.MISSION_COMMAND, PlatformAgentEvent.EXECUTE_RESOURCE, self._handler_execute_resource)
+
+        # MISSION_STREAMING state event handlers.
+        self._fsm.add_handler(PlatformAgentState.MISSION_STREAMING, PlatformAgentEvent.RUN_MISSION, self._handler_mission_run)
+        self._fsm.add_handler(PlatformAgentState.MISSION_STREAMING, PlatformAgentEvent.EXIT_MISSION, self._handler_mission_exit)
+        self._fsm.add_handler(PlatformAgentState.MISSION_STREAMING, PlatformAgentEvent.ABORT_MISSION, self._handler_mission_abort)
+        self._fsm.add_handler(PlatformAgentState.MISSION_STREAMING, PlatformAgentEvent.EXECUTE_RESOURCE, self._handler_execute_resource)

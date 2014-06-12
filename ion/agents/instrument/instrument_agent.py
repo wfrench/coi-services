@@ -231,6 +231,9 @@ class InstrumentAgent(ResourceAgent):
         # Default initial state.
         self._initial_state = ResourceAgentState.UNINITIALIZED
 
+    def _build_stream_publisher(self):
+        return AgentStreamPublisher(self)
+
     def on_init(self):
         """
         Instrument agent pyon process initialization.
@@ -244,7 +247,7 @@ class InstrumentAgent(ResourceAgent):
         self._test_mode = self.CFG.get('test_mode', False)        
 
         # Set up streams.
-        self._asp = AgentStreamPublisher(self)        
+        self._asp = self._build_stream_publisher()
         self._agent_schema['streams'] = copy.deepcopy(self.aparam_streams)
         
         # Set up alert manager.
@@ -1099,7 +1102,7 @@ class InstrumentAgent(ResourceAgent):
         """
         Route async event received from driver.
         """
-        log.info('Instrument agent %s got async driver event %s', self.id, evt)
+        log.debug('Instrument agent %s got async driver event %s', self.id, evt)
         try:
             type = evt['type']
             val = evt['value']
@@ -1536,7 +1539,7 @@ class InstrumentAgent(ResourceAgent):
             dvr_mod = self._dvr_config['dvr_mod']
             dvr_cls = self._dvr_config['dvr_cls']
             
-        except TypeError, KeyError:
+        except (TypeError, KeyError):
             return False
         
         if not isinstance(dvr_mod, str) or not isinstance(dvr_cls, str):

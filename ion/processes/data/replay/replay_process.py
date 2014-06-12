@@ -22,6 +22,7 @@ from coverage_model.parameter_functions import ParameterFunctionException
 from interface.services.dm.idataset_management_service import DatasetManagementServiceProcessClient
 from interface.services.dm.ipubsub_management_service import PubsubManagementServiceProcessClient
 from interface.services.dm.ireplay_process import BaseReplayProcess
+from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 
 from pyon.core.exception import CorruptionError
 
@@ -29,6 +30,8 @@ from gevent.event import Event
 from numbers import Number
 import gevent
 import numpy as np
+from datetime import datetime
+import calendar
 
 class ReplayProcess(BaseReplayProcess):
 
@@ -86,6 +89,7 @@ class ReplayProcess(BaseReplayProcess):
         self.stream_id       = self.CFG.get_safe('process.publish_streams.output', '')
         self.stream_def      = pubsub.read_stream_definition(stream_id=self.stream_id)
         self.stream_def_id   = self.stream_def._id
+        self.replay_thread   = None
 
         self.publishing.clear()
         self.play.set()
@@ -208,6 +212,8 @@ class ReplayProcess(BaseReplayProcess):
         try:
             n = coverage.get_parameter_values(field,tdoa=slice_)
         except ParameterFunctionException:
+            log.exception('Parameter Function Exception')
+            # Just don't fill it in 
             return
         if n is None:
             rdt[field] = [n]
@@ -251,7 +257,7 @@ class ReplayProcess(BaseReplayProcess):
         '''
         if self.publishing.is_set():
             return False
-        gevent.spawn(self.replay)
+        self.replay_thread = self._process.thread_manager.spawn(self.replay)
         return True
 
     def replay(self):
@@ -305,6 +311,32 @@ class ReplayProcess(BaseReplayProcess):
             yield outgoing
         coverage.close(timeout=5)
         return 
+
+class RetrieveProcess:
+    '''
+    A class used by processing to get data from a coverage instance
+    '''
+
+    def __init__(self, dataset_id):
+        self.dataset_id = dataset_id
+
+    def retrieve(self, time1, time2):
+        '''
+        Returns all of the values between time1 and time2
+        '''
+        coverage = self.get_coverage()
+        # Convert python datetimes to unix timestamps
+        if isinstance(time1, datetime):
+            time1 = calendar.timegm(time1.timetuple())
+        if isinstance(time2, datetime):
+            time2 = calendar.timegm(time2.timetuple())
+
+        rdt = ReplayProcess._cov2granule(coverage, time1, time2)
+        return rdt
+
+    def get_coverage(self):
+        return DatasetManagementService._get_coverage(self.dataset_id, mode='r')
+
 
 
 

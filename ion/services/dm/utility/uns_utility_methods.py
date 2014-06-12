@@ -3,12 +3,14 @@
 @file ion/services/dm/utility/uns_utility_methods.py
 @description A module containing common utility methods used by UNS and the notification workers.
 """
-from pyon.public import get_sys_name, OT, IonObject, CFG
+from pyon.core import bootstrap
+from pyon.public import get_sys_name, OT, RT, PRED, IonObject, CFG
 from pyon.util.ion_time import IonTime
 from pyon.util.log import log
 from pyon.core.exception import BadRequest, NotFound
-from interface.objects import NotificationRequest, Event, DeviceStatusType, AggregateStatusType
+from interface.objects import NotificationRequest, Event, DeviceStatusType, AggregateStatusType, InformationStatus, NotificationTypeEnum
 from pyon.util.containers import get_ion_ts
+from ion.services.sa.observatory.observatory_util import ObservatoryUtil
 import smtplib
 import gevent
 import pprint
@@ -31,7 +33,7 @@ class fake_smtplib(object):
 
     def sendmail(self, msg_sender= None, msg_recipients=None, msg=None):
         log.warning('Sending fake message from: %s, to: "%s"', msg_sender,  msg_recipients)
-        log.info("Fake message sent: %s", msg)
+        #log.info("Fake message sent: %s", msg)
         self.sent_mail.put((msg_sender, msg_recipients[0], msg))
         log.debug("size of the sent_mail queue::: %s", self.sent_mail.qsize())
 
@@ -81,9 +83,12 @@ def convert_timestamp_to_human_readable(timestamp=''):
     return str(it)
 
 
-def convert_events_to_email_message(events=None, rr_client=None):
+def convert_events_to_email_message(events=None, notifications_map=None, rr_client=None):
 
     if events is None: events = []
+
+    # map event origins to resource objects to provide additional context in the email
+    event_origin_to_resource_map = {}
 
     if 0 == len(events): raise BadRequest("Tried to convert events to email, but none were supplied")
 
@@ -96,6 +101,9 @@ def convert_events_to_email_message(events=None, rr_client=None):
 
     msg_body = ""
 
+    #collect all the resources from the RR in one call
+    event_origin_to_resource_map = _collect_resources_from_event_origins(events=None, rr_client=None)
+
     resource_human_readable = "<uninitialized string>"
     for idx, event in enumerate(events, 1):
 
@@ -103,11 +111,14 @@ def convert_events_to_email_message(events=None, rr_client=None):
 
         # build human readable resource string
         resource_human_readable = "'%s' with ID='%s' (not found)" % (event.origin_type, event.origin)
-        try:
-            resource = rr_client.read(event.origin)
+        notification_name = _get_notification_name(event_id=event._id, notifications_map=notifications_map)
+
+        resource = ''
+        # pull the resource from the map if the origin id was found
+        if event.origin in event_origin_to_resource_map:
+            resource = event_origin_to_resource_map[event.origin]
             resource_human_readable = "%s '%s'" % (type(resource).__name__, resource.name)
-        except NotFound:
-            pass
+
 
         if 1 == len(events):
             eventtitle = "Type"
@@ -116,6 +127,8 @@ def convert_events_to_email_message(events=None, rr_client=None):
 
         msg_body += string.join(("\r\n",
                                  "Event %s: %s" %  (eventtitle, event.type_),
+                                 "",
+                                 "Notification Request Name: %s" %  notification_name,
                                  "",
                                  "Resource: %s" %  resource_human_readable,
                                  "",
@@ -155,6 +168,51 @@ def convert_events_to_email_message(events=None, rr_client=None):
     return msg
 
 
+def _collect_resources_from_event_origins(events=None, rr_client=None):
+
+    unique_origin_ids = set()
+    origin_id_to_resource_map = {}
+
+    if not events or not rr_client:
+        return origin_id_to_resource_map
+
+    #get the unique set of event origin ids
+    for event in events:
+        unique_origin_ids.add(event)
+
+    #pull all the unique origins from the RR in one call
+    resources = []
+    try:
+        resources = rr_client.read_mult( list(unique_origin_ids) )
+    except NotFound:
+    # if not found, move on and do not include the details for that resource in the email msg
+        pass
+
+    #create the mapping
+    for resource in resources:
+       origin_id_to_resource_map[resource._id] = resource
+
+    return origin_id_to_resource_map
+
+
+def _get_notification_name(event_id='', notifications_map=None):
+    notification_names = ''
+
+    if not notifications_map:
+        return notification_names
+
+    names_list = set()
+    if event_id in notifications_map:
+        for notification_obj in notifications_map[event_id]:
+            # loop the list of associated notification requests and append the names
+            names_list.add(notification_obj.name)
+
+        notification_names = ",".join(list(names_list))
+
+    return notification_names
+
+
+
 def send_email(event, msg_recipient, smtp_client, rr_client):
     """
     A common method to send email with formatting
@@ -174,7 +232,7 @@ def send_email(event, msg_recipient, smtp_client, rr_client):
     ION_NOTIFICATION_EMAIL_ADDRESS = 'data_alerts@oceanobservatories.org'
     smtp_sender = CFG.get_safe('server.smtp.sender', ION_NOTIFICATION_EMAIL_ADDRESS)
 
-    msg = convert_events_to_email_message([event], rr_client)
+    msg = convert_events_to_email_message(events=[event], notifications_map=None, rr_client=rr_client)
     msg['From'] = smtp_sender
     msg['To'] = msg_recipient
     log.debug("UNS sending email from %s to %s for event type: %s", smtp_sender,msg_recipient, event.type_)
@@ -361,7 +419,7 @@ def calculate_reverse_user_info(user_info=None):
 
     return reverse_user_info
 
-def get_event_computed_attributes(event):
+def get_event_computed_attributes(event, include_event=False, include_special=False, include_formatted=False):
     """
     @param event any Event to compute attributes for
     @retval an EventComputedAttributes object for given event
@@ -369,16 +427,18 @@ def get_event_computed_attributes(event):
     evt_computed = IonObject(OT.EventComputedAttributes)
     evt_computed.event_id = event._id
     evt_computed.ts_computed = get_ion_ts()
+    evt_computed.event = event if include_event else None
 
     try:
         summary = get_event_summary(event)
         evt_computed.event_summary = summary
 
-        # The following is unused apparently
-        #spc_attrs = ["%s:%s" % (k, str(getattr(event, k))[:50]) for k in sorted(event.__dict__.keys()) if k not in ['_id', '_rev', 'type_', 'origin', 'origin_type', 'ts_created', 'base_types']]
-        #evt_computed.special_attributes = ", ".join(spc_attrs)
+        if include_special:
+            spc_attrs = ["%s:%s" % (k, str(getattr(event, k))[:50]) for k in sorted(event.__dict__.keys()) if k not in ['_id', '_rev', 'type_', 'origin', 'origin_type', 'ts_created', 'base_types']]
+            evt_computed.special_attributes = ", ".join(spc_attrs)
 
-        #evt_computed.event_attributes_formatted = pprint.pformat(event.__dict__)
+        if include_formatted:
+            evt_computed.event_attributes_formatted = pprint.pformat(event.__dict__)
     except Exception as ex:
         log.exception("Error computing EventComputedAttributes for event %s: %s", event, ex)
 
@@ -410,8 +470,16 @@ def get_event_summary(event):
         summary = "%s agent async command '%s(%s)' succeeded: %s" % (event.origin_type, event.command, event.desc, "" if event.result is None else event.result)
     elif "ResourceAgentConnectionLostErrorEvent" in event_types:
         summary = "%s agent: %s (%s)" % (event.origin_type, event.error_msg, event.error_code)
+    elif "ResourceAgentIOEvent" in event_types:
+        stats_str = ",".join(["%s:%s" % (k, event.stats[k]) for k in sorted(event.stats)])
+        summary = "%s agent IO: %s (%s)" % (event.origin_type, event.source_type, stats_str)
     elif "ResourceAgentEvent" in event_types:
         summary = "%s agent: %s" % (event.origin_type, event.type_)
+
+    elif "InformationContentStatusEvent" in event_types:
+        summary = "%s content status: %s (%s)" % (event.origin_type, event.sub_type, InformationStatus._str_map.get(event.status,"???"))
+    elif "InformationContentEvent" in event_types:
+        summary = "%s content event: %s (%s)" % (event.origin_type, event.type_, event.sub_type)
 
     elif "ResourceAgentResourceCommandEvent" in event_types:
         summary = "%s agent resource command '%s(%s)' executed: %s" % (event.origin_type, event.command, event.execute_command, "OK" if event.result is None else event.result)
@@ -421,6 +489,7 @@ def get_event_summary(event):
         summary = "%s '%s' status change: %s   %s " % (event.origin_type, event.sub_type, DeviceStatusType._str_map.get(event.status,"???"), event.description)
         if hasattr(event, 'values') and event.values:
             summary  +=  " values: %s" % event.values
+
     elif "DeviceOperatorEvent" in event_types or "ResourceOperatorEvent" in event_types:
         summary = "Operator entered: %s" % event.description
     elif "ParameterQCEvent" in event_types:
@@ -452,3 +521,95 @@ def get_event_summary(event):
     #        elif event.description:
     #            summary = event.description
     return summary
+
+
+def load_notifications(container=None):
+    """
+    result is dict:
+        key: tuple(origin,origin_type,event_type,event_subtype), matches Event to NotificationRequest
+        value: set() containing tuple(notification,user_info)
+    """
+
+    # clients
+    container = container or bootstrap.container_instance
+    resource_registry = container.resource_registry
+
+    # uses ObservatoryUtil or ResourceRegistry to find children (id) associated with a NotificationRequest
+    def _notification_children(notification_origin, notification_type, observatory_util=None):
+        if observatory_util is None:
+             observatory_util = ObservatoryUtil()
+        children = []
+        if notification_type == NotificationTypeEnum.PLATFORM:
+            device_relations = observatory_util.get_child_devices(notification_origin)
+            children = [did for pt,did,dt in device_relations[notification_origin]]
+        elif type == NotificationTypeEnum.SITE:
+            child_site_dict, ancestors = observatory_util.get_child_sites(notification_origin)
+            children = child_site_dict.keys()
+        elif type == NotificationTypeEnum.FACILITY:
+            objects, _ = resource_registry.find_objects(subject=notification_origin, predicate=PRED.hasResource, id_only=False)
+            for o in objects:
+                if o.type_ == RT.DataProduct \
+                or o.type_ == RT.InstrumentSite \
+                or o.type_ == RT.InstrumentDevice \
+                or o.type_ == RT.PlatformSite \
+                or o.type_ == RT.PlatformDevice:
+                    children.append(o._id)
+        if notification_origin in children:
+            children.remove(notification_origin)
+        return children
+
+    # time when we're loading, used for expired notifications
+    current_datetime = get_ion_ts()
+
+    # return dict, keyed by (origin,origin_type,event_type,event_subtype) tuple, contains list of (notification, user) values
+    notifications = {}
+
+    # all users (full objects)
+    users, _ = resource_registry.find_resources(restype=RT.UserInfo)
+
+    # subject: UserInfo
+    subjects = [u._id for u in users]
+    # hasNotification associations is only way to NotificationRequests, load all associations
+    objects, associations = resource_registry.find_objects_mult(subjects=subjects, id_only=False)
+    # object: NotificationRequest
+    # association.p: hasNotification
+    # association.s: UserInfo
+    for notification, association in zip(objects, associations):
+
+        if association.p == PRED.hasNotification:
+
+            user = [u for u in users if u._id == association.s][0]
+
+            # NotificationRequest disabled by system process?
+            if notification.disabled_by_system:
+                continue
+
+            # NotificationRequest expired? (note this is relative to current time)
+            if notification.temporal_bounds.end_datetime:
+                if int(notification.temporal_bounds.end_datetime) < current_datetime:
+                    continue
+
+            # create tuple key (origin,origin_type,event_type,event_subtype)
+            origin = notification.origin
+            origin_type = notification.origin_type
+            event_type = notification.event_type
+            event_subtype = notification.event_subtype
+            key = (origin, origin_type, event_type, event_subtype)
+
+            # store tuple by key containing set of (NotificationRequest,UserInfo)
+            if key not in notifications:
+                notifications[key] = set()
+            value = (notification, user)
+            notifications[key].add(value)
+
+            # add children if applicable - children have same (event, event_subtype) in key and same (notification, user) for value
+            if notification.type != NotificationTypeEnum.SIMPLE and notification.origin:
+                children = _notification_children(notification_origin=notification.origin, notification_type=notification.type)
+                for child in children: # child is _id
+                    key = (child, '', event_type, event_subtype) # all children match by origin (_id)
+                    if key not in notifications:
+                        notifications[key] = set()
+                    notifications[key].add(value)
+
+    return notifications
+

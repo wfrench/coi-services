@@ -29,7 +29,7 @@ from ion.agents.instrument.test.load_test_driver_egg import load_egg
 load_egg()
 
 
-@attr('INT', group='dm')
+
 class TestInstrumentIntegration(DMTestCase):
 
     def create_instrument_model(self):
@@ -95,12 +95,14 @@ class TestInstrumentIntegration(DMTestCase):
         self.addCleanup(self.instrument_management.stop_instrument_agent_instance, instrument_agent_instance_id)
 
     def create_instrument_data_products(self, instrument_device_id):
-        raw_dp_id = self.create_data_product('raw', param_dict_name='raw') 
+        raw_config = StreamConfiguration(stream_name='raw', parameter_dictionary_name='raw')
+        parsed_config = StreamConfiguration(stream_name='parsed', parameter_dictionary_name='ctd_parsed_param_dict')
+        raw_dp_id = self.create_data_product('raw', param_dict_name='raw', stream_configuration=raw_config)
         self.data_product_management.activate_data_product_persistence(raw_dp_id)
         self.addCleanup(self.data_product_management.suspend_data_product_persistence, raw_dp_id)
         self.data_acquisition_management.assign_data_product(input_resource_id=instrument_device_id, data_product_id=raw_dp_id)
 
-        parsed_dp_id = self.create_data_product('parsed', param_dict_name='ctd_parsed_param_dict')
+        parsed_dp_id = self.create_data_product('parsed', param_dict_name='ctd_parsed_param_dict', stream_configuration=parsed_config)
         self.data_product_management.activate_data_product_persistence(parsed_dp_id)
         self.addCleanup(self.data_product_management.suspend_data_product_persistence, parsed_dp_id)
         self.data_acquisition_management.assign_data_product(input_resource_id=instrument_device_id, data_product_id=parsed_dp_id)
@@ -123,6 +125,7 @@ class TestInstrumentIntegration(DMTestCase):
         self.assertEqual(expected_state,state)
         return retval
 
+    @attr("UTIL")
     def test_instrument_simple(self):
         instrument_model_id = self.create_instrument_model()
         instrument_agent_id = self.create_instrument_agent(instrument_model_id)
@@ -144,13 +147,13 @@ class TestInstrumentIntegration(DMTestCase):
         self.agent_state_transition(agent_client, ResourceAgentEvent.RUN, ResourceAgentState.COMMAND)
 
         dataset_id = self.RR2.find_dataset_id_of_data_product_using_has_dataset(parsed_dp_id)
+        monitor = DatasetMonitor(dataset_id=dataset_id)
 
         for i in xrange(10):
-            monitor = DatasetMonitor(dataset_id=dataset_id)
             agent_client.execute_resource(AgentCommand(command=SBE37ProtocolEvent.ACQUIRE_SAMPLE))
-            if not monitor.event.wait(30):
+            if not monitor.wait():
                 raise AssertionError('Failed on the %ith granule' % i)
-            monitor.stop()
+            monitor.reset()
 
         rdt = RecordDictionaryTool.load_from_granule(self.data_retriever.retrieve(dataset_id))
         self.assertEquals(len(rdt), 10)

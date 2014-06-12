@@ -17,7 +17,7 @@ log = Logger.get_logger()
 
 from ion.agents.platform.test.helper import HelperTestMixin
 
-from ion.agents.platform.responses import NormalResponse, InvalidResponse
+from ion.agents.platform.responses import NormalResponse
 
 import time
 import ntplib
@@ -46,28 +46,6 @@ class OmsTestMixin(HelperTestMixin):
         response = self.oms.hello.ping()
         self.assertEquals(response, "pong")
 
-    def test_ab_get_platform_map(self):
-        platform_map = self.oms.config.get_platform_map()
-        log.info("config.get_platform_map() => %s" % platform_map)
-        self.assertIsInstance(platform_map, list)
-        roots = []
-        for pair in platform_map:
-            self.assertIsInstance(pair, (tuple, list))
-            self.assertEquals(len(pair), 2)
-            plat, parent = pair
-            if parent == '':
-                roots.append(plat)
-        self.assertEquals(len(roots), 1)
-        self.assertEquals("ShoreStation", roots[0])
-
-    def test_ac_get_platform_types(self):
-        retval = self.oms.config.get_platform_types()
-        log.info("config.get_platform_types() => %s" % retval)
-        self.assertIsInstance(retval, dict)
-        for k, v in retval.iteritems():
-            self.assertIsInstance(k, str)
-            self.assertIsInstance(v, str)
-
     def test_ad_get_platform_metadata(self):
         platform_id = self.PLATFORM_ID
         retval = self.oms.config.get_platform_metadata(platform_id)
@@ -75,26 +53,11 @@ class OmsTestMixin(HelperTestMixin):
         md = self._verify_valid_platform_id(platform_id, retval)
         self.assertIsInstance(md, dict)
         # TODO: decide on the actual expected metadata.
-        # if not 'platform_types' in md:
-        #     log.warn("RSN OMS spec: platform_types not included in metadata: %s", md)
 
     def test_ad_get_platform_metadata_invalid(self):
         platform_id = BOGUS_PLATFORM_ID
         retval = self.oms.config.get_platform_metadata(platform_id)
         log.info("config.get_platform_metadata(%r) => %s" % (platform_id, retval))
-        self._verify_invalid_platform_id(platform_id, retval)
-
-    def test_af_get_platform_attributes(self):
-        platform_id = self.PLATFORM_ID
-        retval = self.oms.attr.get_platform_attributes(platform_id)
-        log.info("attr.get_platform_attributes(%r) => %s" % (platform_id, retval))
-        infos = self._verify_valid_platform_id(platform_id, retval)
-        self.assertIsInstance(infos, dict)
-
-    def test_ag_get_platform_attributes_invalid(self):
-        platform_id = BOGUS_PLATFORM_ID
-        retval = self.oms.attr.get_platform_attributes(platform_id)
-        log.info("attr.get_platform_attributes(%r) => %s" % (platform_id, retval))
         self._verify_invalid_platform_id(platform_id, retval)
 
     def test_ah_get_platform_attribute_values(self):
@@ -136,29 +99,6 @@ class OmsTestMixin(HelperTestMixin):
         for attrName in attrNames:
             self._verify_invalid_attribute_id(attrName, vals)
 
-    def test_ah_set_platform_attribute_values(self):
-        platform_id = self.PLATFORM_ID
-        # try for all test attributes, but check below for both those writable
-        # and not writable
-        attrNames = self.ATTR_NAMES
-
-        def valueFor(attrName):
-            # simple string value, ok because there is no strict value check yet
-            # TODO more realistic value depending on attribute's type
-            return "test_value_for_%s" % attrName
-
-        attrs = [(attrName, valueFor(attrName)) for attrName in attrNames]
-        log.debug("attr.set_platform_attribute_values(%r, %r)" % (platform_id, attrs))
-        retval = self.oms.attr.set_platform_attribute_values(platform_id, attrs)
-        log.info("attr.set_platform_attribute_values(%r, %r) => %s" % (platform_id, attrs, retval))
-        vals = self._verify_valid_platform_id(platform_id, retval)
-        self.assertIsInstance(vals, dict)
-        for attrName in attrNames:
-            if attrName in self.WRITABLE_ATTR_NAMES:
-                self._verify_valid_attribute_id(attrName, vals)
-            else:
-                self._verify_not_writable_attribute_id(attrName, vals)
-
     def _get_platform_ports(self, platform_id):
         retval = self.oms.port.get_platform_ports(platform_id)
         log.info("port.get_platform_ports(%r) => %s" % (platform_id, retval))
@@ -170,7 +110,6 @@ class OmsTestMixin(HelperTestMixin):
         ports = self._get_platform_ports(platform_id)
         for port_id, info in ports.iteritems():
             self.assertIsInstance(info, dict)
-            self.assertIn('network', info)
             self.assertIn('state',   info)
 
     def test_ak_get_platform_ports_invalid_platform_id(self):
@@ -179,107 +118,13 @@ class OmsTestMixin(HelperTestMixin):
         log.info("port.get_platform_ports(%r) => %s" % (platform_id, retval))
         self._verify_invalid_platform_id(platform_id, retval)
 
-    def _get_connected_instruments(self, platform_id, port_id):
-        log.debug("instr.get_connected_instruments(%r, %r)" % (platform_id, port_id))
-        retval = self.oms.instr.get_connected_instruments(platform_id, port_id)
-        log.info("instr.get_connected_instruments(%r, %r) => %s" % (platform_id, port_id, retval))
-        ports = self._verify_valid_platform_id(platform_id, retval)
-        port_dic = self._verify_valid_port_id(port_id, ports)
-        self.assertIsInstance(port_dic, dict)
-        return port_dic
-
-    def test_al_get_connected_instruments(self):
-        platform_id = self.PLATFORM_ID
-        port_id = self.PORT_ID
-        self._get_connected_instruments(platform_id, port_id)
-
-    def _connect_instrument(self, platform_id, port_id, instrument_id, attributes):
-        log.debug("instr.connect_instrument(%r, %r, %r, %r)" % (platform_id, port_id, instrument_id, attributes))
-        retval = self.oms.instr.connect_instrument(platform_id, port_id, instrument_id, attributes)
-        log.info("instr.connect_instrument(%r, %r, %r, %r) => %s" % (platform_id, port_id, instrument_id, attributes, retval))
-        return retval
-
-    def _connect_instrument_valid(self, platform_id, port_id, instrument_id, attributes):
-        retval = self._connect_instrument(platform_id, port_id, instrument_id, attributes)
-        ports = self._verify_valid_platform_id(platform_id, retval)
-        port_dic = self._verify_valid_port_id(port_id, ports)
-        self.assertIsInstance(port_dic, dict)
-        instr_val = self._verify_valid_instrument_id(instrument_id, port_dic)
-        if isinstance(instr_val, dict):
-            for attr_name in attributes:
-                self.assertTrue(attr_name in instr_val)
-                attr_val = instr_val[attr_name]
-                self.assertEquals(attributes[attr_name], attr_val,
-                                  "value given %s different from value received %s" % (
-                                  attributes[attr_name], attr_val))
-
-    def _disconnect_instrument(self, platform_id, port_id, instrument_id):
-        log.debug("instr.disconnect_instrument(%r, %r, %r)" % (platform_id, port_id, instrument_id))
-        retval = self.oms.instr.disconnect_instrument(platform_id, port_id, instrument_id)
-        log.info("instr.disconnect_instrument(%r, %r, %r) => %s" % (platform_id, port_id, instrument_id, retval))
-        return retval
-
-    def _disconnect_instrument_valid(self, platform_id, port_id, instrument_id):
-        retval = self._disconnect_instrument(platform_id, port_id, instrument_id)
-        ports = self._verify_valid_platform_id(platform_id, retval)
-        port_dic = self._verify_valid_port_id(port_id, ports)
-        self.assertIsInstance(port_dic, dict)
-        self.assertIn(instrument_id, port_dic)
-        self._verify_instrument_disconnected(instrument_id, port_dic[instrument_id])
-
-    def test_am_connect_and_disconnect_instrument(self):
-        platform_id = self.PLATFORM_ID
-        port_id = self.PORT_ID
-        instrument_id = self.INSTRUMENT_ID
-
-        # connect (if not already connected)
-        port_dic = self._get_connected_instruments(platform_id, port_id)
-        if not instrument_id in port_dic:
-            # TODO proper values
-            attributes = {'maxCurrentDraw': 1, 'initCurrent': 2,
-                          'dataThroughput': 3, 'instrumentType': 'FOO'}
-
-            self._connect_instrument_valid(platform_id, port_id, instrument_id, attributes)
-
-        # disconnect:
-        port_dic = self._get_connected_instruments(platform_id, port_id)
-        if instrument_id in port_dic:
-            self._disconnect_instrument_valid(platform_id, port_id, instrument_id)
-
-    def test_am_connect_instrument_invalid_platform_id(self):
-        platform_id = BOGUS_PLATFORM_ID
-        port_id = self.PORT_ID
-        instrument_id = self.INSTRUMENT_ID
-        attributes = {}
-        retval = self._connect_instrument(platform_id, port_id, instrument_id, attributes)
-        self._verify_invalid_platform_id(platform_id, retval)
-
-    def test_am_connect_instrument_invalid_port_id(self):
-        platform_id = self.PLATFORM_ID
-        port_id = BOGUS_PORT_ID
-        instrument_id = self.INSTRUMENT_ID
-        attributes = {}
-        retval = self._connect_instrument(platform_id, port_id, instrument_id, attributes)
-        ports = self._verify_valid_platform_id(platform_id, retval)
-        self._verify_invalid_port_id(port_id, ports)
-
-    def test_am_connect_instrument_invalid_instrument_id(self):
-        platform_id = self.PLATFORM_ID
-        port_id = self.PORT_ID
-        instrument_id = BOGUS_INSTRUMENT_ID
-        attributes = {}
-        retval = self._connect_instrument(platform_id, port_id, instrument_id, attributes)
-        ports = self._verify_valid_platform_id(platform_id, retval)
-        port_dic = self._verify_valid_port_id(port_id, ports)
-        self.assertIsInstance(port_dic, dict)
-        self._verify_invalid_instrument_id(instrument_id, port_dic)
-
     def test_an_turn_on_platform_port(self):
         platform_id = self.PLATFORM_ID
         ports = self._get_platform_ports(platform_id)
+        src = self.__class__.__name__
         for port_id in ports.iterkeys():
-            retval = self.oms.port.turn_on_platform_port(platform_id, port_id)
-            log.info("port.turn_on_platform_port(%s,%s) => %s" % (platform_id, port_id, retval))
+            retval = self.oms.port.turn_on_platform_port(platform_id, port_id, src)
+            log.info("port.turn_on_platform_port(%r,%r,%r) => %s" % (platform_id, port_id, src, retval))
             portRes = self._verify_valid_platform_id(platform_id, retval)
             res = self._verify_valid_port_id(port_id, portRes)
             self.assertEquals(res, NormalResponse.PORT_TURNED_ON)
@@ -288,35 +133,48 @@ class OmsTestMixin(HelperTestMixin):
         # use valid id for get_platform_ports
         platform_id = self.PLATFORM_ID
         ports = self._get_platform_ports(platform_id)
-
+        src = self.__class__.__name__
         # use invalid id for turn_on_platform_port
         requested_platform_id = BOGUS_PLATFORM_ID
         for port_id in ports.iterkeys():
-            retval = self.oms.port.turn_on_platform_port(requested_platform_id, port_id)
-            log.info("port.turn_on_platform_port(%r, %r) => %s" % (requested_platform_id, port_id, retval))
+            retval = self.oms.port.turn_on_platform_port(requested_platform_id, port_id, src)
+            log.info("port.turn_on_platform_port(%r,%r,%r) => %s" % (requested_platform_id, port_id, src, retval))
             self._verify_invalid_platform_id(requested_platform_id, retval)
 
     def test_ao_turn_off_platform_port(self):
         platform_id = self.PLATFORM_ID
         ports = self._get_platform_ports(platform_id)
+        src = self.__class__.__name__
         for port_id in ports.iterkeys():
-            retval = self.oms.port.turn_off_platform_port(platform_id, port_id)
-            log.info("port.turn_off_platform_port(%r, %r) => %s" % (platform_id, port_id, retval))
+            retval = self.oms.port.turn_off_platform_port(platform_id, port_id, src)
+            log.info("port.turn_off_platform_port(%r,%r,%r) => %s" % (platform_id, port_id, src, retval))
             portRes = self._verify_valid_platform_id(platform_id, retval)
             res = self._verify_valid_port_id(port_id, portRes)
-            self.assertEquals(res, NormalResponse.PORT_TURNED_OFF)
+            self.assertIn(res, [NormalResponse.PORT_ALREADY_OFF, NormalResponse.PORT_TURNED_OFF])
 
     def test_ao_turn_off_platform_port_invalid_platform_id(self):
         # use valid for get_platform_ports
         platform_id = self.PLATFORM_ID
         ports = self._get_platform_ports(platform_id)
-
+        src = self.__class__.__name__
         # use invalid for turn_off_platform_port
         requested_platform_id = BOGUS_PLATFORM_ID
         for port_id in ports.iterkeys():
-            retval = self.oms.port.turn_off_platform_port(requested_platform_id, port_id)
-            log.info("port.turn_off_platform_port(%r, %r) => %s" % (requested_platform_id, port_id, retval))
+            retval = self.oms.port.turn_off_platform_port(requested_platform_id, port_id, src)
+            log.info("port.turn_off_platform_port(%r,%r,%r) => %s" % (requested_platform_id, port_id, src, retval))
             self._verify_invalid_platform_id(requested_platform_id, retval)
+
+    def test_ao_set_over_current(self):
+        platform_id = self.PLATFORM_ID
+        ports = self._get_platform_ports(platform_id)
+        ma, us = 99, 88
+        src = self.__class__.__name__
+        for port_id in ports.iterkeys():
+            retval = self.oms.port.set_over_current(platform_id, port_id, ma, us, src)
+            log.info("port.set_over_current(%r,%r,%r,%r,%r) => %s" % (platform_id, port_id, ma, us, src, retval))
+            portRes = self._verify_valid_platform_id(platform_id, retval)
+            res = self._verify_valid_port_id(port_id, portRes)
+            self.assertEquals(res, NormalResponse.PORT_SET_OVER_CURRENT)
 
     ###################################################################
     # EVENTS
@@ -348,10 +206,10 @@ class OmsTestMixin(HelperTestMixin):
         def application(environ, start_response):
             input = environ['wsgi.input']
             body = "\n".join(input.readlines())
-            event_instance = yaml.load(body)
-            log.debug('http server received event_instance=%s' % str(event_instance))
+            event_instances = yaml.load(body)
+            log.debug('http server received event_instances=%s' % str(event_instances))
 
-            cls._notifications.append(event_instance)
+            cls._notifications.extend(event_instances)
 
             status = '200 OK'
             headers = [('Content-Type', 'text/plain')]
@@ -471,8 +329,3 @@ class OmsTestMixin(HelperTestMixin):
                              "secs. (Got %d event notifications.)" % (
                              max_wait, len(self._notifications)))
         log.info("got test event: %s" % got_it)
-
-    def test_get_checksum(self):
-        platform_id = self.PLATFORM_ID
-        retval = self.oms.config.get_checksum(platform_id)
-        log.info("config.get_checksum(%r) => %s" % (platform_id, retval))

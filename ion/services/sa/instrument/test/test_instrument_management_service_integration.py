@@ -1,14 +1,19 @@
-from interface.services.cei.iprocess_dispatcher_service import ProcessDispatcherServiceClient
-from interface.services.dm.idataset_management_service import DatasetManagementServiceClient
+#!/usr/bin/env python
 
-#from pyon.ion.endpoint import ProcessRPCClient
-from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
+from nose.plugins.attrib import attr
+import unittest
+import os
+
+from ooi.logging import log
 
 from pyon.datastore.datastore import DataStore
-from pyon.public import IonObject
+from pyon.public import RT, PRED, OT, LCE, IonObject, CFG
 from pyon.util.containers import DotDict
 from pyon.util.int_test import IonIntegrationTestCase
+
 from ion.services.dm.utility.granule_utils import time_series_domain
+from ion.services.sa.test.helpers import any_old
+from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
 
 
 from interface.services.coi.iresource_registry_service import ResourceRegistryServiceClient
@@ -18,16 +23,10 @@ from interface.services.dm.ipubsub_management_service import PubsubManagementSer
 from interface.services.sa.idata_product_management_service import DataProductManagementServiceClient
 from interface.services.sa.idata_acquisition_management_service import DataAcquisitionManagementServiceClient
 from interface.services.sa.iobservatory_management_service import ObservatoryManagementServiceClient
+from interface.services.cei.iprocess_dispatcher_service import ProcessDispatcherServiceClient
+from interface.services.dm.idataset_management_service import DatasetManagementServiceClient
 from interface.objects import ComputedValueAvailability
 from interface.objects import ComputedIntValue, ComputedFloatValue, ComputedStringValue
-
-from pyon.public import RT, PRED, OT, LCE
-from nose.plugins.attrib import attr
-from ooi.logging import log
-import unittest
-
-
-from ion.services.sa.test.helpers import any_old
 
 
 @attr('INT', group='sa')
@@ -60,12 +59,14 @@ class TestInstrumentManagementServiceIntegration(IonIntegrationTestCase):
 #        return
 
     @attr('EXT')
+    @unittest.skipIf(os.getenv('CEI_LAUNCH_TEST', False), 'Skip test while in CEI LAUNCH mode as it depends on modifying CFG on service side')
     def test_resources_associations_extensions(self):
         """
         create one of each resource and association used by IMS
         to guard against problems in ion-definitions
         """
-        
+        self.patch_cfg(CFG["container"], {"extended_resources": {"strip_results": False}})
+
         #stuff we control
         instrument_agent_instance_id, _ =  self.RR.create(any_old(RT.InstrumentAgentInstance))
         instrument_agent_id, _ =           self.RR.create(any_old(RT.InstrumentAgent))
@@ -124,15 +125,10 @@ class TestInstrumentManagementServiceIntegration(IonIntegrationTestCase):
         sensor_model_id #is only a target
 
         #create a parsed product for this instrument output
-        tdom, sdom = time_series_domain()
-        tdom = tdom.dump()
-        sdom = sdom.dump()
         dp_obj = IonObject(RT.DataProduct,
             name='the parsed data',
             description='ctd stream test',
-            processing_level_code='Parsed_Canonical',
-            temporal_domain = tdom,
-            spatial_domain = sdom)
+            processing_level_code='Parsed_Canonical')
         pdict_id = self.DSC.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
         parsed_stream_def_id = self.PSC.create_stream_definition(name='parsed', parameter_dictionary_id=pdict_id)
         data_product_id1 = self.DP.create_data_product(data_product=dp_obj, stream_definition_id=parsed_stream_def_id)
@@ -162,8 +158,8 @@ class TestInstrumentManagementServiceIntegration(IonIntegrationTestCase):
         self.assertEqual(extended_instrument.instrument_model._id, instrument_model_id)
 
         # Lifecycle
-        self.assertEquals(len(extended_instrument.lcstate_transitions), 5)
-        self.assertEquals(set(extended_instrument.lcstate_transitions.keys()), set(['develop', 'deploy', 'retire', 'plan', 'integrate']))
+        self.assertEquals(len(extended_instrument.lcstate_transitions), 6)
+        self.assertEquals(set(extended_instrument.lcstate_transitions.keys()), set(['develop', 'deploy', 'retire', 'plan', 'integrate', 'delete']))
         self.assertEquals(len(extended_instrument.availability_transitions), 2)
         self.assertEquals(set(extended_instrument.availability_transitions.keys()), set(['enable', 'announce']))
 
@@ -206,8 +202,8 @@ class TestInstrumentManagementServiceIntegration(IonIntegrationTestCase):
         self.assertEqual(instrument_model_id, extended_platform.instrument_models[0]._id)
         self.assertEquals(extended_platform.platform_agent._id, platform_agent_id)
 
-        self.assertEquals(len(extended_platform.lcstate_transitions), 5)
-        self.assertEquals(set(extended_platform.lcstate_transitions.keys()), set(['develop', 'deploy', 'retire', 'plan', 'integrate']))
+        self.assertEquals(len(extended_platform.lcstate_transitions), 6)
+        self.assertEquals(set(extended_platform.lcstate_transitions.keys()), set(['develop', 'deploy', 'retire', 'plan', 'integrate', 'delete']))
         self.assertEquals(len(extended_platform.availability_transitions), 2)
         self.assertEquals(set(extended_platform.availability_transitions.keys()), set(['enable', 'announce']))
 
@@ -401,15 +397,10 @@ class TestInstrumentManagementServiceIntegration(IonIntegrationTestCase):
 
 
         #create a parsed product for this instrument output
-        tdom, sdom = time_series_domain()
-        tdom = tdom.dump()
-        sdom = sdom.dump()
         dp_obj = IonObject(RT.DataProduct,
             name='the parsed data',
             description='ctd stream test',
-            processing_level_code='Parsed_Canonical',
-            temporal_domain = tdom,
-            spatial_domain = sdom)
+            processing_level_code='Parsed_Canonical')
         pdict_id = self.DSC.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
         parsed_stream_def_id = self.PSC.create_stream_definition(name='parsed', parameter_dictionary_id=pdict_id)
         data_product_id1 = self.DP.create_data_product(data_product=dp_obj, stream_definition_id=parsed_stream_def_id)

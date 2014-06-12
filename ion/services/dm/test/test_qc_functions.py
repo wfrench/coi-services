@@ -30,10 +30,12 @@ from pyon.util.log import log
 from ion.services.dm.test.dm_test_case import DMTestCase
 from ion_functions.qc.qc_functions import ntp_to_month
 from uuid import uuid4
+import unittest
 
 import numpy as np
 
-@attr('INT', group='dm')
+
+@unittest.skip("Deprecated")
 class TestQCFunctions(DMTestCase):
     def setUp(self):
         DMTestCase.setUp(self)
@@ -193,7 +195,7 @@ class TestCoverageQC(TestQCFunctions):
         self.addCleanup(event_subscriber.stop)
 
         self.ph.publish_rdt_to_data_product(self.dp_id, self.rdt)
-        self.dataset_monitor.event.wait(10)
+        self.assertTrue(self.dataset_monitor.wait())
 
         rdt = RecordDictionaryTool.load_from_granule(self.data_retriever.retrieve(self.dataset_id))
         np.testing.assert_array_almost_equal(rdt['tempwat_glblrng_qc'], [0, 1, 1, 1, 1, 1, 1, 0])
@@ -214,7 +216,7 @@ class TestCoverageQC(TestQCFunctions):
         np.testing.assert_array_equal(self.rdt['tempwat_gradtst_qc'], [-99] * 5)
         self.ph.publish_rdt_to_data_product(self.dp_id, self.rdt)
 
-        self.dataset_monitor.event.wait(10)
+        self.assertTrue(self.dataset_monitor.wait())
         rdt = RecordDictionaryTool.load_from_granule(self.data_retriever.retrieve(self.dataset_id))
         np.testing.assert_array_equal(rdt['tempwat_glblrng_qc'], [-99] * 5)
         np.testing.assert_array_equal(rdt['tempwat_spketst_qc'], [-99] * 5)
@@ -227,7 +229,7 @@ class TestCoverageQC(TestQCFunctions):
         TestQCFunctions.check_spike(self)
         self.init_check()
         self.ph.publish_rdt_to_data_product(self.dp_id, self.rdt)
-        self.dataset_monitor.event.wait(10)
+        self.assertTrue(self.dataset_monitor.wait())
 
         rdt = RecordDictionaryTool.load_from_granule(self.data_retriever.retrieve(self.dataset_id))
         np.testing.assert_array_almost_equal(rdt['tempwat_spketst_qc'], [1, 1, 0, 1, 1, 1, 1, 1])
@@ -238,7 +240,7 @@ class TestCoverageQC(TestQCFunctions):
         TestQCFunctions.check_stuck_value(self)
         self.init_check()
         self.ph.publish_rdt_to_data_product(self.dp_id, self.rdt)
-        self.dataset_monitor.event.wait(10)
+        self.assertTrue(self.dataset_monitor.wait())
 
         rdt = RecordDictionaryTool.load_from_granule(self.data_retriever.retrieve(self.dataset_id))
         np.testing.assert_array_almost_equal(rdt['tempwat_stuckvl_qc'], [1, 1, 0, 0, 0, 0, 1, 1, 1, 1])
@@ -248,7 +250,7 @@ class TestCoverageQC(TestQCFunctions):
         TestQCFunctions.check_gradient(self)
         self.init_check()
         self.ph.publish_rdt_to_data_product(self.dp_id, self.rdt)
-        self.dataset_monitor.event.wait(10)
+        self.assertTrue(self.dataset_monitor.wait())
 
         rdt = RecordDictionaryTool.load_from_granule(self.data_retriever.retrieve(self.dataset_id))
         np.testing.assert_array_equal(rdt['tempwat_gradtst_qc'], [1, 1, 0, 0, 1])
@@ -258,7 +260,7 @@ class TestCoverageQC(TestQCFunctions):
         TestQCFunctions.check_trend(self)
         self.init_check()
         self.ph.publish_rdt_to_data_product(self.dp_id, self.rdt)
-        self.dataset_monitor.event.wait(10)
+        self.assertTrue(self.dataset_monitor.wait())
 
         rdt = RecordDictionaryTool.load_from_granule(self.data_retriever.retrieve(self.dataset_id))
         np.testing.assert_array_almost_equal(rdt['tempwat_trndtst_qc'], [1] * 10)
@@ -281,7 +283,7 @@ class TestCoverageQC(TestQCFunctions):
         self.addCleanup(event_subscriber.stop)
 
         self.ph.publish_rdt_to_data_product(self.dp_id, self.rdt)
-        self.dataset_monitor.event.wait(10)
+        self.assertTrue(self.dataset_monitor.wait())
         rdt = RecordDictionaryTool.load_from_granule(self.data_retriever.retrieve(self.dataset_id))
         np.testing.assert_array_almost_equal(rdt['tempwat_loclrng_qc'], [1 ,1 ,1 ,1 ,1 ,0 ,0 ,0 ,0 ,0])
         self.assertTrue(flagged.wait(10))

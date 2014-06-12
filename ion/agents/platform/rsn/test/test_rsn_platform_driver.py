@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-@package ion.agents.platform.rsn.test.test_oms_platform_driver
+@package ion.agents.platform.rsn.test.test_rsn_platform_driver
 @file    ion/agents/platform/rsn/test/test_rsn_platform_driver.py
 @author  Carlos Rueda
 @brief   Some basic and direct tests to RSNPlatformDriver.
@@ -18,8 +18,6 @@ import logging
 
 from pyon.util.containers import get_ion_ts
 
-from ion.agents.platform.rsn.oms_client_factory import CIOMSClientFactory
-from ion.agents.platform.rsn.oms_util import RsnOmsUtil
 from ion.agents.platform.util.network_util import NetworkUtil
 
 from ion.agents.platform.rsn.rsn_platform_driver import RSNPlatformDriver
@@ -41,11 +39,10 @@ DVR_CONFIG = {
     'oms_uri': oms_uri  # see setUp for possible update of this entry
 }
 
-DVR_CONFIG = {
-    'oms_uri': 'launchsimulator',
-}
+from unittest import skip
 
-
+@skip("No critical test; functionality covered by other more comprehensive "
+      "tests. To be removed")
 @attr('INT', group='sa')
 class TestRsnPlatformDriver(IonIntegrationTestCase, HelperTestMixin):
 
@@ -58,10 +55,9 @@ class TestRsnPlatformDriver(IonIntegrationTestCase, HelperTestMixin):
         DVR_CONFIG['oms_uri'] = self._dispatch_simulator(oms_uri)
         log.debug("DVR_CONFIG['oms_uri'] = %s", DVR_CONFIG['oms_uri'])
 
-        # Use the network definition provided by RSN OMS directly.
-        rsn_oms = CIOMSClientFactory.create_instance(DVR_CONFIG['oms_uri'])
-        network_definition = RsnOmsUtil.build_network_definition(rsn_oms)
-        CIOMSClientFactory.destroy_instance(rsn_oms)
+        yaml_filename = 'ion/agents/platform/rsn/simulator/network.yml'
+        log.debug("retrieving network definition from %s", yaml_filename)
+        network_definition = NetworkUtil.deserialize_network_definition(file(yaml_filename))
 
         if log.isEnabledFor(logging.DEBUG):
             network_definition_ser = NetworkUtil.serialize_network_definition(network_definition)

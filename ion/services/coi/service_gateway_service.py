@@ -3,9 +3,13 @@
 __author__ = 'Stephen P. Henrie'
 __license__ = 'Apache 2.0'
 
-import inspect, ast, simplejson, sys, traceback, string, copy
+import inspect, ast, sys, traceback, string
+import json, simplejson
 from flask import Flask, request, abort
+from werkzeug import secure_filename
 from gevent.wsgi import WSGIServer
+import os
+import time
 
 from pyon.public import IonObject, Container, OT
 from pyon.core.object import IonObjectBase
@@ -15,6 +19,8 @@ from pyon.core.governance import DEFAULT_ACTOR_ID, get_role_message_headers, fin
 from pyon.core.governance.negotiation import Negotiation
 from pyon.event.event import EventSubscriber, EventPublisher
 from pyon.ion.resource import get_object_schema
+from interface.services.cei.iprocess_dispatcher_service import ProcessDispatcherServiceClient
+from interface.services.coi.idirectory_service import DirectoryServiceProcessClient
 from interface.services.coi.iservice_gateway_service import BaseServiceGatewayService
 from interface.services.coi.iresource_registry_service import ResourceRegistryServiceProcessClient
 from interface.services.coi.iidentity_management_service import IdentityManagementServiceProcessClient
@@ -23,11 +29,12 @@ from interface.services.ans.ivisualization_service import VisualizationServicePr
 from interface.services.sa.idata_product_management_service import DataProductManagementServiceClient
 from pyon.util.log import log
 from pyon.util.lru_cache import LRUCache
-from pyon.util.containers import current_time_millis
+from pyon.util.containers import current_time_millis, DotDict
+from pyon.util.file_sys import FileSystem, FS
 
 from pyon.agent.agent import ResourceAgentClient
 from interface.services.iresource_agent import ResourceAgentProcessClient
-from interface.objects import Attachment
+from interface.objects import Attachment, ProcessDefinition
 from interface.objects import ProposalStatusEnum, ProposalOriginatorEnum
 
 #Initialize the flask app
@@ -50,14 +57,16 @@ OMS_ACCEPTED_RESPONSE = '202 Accepted'
 OMS_BAD_REQUEST_RESPONSE = '400 Bad Request'
 
 
-
 DEFAULT_EXPIRY = '0'
 
-#Stuff for specifying other return types
+# Stuff for specifying other return types
 RETURN_MIMETYPE_PARAM = 'return_mimetype'
 
+# Set standard json functions
+json_dumps = json.dumps
+json_loads = simplejson.loads
 
-#This class is used to manage the WSGI/Flask server as an ION process - and as a process endpoint for ION RPC calls
+
 class ServiceGatewayService(BaseServiceGatewayService):
     """
 	The Service Gateway Service is the service that uses a gevent web server and Flask
@@ -230,7 +239,7 @@ def process_gateway_request(service_name, operation):
             payload = request.form['payload']
             #debug only
             #payload = '{"serviceRequest": { "serviceName": "resource_registry", "serviceOp": "find_resources", "params": { "restype": "BankAccount", "lcstate": "", "name": "", "id_only": false } } }'
-            json_params = simplejson.loads(str(payload))
+            json_params = json_loads(str(payload))
 
             if not json_params.has_key('serviceRequest'):
                 raise Inconsistent("The JSON request is missing the 'serviceRequest' key in the request")
@@ -293,7 +302,7 @@ def process_gateway_agent_request(resource_id, operation):
         if request.method == "POST":
             payload = request.form['payload']
 
-            json_params = simplejson.loads(str(payload))
+            json_params = json_loads(str(payload))
 
             if not json_params.has_key('agentRequest'):
                 raise Inconsistent("The JSON request is missing the 'agentRequest' key in the request")
@@ -332,40 +341,47 @@ def process_gateway_agent_request(resource_id, operation):
 #This service method is used to provide the RSN OMS with a means of sending events to the CI system using HTTP requests.
 
 #test this method with curl:
-# curl -H "Content-type: application/json" --data "{\"summary\": \"fake event triggered from CI using OMS generate_test_event\",
+# curl -H "Content-type: application/json" --data "[{\"summary\": \"fake event triggered from CI using OMS generate_test_event\",
 #     \"severity\": 3, \"class\": \"/Test\", \"platform_id\":\"test_platform_123\" , \"timestamp\":\"timestamp\" , \"message\":
-#     \"fake event triggered from CI using OMS generate_test_event\", \"test_event\": True}" http://localhost:5000/ion-service/oms_event
+#     \"fake event triggered from CI using OMS generate_test_event\", \"test_event\": True}]" http://localhost:5000/ion-service/oms_event
 
 @service_gateway_app.route('/ion-service/oms_event', methods=['GET','POST'])
 def process_oms_event():
+    if not request.data:
+        log.warning('process_oms_event: invalid OMS event payload: %r', request.data)
+        return gateway_json_response(OMS_BAD_REQUEST_RESPONSE)
 
-    json_params = {}
+    payload = json_loads(str(request.data))
+    if not isinstance(payload, list):
+        log.warning('process_oms_event: invalid OMS event payload: '
+                    'expecting array but got: %r', payload)
+        return gateway_json_response(OMS_BAD_REQUEST_RESPONSE)
 
-    # oms direct request
-    if request.data:
-        json_params  = simplejson.loads(str(request.data))
-        log.debug('ServiceGatewayService:process_oms_event request.data:  %s', json_params)
+    log.debug('process_oms_event: payload=%s', payload)
 
-    #validate payload
-    if 'platform_id' not in json_params or 'message' not in json_params:
-        log.warning('Invalid OMS event format. payload_data: %s', json_params)
-        #return gateway_json_response(OMS_BAD_REQUEST_RESPONSE)
+    event_publisher = EventPublisher()
 
-    #prepare the event information
-    try:
-        #create a publisher to relay OMS events into the system as DeviceEvents
-        event_publisher = EventPublisher()
+    for obj in payload:
+        for k in ['event_id', 'platform_id', 'message']:
+            if k not in obj:
+                log.warning('process_oms_event: invalid OMS event: %r missing. '
+                            'Received object: %s', k, obj)
+                #return gateway_json_response(OMS_BAD_REQUEST_RESPONSE)
 
-        event_publisher.publish_event(
-            event_type='OMSDeviceStatusEvent',
-            origin_type='OMS Platform',
-            origin=json_params.get('platform_id', 'NOT PROVIDED'),
-            sub_type='',
-            description = json_params.get('message', ''),
-            status_details = json_params)
-    except Exception, e:
-        log.error('Could not publish OMS  event: %s. Event data: %s', e.message, json_params)
+        # note the the external event_id is captured in the sub_type field:
+        evt = dict(
+            event_type     = 'OMSDeviceStatusEvent',
+            origin_type    = 'OMS Platform',
+            origin         = obj.get('platform_id', 'platform_id NOT PROVIDED'),
+            sub_type       = obj.get('event_id', 'event_id NOT PROVIDED'),
+            description    = obj.get('message', ''),
+            status_details = obj)
+        try:
+            event_publisher.publish_event(**evt)
+            log.debug('process_oms_event: published: %s', evt)
 
+        except Exception as e:
+            log.exception('process_oms_event: could not publish OMS event: %s', evt)
 
     return gateway_json_response(OMS_ACCEPTED_RESPONSE)
 
@@ -373,7 +389,7 @@ def process_oms_event():
 #Private implementation of standard flask jsonify to specify the use of an encoder to walk ION objects
 def json_response(response_data):
 
-    return service_gateway_app.response_class(simplejson.dumps(response_data, default=ion_object_encoder,
+    return service_gateway_app.response_class(json_dumps(response_data, default=ion_object_encoder,
         indent=None if request.is_xhr else 2), mimetype='application/json')
 
 def gateway_json_response(response_data):
@@ -685,7 +701,7 @@ def create_attachment():
 
     try:
         payload              = request.form['payload']
-        json_params          = simplejson.loads(str(payload))
+        json_params          = json_loads(str(payload))
 
         ion_actor_id, expiry = get_governance_info_from_request('serviceRequest', json_params)
         ion_actor_id, expiry = validate_request(ion_actor_id, expiry)
@@ -744,7 +760,7 @@ def get_visualization_image():
     params = request.args
 
     data_product_id = params["data_product_id"]
-    visualization_parameters = simplejson.loads(params["visualization_parameters"])
+    visualization_parameters = json_loads(params["visualization_parameters"])
     image_info = vs_cli.get_visualization_image(data_product_id, visualization_parameters)
 
     return service_gateway_app.response_class(image_info['image_obj'],mimetype=image_info['content_type'])
@@ -754,7 +770,7 @@ def get_visualization_image():
 def get_parameter_provenance_visualization_image():
 
     payload = request.form['payload']
-    json_params = simplejson.loads(str(payload))
+    json_params = json_loads(str(payload))
     #log.debug('get_parameter_provenance_visualization_image  json_params:  %s', json_params)
 
     # Create client to interface with the viz service
@@ -796,6 +812,15 @@ def get_version_info():
             # @TODO git versions for each?
         except pkg_resources.DistributionNotFound:
             pass
+
+    try:
+        dir_client = DirectoryServiceProcessClient(process=service_gateway_instance)
+        sys_attrs = dir_client.lookup("/System")
+        if sys_attrs and isinstance(sys_attrs, dict):
+            version.update({k: v for (k, v) in sys_attrs.iteritems() if "version" in k.lower()})
+
+    except Exception as ex:
+        log.exception("Could not determine system directory attributes")
 
     return gateway_json_response(version)
 
@@ -851,7 +876,7 @@ def find_resources_by_type(resource_type):
 def resolve_org_negotiation():
     try:
         payload              = request.form['payload']
-        json_params          = simplejson.loads(str(payload))
+        json_params          = json_loads(str(payload))
 
         ion_actor_id, expiry = get_governance_info_from_request('serviceRequest', json_params)
         ion_actor_id, expiry = validate_request(ion_actor_id, expiry)
@@ -896,3 +921,224 @@ def resolve_org_negotiation():
     except Exception, e:
         return build_error_response(e)
 
+@service_gateway_app.route('/ion-service/upload/data/<dataproduct_id>', methods=['POST'])
+def upload_data(dataproduct_id):
+    upload_folder = FileSystem.get_url(FS.TEMP,'uploads')
+    try:
+
+        rr_client = ResourceRegistryServiceProcessClient(node=Container.instance.node, process=service_gateway_instance)
+        object_store = Container.instance.object_store
+
+        try:
+            rr_client.read(str(dataproduct_id))
+        except BadRequest:
+            raise BadRequest('Unknown DataProduct ID %s' % dataproduct_id)
+
+        # required fields
+        upload = request.files['file'] # <input type=file name="file">
+
+        # determine filetype
+        filetype = _check_magic(upload)
+        upload.seek(0) # return to beginning for save
+
+        if upload and filetype is not None:
+
+            # upload file - run filename through werkzeug.secure_filename
+            filename = secure_filename(upload.filename)
+            path = os.path.join(upload_folder, filename)
+            upload_time = time.time()
+            upload.save(path)
+
+            # register upload
+            file_upload_context = {
+                # TODO add dataproduct_id
+                'name':'User uploaded file %s' % filename,
+                'filename':filename,
+                'filetype':filetype,
+                'path':path,
+                'upload_time':upload_time,
+                'status':'File uploaded to server'
+            }
+            fuc_id, _ = object_store.create_doc(file_upload_context)
+
+            # client to process dispatch
+            pd_client = ProcessDispatcherServiceClient()
+
+            # create process definition
+            process_definition = ProcessDefinition(
+                name='upload_data_processor',
+                executable={
+                    'module':'ion.processes.data.upload.upload_data_processing',
+                    'class':'UploadDataProcessing'
+                }
+            )
+            process_definition_id = pd_client.create_process_definition(process_definition)
+            # create process
+            process_id = pd_client.create_process(process_definition_id)
+            #schedule process
+            config = DotDict()
+            config.process.fuc_id = fuc_id
+            config.process.dp_id = dataproduct_id
+            pid = pd_client.schedule_process(process_definition_id, process_id=process_id, configuration=config)
+            log.info('UploadDataProcessing process created %s' % pid)
+            # response - only FileUploadContext ID and determined filetype for UX display
+            resp = {'fuc_id': fuc_id}
+            return gateway_json_response(resp)
+
+        raise BadRequest('Invalid Upload')
+
+    except Exception as e:
+        return build_error_response(e)
+
+'''
+upload QC (CSV format)
+'''
+@service_gateway_app.route('/ion-service/upload/qc', methods=['POST'])
+def upload_qc():
+    upload_folder = FileSystem.get_url(FS.TEMP,'uploads')
+    try:
+
+        object_store = Container.instance.object_store
+        
+        # required fields
+        upload = request.files['file'] # <input type=file name="file">
+
+        if upload:
+
+            # upload file - run filename through werkzeug.secure_filename
+            filename = secure_filename(upload.filename)
+            path = os.path.join(upload_folder, filename)
+            upload_time = time.time()
+            upload.save(path)
+            filetype = _check_magic(upload) or 'CSV' # Either going to be ZIP or CSV, probably
+
+            # register upload
+            file_upload_context = {
+                'name':'User uploaded QC file %s' % filename,
+                'filename':filename,
+                'filetype':filetype, # only CSV, no detection necessary
+                'path':path,
+                'upload_time':upload_time,
+                'status':'File uploaded to server'
+            }
+            fuc_id, _ = object_store.create_doc(file_upload_context)
+
+            # client to process dispatch
+            pd_client = ProcessDispatcherServiceClient()
+
+            # create process definition
+            process_definition = ProcessDefinition(
+                name='upload_qc_processor',
+                executable={
+                    'module':'ion.processes.data.upload.upload_qc_processing',
+                    'class':'UploadQcProcessing'
+                }
+            )
+            process_definition_id = pd_client.create_process_definition(process_definition)
+            # create process
+            process_id = pd_client.create_process(process_definition_id)
+            #schedule process
+            config = DotDict()
+            config.process.fuc_id = fuc_id
+            pid = pd_client.schedule_process(process_definition_id, process_id=process_id, configuration=config)
+            log.info('UploadQcProcessing process created %s' % pid)
+            # response - only FileUploadContext ID and determined filetype for UX display
+            resp = {'fuc_id': fuc_id}
+            return gateway_json_response(resp)
+
+        raise BadRequest('Invalid Upload')
+
+    except Exception as e:
+        return build_error_response(e)
+
+@service_gateway_app.route('/ion-service/upload/calibration', methods=['POST'])
+def upload_calibration():
+    """
+    upload calibrations (CSV or ZIP format)
+    """
+    upload_folder = FileSystem.get_url(FS.TEMP,'uploads')
+    try:
+        object_store = Container.instance.object_store
+        # required fields
+        upload = request.files['file'] # <input type=file name="file">
+        if upload:
+            # upload file - run filename through werkzeug.secure_filename
+            filename = secure_filename(upload.filename)
+            path = os.path.join(upload_folder, filename)
+            upload_time = time.time()
+            upload.save(path)
+            filetype = _check_magic(upload) or 'CSV' # Either going to be ZIP or CSV, probably
+            # register upload
+            file_upload_context = {
+                'name':'User uploaded calibration file %s' % filename,
+                'filename':filename,
+                'filetype':filetype, # only CSV, no detection necessary
+                'path':path,
+                'upload_time':upload_time,
+                'status':'File uploaded to server'
+            }
+            fuc_id, _ = object_store.create_doc(file_upload_context)
+            # client to process dispatch
+            pd_client = ProcessDispatcherServiceClient()
+            # create process definition
+            process_definition = ProcessDefinition(
+                name='upload_calibration_processor',
+                executable={
+                    'module':'ion.processes.data.upload.upload_calibration_processing',
+                    'class':'UploadCalibrationProcessing'
+                }
+            )
+            process_definition_id = pd_client.create_process_definition(process_definition)
+            # create process
+            process_id = pd_client.create_process(process_definition_id)
+            #schedule process
+            config = DotDict()
+            config.process.fuc_id = fuc_id
+            pid = pd_client.schedule_process(process_definition_id, process_id=process_id, configuration=config)
+            log.info('UploadCalibrationProcessing process created %s' % pid)
+            # response - only FileUploadContext ID and determined filetype for UX display
+            resp = {'fuc_id': fuc_id}
+            return gateway_json_response(resp)
+
+        raise BadRequest('Invalid Upload')
+
+    except Exception as e:
+        return build_error_response(e)
+
+@service_gateway_app.route('/ion-service/upload/<fuc_id>', methods=['GET'])
+def upload_status(fuc_id):
+    try:
+        object_store = Container.instance.object_store
+        fuc = object_store.read(str(fuc_id))
+        return gateway_json_response(fuc)
+    except Exception as e:
+        return build_error_response(e)
+
+def _check_magic(f):
+    '''
+    determines file type from leading bytes
+    '''
+    # CDF
+    f.seek(0)
+    CDF = f.read(3)
+    if CDF == 'CDF':
+        VERSION_BYTE = ord(f.read(1))
+        if VERSION_BYTE == 1:
+            return 'NetCDF Classic'
+        elif VERSION_BYTE == 2:
+            return 'NetCDF 64-bit'
+        return None
+    # HDF
+    HDF_MAGIC = b"\x89HDF\r\n\x1a\n"
+    f.seek(0)
+    HDF = f.read(8)
+    if HDF == HDF_MAGIC:
+        return 'HDF'
+
+    # PKZIP
+    ZIP_MAGIC = b"\x50\x4b\x03\x04"
+    f.seek(0)
+    ZIP = f.read(4)
+    if ZIP == ZIP_MAGIC:
+        return 'ZIP'
+    return None

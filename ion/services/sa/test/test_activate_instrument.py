@@ -1,10 +1,36 @@
 #!/usr/bin/env python
-from ion.services.sa.test.helpers import AgentProcessStateGate
 
+from gevent.event import AsyncResult
+import unittest, os
+from nose.plugins.attrib import attr
+import gevent
+from mock import patch
+
+import time
+
+from pyon.util.int_test import IonIntegrationTestCase
 from pyon.util.containers import DotDict
 from pyon.util.poller import poll
 from pyon.core.bootstrap import get_sys_name
-from gevent.event import AsyncResult
+from pyon.public import RT, PRED
+from pyon.core.bootstrap import CFG
+from pyon.public import IonObject, log
+from pyon.datastore.datastore import DataStore
+from pyon.event.event import EventPublisher, EventSubscriber
+from pyon.util.context import LocalContextMixin
+from pyon.util.containers import  get_ion_ts
+
+from pyon.agent.agent import ResourceAgentClient, ResourceAgentState
+from pyon.agent.agent import ResourceAgentEvent
+
+from ion.services.sa.test.helpers import AgentProcessStateGate
+from ion.services.dm.utility.granule_utils import time_series_domain
+from ion.services.dm.inventory.index_management_service import IndexManagementService
+from ion.services.dm.test.test_dm_end_2_end import DatasetMonitor
+
+from ion.services.cei.process_dispatcher_service import ProcessStateGate
+from ion.agents.port.port_agent_process import PortAgentProcessType, PortAgentType
+from ion.services.dm.utility.granule_utils import RecordDictionaryTool
 
 from interface.services.coi.iresource_registry_service import ResourceRegistryServiceClient
 from interface.services.dm.ipubsub_management_service import PubsubManagementServiceClient
@@ -17,49 +43,18 @@ from interface.services.sa.idata_process_management_service import DataProcessMa
 from interface.services.dm.idata_retriever_service import DataRetrieverServiceClient
 from interface.services.dm.iuser_notification_service import UserNotificationServiceClient
 
-from ion.services.dm.utility.granule_utils import time_series_domain
-from ion.services.dm.inventory.index_management_service import IndexManagementService
-from ion.services.dm.test.test_dm_end_2_end import DatasetMonitor
-
-from ion.services.cei.process_dispatcher_service import ProcessStateGate
-from ion.agents.port.port_agent_process import PortAgentProcessType, PortAgentType
-
-from pyon.public import RT, PRED
-from pyon.core.bootstrap import CFG
-from pyon.public import IonObject, log
-from pyon.datastore.datastore import DataStore
-from pyon.event.event import EventPublisher, EventSubscriber
-
-from pyon.util.int_test import IonIntegrationTestCase
-from pyon.util.context import LocalContextMixin
-from pyon.util.containers import  get_ion_ts
-
-from pyon.agent.agent import ResourceAgentClient, ResourceAgentState
-from pyon.agent.agent import ResourceAgentEvent
-import unittest, os
-from ion.services.dm.utility.granule_utils import RecordDictionaryTool
 from interface.objects import Granule, DeviceStatusType, DeviceCommsType, StreamConfiguration
 from interface.objects import AgentCommand, ProcessDefinition, ProcessStateEnum
 from interface.objects import UserInfo, NotificationRequest
 from interface.objects import ComputedIntValue, ComputedFloatValue, ComputedStringValue, ComputedDictValue, ComputedListValue, ComputedEventListValue
-# Alarm types and events.
-from interface.objects import StreamAlertType,AggregateStatusType, DeviceStatusType
 
-from ion.processes.bootstrap.index_bootstrap import STD_INDEXES
-from nose.plugins.attrib import attr
-import gevent
-import elasticpy as ep
-from mock import patch
-
-import time
-
-use_es = CFG.get_safe('system.elasticsearch',False)
 
 # This import will dynamically load the driver egg.  It is needed for the MI includes below
 from ion.agents.instrument.test.load_test_driver_egg import load_egg
 load_egg()
 DRV_URI_GOOD = CFG.device.sbe37.dvr_egg
 from mi.instrument.seabird.sbe37smb.ooicore.driver import SBE37ProtocolEvent
+
 
 class FakeProcess(LocalContextMixin):
     """
@@ -78,10 +73,8 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
         # Start container
         super(TestActivateInstrumentIntegration, self).setUp()
         config = DotDict()
-        config.bootstrap.use_es = True
 
         self._start_container()
-        self.addCleanup(TestActivateInstrumentIntegration.es_cleanup)
 
         self.container.start_rel_from_url('res/deploy/r2deploy.yml', config)
 
@@ -105,23 +98,6 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
         self._samples_received = []
 
         self.event_publisher = EventPublisher()
-
-    @staticmethod
-    def es_cleanup():
-        es_host = CFG.get_safe('server.elasticsearch.host', 'localhost')
-        es_port = CFG.get_safe('server.elasticsearch.port', '9200')
-        es = ep.ElasticSearch(
-            host=es_host,
-            port=es_port,
-            timeout=10
-        )
-        indexes = STD_INDEXES.keys()
-        indexes.append('%s_resources_index' % get_sys_name().lower())
-        indexes.append('%s_events_index' % get_sys_name().lower())
-
-        for index in indexes:
-            IndexManagementService._es_call(es.river_couchdb_delete,index)
-            IndexManagementService._es_call(es.index_delete,index)
 
 
     def create_logger(self, name, stream_id=''):
@@ -244,7 +220,6 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
 
     @attr('LOCOINT')
     #@unittest.skip('refactoring')
-    #@unittest.skipIf(not use_es, 'No ElasticSearch')
     @unittest.skipIf(os.getenv('CEI_LAUNCH_TEST', False), 'Skip test while in CEI LAUNCH mode')
     @patch.dict(CFG, {'endpoint':{'receive':{'timeout': 90}}})
     def test_activateInstrumentSample(self):
@@ -310,9 +285,6 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
                                                                                instDevice_id)
 
 
-        tdom, sdom = time_series_domain()
-        sdom = sdom.dump()
-        tdom = tdom.dump()
 
 
         parsed_pdict_id = self.dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
@@ -328,11 +300,9 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
 
         dp_obj = IonObject(RT.DataProduct,
             name='the parsed data',
-            description='ctd stream test',
-            temporal_domain = tdom,
-            spatial_domain = sdom)
+            description='ctd stream test')
 
-        data_product_id1 = self.dpclient.create_data_product(data_product=dp_obj, stream_definition_id=parsed_stream_def_id)
+        data_product_id1 = self.dpclient.create_data_product(data_product=dp_obj, stream_definition_id=parsed_stream_def_id, default_stream_configuration=parsed_config)
         log.debug( 'new dp_id = %s' , data_product_id1)
         self.dpclient.activate_data_product_persistence(data_product_id=data_product_id1)
 
@@ -356,11 +326,9 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
 
         dp_obj = IonObject(RT.DataProduct,
             name='the raw data',
-            description='raw stream test',
-            temporal_domain = tdom,
-            spatial_domain = sdom)
+            description='raw stream test')
 
-        data_product_id2 = self.dpclient.create_data_product(data_product=dp_obj, stream_definition_id=raw_stream_def_id)
+        data_product_id2 = self.dpclient.create_data_product(data_product=dp_obj, stream_definition_id=raw_stream_def_id, default_stream_configuration=raw_config)
         log.debug('new dp_id = %s', data_product_id2)
 
         self.damsclient.assign_data_product(input_resource_id=instDevice_id, data_product_id=data_product_id2)
@@ -380,11 +348,6 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
         dataset_ids, _ = self.rrclient.find_objects(data_product_id2, PRED.hasDataset, RT.Dataset, True)
         log.debug('Data set for data_product_id2 = %s' , dataset_ids[0])
         self.raw_dataset = dataset_ids[0]
-
-        #elastic search debug
-        es_indexes, _ = self.container.resource_registry.find_resources(restype='ElasticSearchIndex')
-        log.debug('ElasticSearch indexes: %s', [i.name for i in es_indexes])
-        log.debug('Bootstrap %s', CFG.bootstrap.use_es)
 
 
         def start_instrument_agent():
@@ -462,7 +425,7 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
         for i in xrange(10):
             monitor = DatasetMonitor(dataset_id=self.parsed_dataset)
             self._ia_client.execute_resource(AgentCommand(command=SBE37ProtocolEvent.ACQUIRE_SAMPLE))
-            if not monitor.event.wait(30):
+            if not monitor.wait():
                 raise AssertionError('Failed on the %ith granule' % i)
             monitor.stop()
 

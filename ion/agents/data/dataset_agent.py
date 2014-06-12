@@ -21,7 +21,7 @@ interrupt/resume state:
 __author__ = 'Christopher Mueller, Jonathan Newbrough, Bill French'
 
 
-import os, sys, gevent, json, math, time
+import os, sys, gevent, json, math, time, copy
 
 from ooi.logging import log
 from ooi.poller import DirectoryPoller
@@ -40,6 +40,8 @@ from ion.agents.instrument.common import BaseEnum
 from ion.agents.instrument.instrument_agent import InstrumentAgent
 from ion.core.includes.mi import DriverEvent
 from ion.services.dm.utility.granule.record_dictionary import RecordDictionaryTool
+from ion.agents.agent_stream_publisher import AgentStreamPublisher
+from ion.agents.agent_alert_manager import AgentAlertManager
 
 from coverage_model import ParameterDictionary
 
@@ -76,9 +78,6 @@ class DataSetAgent(InstrumentAgent):
         self._fsm.add_handler(ResourceAgentState.STREAMING, ResourceAgentEvent.EXIT, self._handler_streaming_exit)
 
         self._retry_calculator = FactorialRetryCalculator(60, 1.5, 3600)
-
-        # simulate compliance with platform agent - dict of aggregate statuses for all descendants
-        self.aparam_child_agg_status = {}
 
     ####
     ##    Response Handlers
@@ -142,8 +141,12 @@ class DataSetAgent(InstrumentAgent):
 
         The retry time will be the factorial se
         """
+        log.debug("starting auto reconnect sequence.")
         while self._autoreconnect_greenlet:
-            gevent.sleep(self._retry_calculator.get_sleep_time())
+            sleep_time = self._retry_calculator.get_sleep_time()
+
+            log.debug("Attempt reconnect in %d seconds", sleep_time)
+            gevent.sleep(sleep_time)
             try:
                 self._fsm.on_event(ResourceAgentEvent.AUTORECONNECT)
             except:
@@ -160,12 +163,11 @@ class DataSetAgent(InstrumentAgent):
         # Reset the connection id and index.
         self._asp.reset_connection()
 
-        if(self._state_when_lost in [ResourceAgentState.STREAMING, ResourceAgentState.COMMAND]):
+        if(self._state_when_lost in [ResourceAgentState.STREAMING]):
             log.debug("Exception detected from driver operation, attempting to reconnect.")
 
-            (next_state, result) = self._dvr_client.cmd_dvr('execute_resource', DriverEvent.START_AUTOSAMPLE)
-            log.debug("_handler_lost_connection__autoreconnect: start autosample result: %s, %s", next_state, result)
-
+            # just set the state to streaming.  the enter event will start up the driver.
+            next_state = ResourceAgentState.STREAMING
         else:
             log.debug("Exception detected during agent startup. going back to %s", self._state_when_lost)
             next_state = self._state_when_lost
@@ -187,6 +189,7 @@ class DataSetAgent(InstrumentAgent):
             module_name = self._dvr_config['dvr_mod']
             class_name = self._dvr_config['dvr_cls']
             config = self._dvr_config['startup_config']
+            config['resource_id'] = self.resource_id
         except:
             log.error('error in configuration', exc_info=True)
             raise
@@ -198,28 +201,29 @@ class DataSetAgent(InstrumentAgent):
 
         if memento:
             # memento not empty, which is the case after restart. Just keep what we have.
-            log.info("Using process persistent state: %s", memento)
+            log.debug("Using process persistent state: %s", memento)
         else:
             # memento empty, which is the case after a fresh start. See if we got stuff in CFG
 
             # Set state based on CFG using prior process' state
             prior_state = self.CFG.get_safe("agent.prior_state")
+
             if prior_state:
                 if isinstance(prior_state, dict):
                     if DSA_STATE_KEY in prior_state:
                         memento = prior_state[DSA_STATE_KEY]
-                        log.info("Using persistent state from prior agent run: %s", memento)
+                        log.debug("Using persistent state from prior agent run: %s", memento)
                         self.persist_state_callback(memento)
                 else:
                     raise InstrumentStateException('agent.prior_state invalid: %s' % prior_state)
 
-        log.warn("Get driver object: %s, %s, %s, %s, %s", class_name, module_name, egg_name, egg_repo, memento)
+        log.debug("Get driver object: %s, %s, %s, %s, %s", class_name, module_name, egg_name, egg_repo, memento)
         if uri:
             egg_name = uri.split('/')[-1] if uri.startswith('http') else uri
             egg_repo = uri[0:len(uri)-len(egg_name)-1] if uri.startswith('http') else None
 
-        log.info("instantiate driver plugin %s.%s", module_name, class_name)
-        params = [config, memento, self.publish_callback, self.persist_state_callback, self.exception_callback]
+        log.debug("instantiate driver plugin %s.%s", module_name, class_name)
+        params = [config, memento, self.publish_callback, self.persist_state_callback, self.event_callback, self.exception_callback]
         return EGG_CACHE.get_object(class_name, module_name, egg_name, egg_repo, params)
 
 
@@ -255,14 +259,32 @@ class DataSetAgent(InstrumentAgent):
             log.error("Failed to instantiate driver plugin!")
             raise InstrumentStateException('failed to start driver')
 
-        log.warn("driver client created")
+        self._set_resource_schema()
+
+        log.info("driver client created")
 
         self._asp.reset_connection()
+
+    def _set_resource_schema(self):
+        resource_schema = self._dvr_client.cmd_dvr('get_config_metadata')
+        if isinstance(resource_schema, str):
+            resource_schema = json.loads(resource_schema)
+            if isinstance(resource_schema, dict):
+                self._resource_schema = resource_schema
+            else:
+                self._resource_schema = {}
+        if isinstance(resource_schema, dict):
+            self._resource_schema = resource_schema
+        else:
+            self._resource_schema = {}
 
     def _stop_driver(self, force=True):
         log.warn("DRIVER: _stop_driver")
         if self._dvr_client:
             self._dvr_client.stop_sampling()
+
+        # Force the driver state to be stored
+        self._flush_state()
 
     ####
     ##    Callbacks
@@ -286,7 +308,7 @@ class DataSetAgent(InstrumentAgent):
             for p in particle:
                 # Can we use p.generate_dict() here?
                 p_obj = p.generate()
-                log.info("Particle received: %s", p_obj)
+                log.debug("Particle received: %s", p_obj)
                 self._async_driver_event_sample(p_obj, None)
                 publish_count += 1
         except Exception as e:
@@ -313,6 +335,21 @@ class DataSetAgent(InstrumentAgent):
         """
         log.error('Exception detected in the driver', exc_info=True)
         self._fsm.on_event(ResourceAgentEvent.LOST_CONNECTION)
+
+    def event_callback(self, event_type, **kwargs):
+         """
+         Publish event generated in driver
+         """
+         log.debug("Publish ResourceAgentIOEvent from publisher_callback")
+         self._event_publisher.publish_event(
+             event_type=event_type,
+             origin_type=self.ORIGIN_TYPE,
+             origin=self.resource_id,
+             **kwargs
+         )
+
+    def _build_stream_publisher(self):
+        return AgentStreamPublisher(self, flush_on_publish=True)
 
     def on_quit(self):
         super(DataSetAgent, self).on_quit()
@@ -353,7 +390,7 @@ class DataSetAgent(InstrumentAgent):
         new_sequence = val.get('new_sequence')
 
         if new_sequence == True:
-            log.info("New sequence flag detected in particle.  Resetting connection ID")
+            log.debug("New sequence flag detected in particle.  Resetting connection ID")
             self._asp.reset_connection()
 
         super(DataSetAgent, self)._async_driver_event_sample(val, ts)
@@ -361,6 +398,131 @@ class DataSetAgent(InstrumentAgent):
     def _filter_capabilities(self, events):
         events_out = [x for x in events if DataSetAgentCapability.has(x)]
         return events_out
+
+    def _restore_resource(self, state, prev_state):
+        """
+        Restore agent/resource configuration and state.
+        """
+        log.debug("starting agent restore process, State: %s, Prev State: %s", state, prev_state)
+
+        # Get state to restore. If the last state was lost connection,
+        # use the prior connected state.
+        if not state:
+            log.debug("State not defined, not restoring")
+            return
+
+        if state == ResourceAgentState.LOST_CONNECTION:
+            state = prev_state
+
+        try:
+            cur_state = self._fsm.get_current_state()
+
+            # If unitialized, confirm and do nothing.
+            if state == ResourceAgentState.UNINITIALIZED:
+                if cur_state != state:
+                    raise Exception()
+
+            # If inactive, initialize and confirm.
+            elif state == ResourceAgentState.INACTIVE:
+                self._fsm.on_event(ResourceAgentEvent.INITIALIZE)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != state:
+                    raise Exception()
+
+            # If idle, initialize, activate and confirm.
+            elif state == ResourceAgentState.IDLE:
+                self._fsm.on_event(ResourceAgentEvent.INITIALIZE)
+                self._fsm.on_event(ResourceAgentEvent.GO_ACTIVE)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != state:
+                    raise Exception()
+
+            # If streaming, initialize, activate and confirm.
+            # Driver discover should put us in streaming mode.
+            elif state == ResourceAgentState.STREAMING:
+                self._fsm.on_event(ResourceAgentEvent.INITIALIZE)
+                self._fsm.on_event(ResourceAgentEvent.GO_ACTIVE)
+                self._fsm.on_event(ResourceAgentEvent.RUN)
+                self._fsm.on_event(ResourceAgentEvent.EXECUTE_RESOURCE, DriverEvent.START_AUTOSAMPLE)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != state:
+                    raise Exception()
+
+            # If command, initialize, activate, confirm idle,
+            # run and confirm command.
+            elif state == ResourceAgentState.COMMAND:
+                self._fsm.on_event(ResourceAgentEvent.INITIALIZE)
+                self._fsm.on_event(ResourceAgentEvent.GO_ACTIVE)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != ResourceAgentState.IDLE:
+                    raise Exception()
+                self._fsm.on_event(ResourceAgentEvent.RUN)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != state:
+                    raise Exception()
+
+            # If paused, initialize, activate, confirm idle,
+            # run, confirm command, pause and confirm stopped.
+            elif state == ResourceAgentState.STOPPED:
+                self._fsm.on_event(ResourceAgentEvent.INITIALIZE)
+                self._fsm.on_event(ResourceAgentEvent.GO_ACTIVE)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != ResourceAgentState.IDLE:
+                    raise Exception()
+                self._fsm.on_event(ResourceAgentEvent.RUN)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != ResourceAgentState.COMMAND:
+                    raise Exception()
+                self._fsm.on_event(ResourceAgentEvent.PAUSE)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != state:
+                    raise Exception()
+
+            # If in a command reachable substate, attempt to return to command.
+            # Initialize, activate, confirm idle, run confirm command.
+            elif state in [ResourceAgentState.TEST,
+                    ResourceAgentState.CALIBRATE,
+                    ResourceAgentState.DIRECT_ACCESS,
+                    ResourceAgentState.BUSY]:
+                self._fsm.on_event(ResourceAgentEvent.INITIALIZE)
+                self._fsm.on_event(ResourceAgentEvent.GO_ACTIVE)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != ResourceAgentState.IDLE:
+                    raise Exception()
+                self._fsm.on_event(ResourceAgentEvent.RUN)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != ResourceAgentState.COMMAND:
+                    raise Exception()
+
+            # If active unknown, return to active unknown or command if
+            # possible. Initialize, activate, confirm active unknown, else
+            # confirm idle, run, confirm command.
+            elif state == ResourceAgentState.ACTIVE_UNKNOWN:
+                self._fsm.on_event(ResourceAgentEvent.INITIALIZE)
+                self._fsm.on_event(ResourceAgentEvent.GO_ACTIVE)
+                cur_state = self._fsm.get_current_state()
+                if cur_state == ResourceAgentState.ACTIVE_UNKNOWN:
+                    return
+                elif cur_state != ResourceAgentState.IDLE:
+                    raise Exception()
+                self._fsm.on_event(ResourceAgentEvent.RUN)
+                cur_state = self._fsm.get_current_state()
+                if cur_state != ResourceAgentState.COMMAND:
+                    raise Exception()
+
+            else:
+                log.error('Instrument agent %s error restoring unhandled state %s, current state %s.',
+                        self.id, state, cur_state)
+
+        except Exception as ex:
+            log.error('Instrument agent %s error restoring state %s, current state %s, exception %s.',
+                    self.id, state, cur_state, str(ex))
+            log.exception('###### Agent restore stack trace:')
+
+        else:
+            log.debug('Instrument agent %s restored state %s = %s.',
+                     self.id, state, cur_state)
+
 
 class FactorialRetryCalculator(object):
     """

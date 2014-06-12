@@ -17,7 +17,7 @@ from pyon.util.containers import for_name
 from pyon.util.log import log
 from pyon.event.event import EventSubscriber
 
-from interface.objects import Replay 
+from interface.objects import Replay, CoverageTypeEnum
 from interface.services.dm.idata_retriever_service import BaseDataRetrieverService
 
 import collections
@@ -158,6 +158,7 @@ class DataRetrieverService(BaseDataRetrieverService):
             data_products, _ = Container.instance.resource_registry.find_subjects(object=dataset_id, predicate=PRED.hasDataset, subject_type=RT.DataProduct)
             for data_product in data_products:
                 log.exception("Data Product %s (%s) had issues reading from the coverage model\nretrieve_oob(dataset_id='%s', query=%s, delivery_format=%s)", data_product.name, data_product._id, dataset_id, query, delivery_format)
+            log.exception('Problems reading from the coverage')
             raise BadRequest('Problems reading from the coverage')
         return rdt.to_granule()
 
@@ -173,6 +174,10 @@ class DataRetrieverService(BaseDataRetrieverService):
         @param kwargs          Keyword Arguments to pass into the transform.
 
         '''
+        dataset = self.clients.dataset_management.read_dataset(dataset_id)
+        if dataset.coverage_type == CoverageTypeEnum.COMPLEX:
+            raise BadRequest("Can't retrieve from complex coverage stub")
+
         retrieve_data = self.retrieve_oob(dataset_id=dataset_id,query=query,delivery_format=delivery_format)
 
         if module and cls:
@@ -188,12 +193,7 @@ class DataRetrieverService(BaseDataRetrieverService):
 
     def replay_data_process(self, dataset_id, query, delivery_format, replay_stream_id):
         dataset = self.clients.dataset_management.read_dataset(dataset_id=dataset_id)
-        datastore_name = dataset.datastore_name
         delivery_format = delivery_format or {}
-
-        view_name = dataset.view_name
-        key_id = dataset.primary_view_key
-        # Make a new definition container
 
 
         replay = Replay()
@@ -206,10 +206,7 @@ class DataRetrieverService(BaseDataRetrieverService):
         replay._rev = rev
         config = {'process':{
             'query':query,
-            'datastore_name':datastore_name,
             'dataset_id':dataset_id,
-            'view_name':view_name,
-            'key_id':key_id,
             'delivery_format':delivery_format,
             'publish_streams':{'output':replay_stream_id}
             }

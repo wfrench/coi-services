@@ -9,20 +9,29 @@ from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryC
 
 from pyon.util.log import log
 from pyon.util.ion_time import IonTime
-from pyon.public import RT, PRED, OT, LCS
+from pyon.public import RT, PRED, OT, LCS, CFG
 from pyon.core.bootstrap import IonObject
 from pyon.core.exception import BadRequest, NotFound
 from pyon.util.containers import create_unique_identifier
 from pyon.util.containers import DotDict
 from pyon.util.arg_check import validate_is_not_none, validate_true
 from pyon.ion.resource import ExtendedResourceContainer
-from interface.objects import ProcessDefinition, ProcessSchedule, ProcessRestartMode, TransformFunction, DataProcess, ProcessQueueingMode, ComputedValueAvailability
+from pyon.event.event import EventPublisher
+
+from interface.objects import ProcessDefinition, ProcessSchedule, ProcessRestartMode, DataProcess, ProcessQueueingMode, ComputedValueAvailability
+from interface.objects import ParameterFunction, TransformFunction, DataProcessTypeEnum, DataProcessStatusType, ParameterFunctionType as PFT
 
 from interface.services.sa.idata_process_management_service import BaseDataProcessManagementService
 from interface.services.sa.idata_product_management_service import DataProductManagementServiceClient
+from interface.services.dm.ipubsub_management_service import PubsubManagementServiceClient
+from coverage_model.parameter_functions import AbstractFunction, PythonFunction, NumexprFunction
+from coverage_model import ParameterContext, ParameterFunctionType, ParameterDictionary
+from ion.processes.data.replay.replay_client import ReplayClient
+from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 
 from pyon.util.arg_check import validate_is_instance
 from ion.util.module_uploader import RegisterModulePreparerPy
+import inspect
 import os
 import pwd
 
@@ -33,7 +42,11 @@ class DataProcessManagementService(BaseDataProcessManagementService):
 
         self.override_clients(self.clients)
 
+        self.event_publisher = EventPublisher(OT.DataProcessStatusEvent)
+
         self.init_module_uploader()
+
+        self.init_transform_worker()
 
         self.get_unique_id = (lambda : uuid4().hex)
 
@@ -68,6 +81,19 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         #shortcut names for the import sub-services
         if hasattr(self.clients, "resource_registry"):
             self.RR   = self.clients.resource_registry
+
+
+    def init_transform_worker(self):
+
+        #todo: temporary? where to store for use on restart?
+
+        # map contains worker_process_id : exchange_name
+        #self.transform_worker_subscription_map = {}
+        # map contains worker_process_id : [dp_id1, dp_id2, etc]
+        #self.transform_worker_dp_map = {}
+
+        self.TRANSFORM_WORKER_HOST_LIMIT = 10
+
 
 
     #todo: need to know what object will be worked with here
@@ -106,11 +132,12 @@ class DataProcessManagementService(BaseDataProcessManagementService):
                tf1.uri           == tf2.uri    and \
                tf1.function_type == tf2.function_type
 
-    def create_transform_function(self, transform_function=''):
+    def create_transform_function(self, transform_function=None):
         '''
         Creates a new transform function
         '''
-
+        if not transform_function:
+            raise BadRequest("Improper TransformFunction specified")
         return self.RR2.create(transform_function, RT.TransformFunction)
 
     def read_transform_function(self, transform_function_id=''):
@@ -121,30 +148,33 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         self.RR2.update(transform_function, RT.TransformFunction)
 
     def delete_transform_function(self, transform_function_id=''):
-        self.RR2.retire(transform_function_id, RT.TransformFunction)
+        self.clients.resource_registry.retire(transform_function_id)
 
     def force_delete_transform_function(self, transform_function_id=''):
-        self.RR2.pluck_delete(transform_function_id, RT.TransformFunction)
+        self.RR2.force_delete(transform_function_id, RT.TransformFunction)
 
-    def create_data_process_definition(self, data_process_definition=None):
 
-        data_process_definition_id = self.RR2.create(data_process_definition, RT.DataProcessDefinition)
+    def create_data_process_definition(self, data_process_definition=None, function_id=''):
+        function_definition = self.clients.resource_registry.read(function_id)
 
-        #-------------------------------
-        # Process Definition
-        #-------------------------------
-        # Create the underlying process definition
-        process_definition = ProcessDefinition()
-        process_definition.name = data_process_definition.name
-        process_definition.description = data_process_definition.description
+        if isinstance(function_definition,  ParameterFunction):
+            data_process_definition.data_process_type = DataProcessTypeEnum.PARAMETER_FUNCTION
+            dpd_id, _ = self.clients.resource_registry.create(data_process_definition)
+            self.clients.resource_registry.create_association(subject=dpd_id, object=function_id, predicate=PRED.hasParameterFunction)
+            return dpd_id
 
-        process_definition.executable = {'module':data_process_definition.module, 'class':data_process_definition.class_name}
-        process_definition_id = self.clients.process_dispatcher.create_process_definition(process_definition=process_definition)
+        elif isinstance(function_definition, TransformFunction):
+            # TODO: Need service methods for this stuff
+            if data_process_definition.data_process_type not in (DataProcessTypeEnum.TRANSFORM_PROCESS, DataProcessTypeEnum.RETRIEVE_PROCESS):
+                data_process_definition.data_process_type = DataProcessTypeEnum.TRANSFORM_PROCESS
 
-        self.RR2.assign_process_definition_to_data_process_definition_with_has_process_definition(process_definition_id,
-                                                                                                  data_process_definition_id)
+            dpd_id, _ = self.clients.resource_registry.create(data_process_definition)
+            self.clients.resource_registry.create_association(subject=dpd_id, object=function_id, predicate=PRED.hasTransformFunction)
+            return dpd_id
 
-        return data_process_definition_id
+        else:
+            raise BadRequest('function_definition is not a function type')
+
 
     def update_data_process_definition(self, data_process_definition=None):
         # TODO: If executable has changed, update underlying ProcessDefinition
@@ -158,14 +188,13 @@ class DataProcessManagementService(BaseDataProcessManagementService):
 
     def delete_data_process_definition(self, data_process_definition_id=''):
 
-        # Delete the resource
-        self.RR2.retire(data_process_definition_id, RT.DataProcessDefinition)
+        self.clients.resource_registry.retire(data_process_definition_id)
 
     def force_delete_data_process_definition(self, data_process_definition_id=''):
 
         processdef_ids, _ = self.clients.resource_registry.find_objects(subject=data_process_definition_id, predicate=PRED.hasProcessDefinition, object_type=RT.ProcessDefinition, id_only=True)
 
-        self.RR2.pluck_delete(data_process_definition_id, RT.DataProcessDefinition)
+        self.RR2.force_delete(data_process_definition_id, RT.DataProcessDefinition)
 
         for processdef_id in processdef_ids:
             self.clients.process_dispatcher.delete_process_definition(processdef_id)
@@ -243,172 +272,573 @@ class DataProcessManagementService(BaseDataProcessManagementService):
             self.clients.resource_registry.delete_association(association)
 
 
-    def create_data_process(self, data_process_definition_id='', in_data_product_ids=None, out_data_product_ids=None, configuration=None):
-        '''
-        Creates a DataProcess resource and launches the process.
-        A DataProcess is a process that receives one (or more) data products and produces one (or more) data products.
 
-        @param data_process_definition_id : The Data Process Definition to use, if none is specified the standard TransformDataProcess is used
-        @param in_data_product_ids : A list of input data product identifiers
-        @param out_data_product_ids : A list of output data product identifiers
+    def create_data_process(self, data_process_definition_id='', inputs=None, outputs=None, configuration=None, argument_map=None, out_param_name=''):
+        '''
+        Creates a DataProcess resource.
+        A DataProcess can be of a few types:
+           - a data transformation function hosted on a transform worker that receives granules and produces granules.
+           - a parameter function in a coverage that transforms data on request
+
+        @param data_process_definition_id : The Data Process Definition parent which contains the transform or parameter funcation specification
+        @param inputs: A list of inputs
+        @param outputs: A list of outputs
+
         @param configuration : The configuration dictionary for the process, and the routing table:
-
-        The routing table is defined as such:
-            { in_data_product_id: {out_data_product_id : actor }}
-
-        Routes are specified in the configuration dictionary under the item "routes"
-        actor is either None (for ParameterFunctions) or a valid TransformFunction identifier
         '''
-        configuration = DotDict(configuration or {}) 
-        in_data_product_ids = in_data_product_ids or []
-        out_data_product_ids = out_data_product_ids or []
-        routes = configuration.get_safe('process.routes', {})
-        if not routes and (1==len(in_data_product_ids)==len(out_data_product_ids)):
-            routes = {in_data_product_ids[0]: {out_data_product_ids[0]:None}}
-        # Routes are not supported for processes with discrete data process definitions
-        elif not routes and not data_process_definition_id:
-            raise BadRequest('No valid route defined for this data process.')
 
-        self.validate_compatibility(data_process_definition_id, in_data_product_ids, out_data_product_ids, routes)
-        routes = self._manage_routes(routes)
-        configuration.process.input_products = in_data_product_ids
+        #todo: determine if/how routing tables will be managed
+        dpd_obj = self.read_data_process_definition(data_process_definition_id)
+        configuration = DotDict(configuration or {})
+        if dpd_obj.data_process_type == DataProcessTypeEnum.PARAMETER_FUNCTION:
+            # A different kind of data process
+            # this function creates a data process resource for each data product and appends the parameter
+            return self._initialize_parameter_function(data_process_definition_id, inputs, argument_map, out_param_name)
+        elif dpd_obj.data_process_type == DataProcessTypeEnum.TRANSFORM_PROCESS:
+            return self._initialize_transform_process(dpd_obj, inputs, outputs, configuration, argument_map, out_param_name)
+        elif dpd_obj.data_process_type == DataProcessTypeEnum.RETRIEVE_PROCESS:
+            return self._initialize_retrieve_process(dpd_obj, inputs, outputs, configuration, argument_map, out_param_name)
+
+
+    def _initialize_transform_process(self, data_process_definition, in_data_product_ids, out_data_product_ids, configuration=None, argument_map=None, out_param_name=''):
+        dpd_obj = data_process_definition
+        configuration = DotDict(configuration or {})
+        # work with empty lists if nothing provided for inputs / outputs
+        in_data_product_ids = (in_data_product_ids or [])
+        out_data_product_ids = (out_data_product_ids or [])
+
         configuration.process.output_products = out_data_product_ids
-        configuration.process.routes = routes
+
+        dataproduct_name = ''
+        if in_data_product_ids:
+            in_dataprod_obj = self.clients.data_product_management.read_data_product(in_data_product_ids[0])
+            dataproduct_name = in_dataprod_obj.name
+
         if 'lookup_docs' in configuration.process:
             configuration.process.lookup_docs.extend(self._get_lookup_docs(in_data_product_ids, out_data_product_ids))
         else:
             configuration.process.lookup_docs = self._get_lookup_docs(in_data_product_ids, out_data_product_ids)
+
+        #Validate input and output mappings
+        for in_data_product_id in in_data_product_ids:
+            if not self.validate_argument_input(data_product_id=in_data_product_id, argument_map=argument_map):
+                raise BadRequest('Input data product does not contain the parameters defined in argument map')
+        for out_data_product_id in out_data_product_ids:
+            if not self.validate_argument_input(data_product_id=out_data_product_id, output_param=out_param_name):
+                raise BadRequest('Output data product does not contain the output parameter name provided')
+
         dproc = DataProcess()
-        dproc.name = 'data_process_%s' % self.get_unique_id()
+        #name the data process the DPD name + in_data_product name to make more readable
+        dproc.name = ''.join([dpd_obj.name, '_on_', dataproduct_name])
         dproc.configuration = configuration
+        # todo: document that these two attributes must be added into the configuration dict of the create call
+        dproc.argument_map = argument_map
+        dproc.output_param = out_param_name
+
         dproc_id, rev = self.clients.resource_registry.create(dproc)
         dproc._id = dproc_id
         dproc._rev = rev
 
+        # create links
         for data_product_id in in_data_product_ids:
             self.clients.resource_registry.create_association(subject=dproc_id, predicate=PRED.hasInputProduct, object=data_product_id)
+        for data_product_id in out_data_product_ids:
+            self.clients.resource_registry.create_association(subject=dproc_id, predicate=PRED.hasOutputProduct, object=data_product_id)
+        if data_process_definition._id:
+            self.clients.resource_registry.create_association(data_process_definition._id, PRED.hasDataProcess ,dproc_id)
 
-        if data_process_definition_id:
-            self.clients.resource_registry.create_association(data_process_definition_id, PRED.hasDataProcess ,dproc_id)
+        exchange_name = self._assign_worker(dproc_id)
+        #exchange_name = self.transform_worker_subscription_map[transform_worker_pid]
+        log.debug('create_data_process  exchange_name: %s', exchange_name)
+        queue_name = self._create_subscription(dproc, in_data_product_ids, exchange_name)
+        log.debug('create_data_process  queue_name: %s', queue_name)
 
-        self._manage_producers(dproc_id, out_data_product_ids)
-
-        self._manage_attachments()
-
-        queue_name = self._create_subscription(dproc, in_data_product_ids)
-
-        pid = self._launch_data_process(
-                queue_name=queue_name,
-                data_process_definition_id=data_process_definition_id,
-                out_data_product_ids=out_data_product_ids,
-                configuration=configuration)
-
-        self.clients.resource_registry.create_association(subject=dproc_id, predicate=PRED.hasProcess, object=pid)
-
+        self.event_publisher.publish_event(origin=dproc_id, origin_type='DataProcess', status=DataProcessStatusType.NORMAL,
+                           description='Data process created for data product ', values= in_data_product_ids )
 
         return dproc_id
 
-    def _get_input_stream_ids(self, in_data_product_ids = None):
+    def _assign_worker(self, data_process_id):
+        #todo: assign to a transform worker
+        #if no workers, start the first one
+        #todo: check if TW has reached limit of dps
+        transform_worker_pid = ''
+        exchange_name = ''
+        transform_worker_dp_map = self._find_transform_workers()
+        log.debug('_start_transform_worker  transform_worker_dp_map:  %s', transform_worker_dp_map)
+        if not transform_worker_dp_map:
+            log.debug('create_data_process start first worker')
+            #for the first data process in a TW, generate the exchange name
+            transform_worker_pid, exchange_name = self._start_transform_worker()
+        else:
+            for worker_pid, dp_list in transform_worker_dp_map.iteritems():
+                if len(dp_list) < self.TRANSFORM_WORKER_HOST_LIMIT:
+                    # slots available on this worker, add the dp input stream to its queue
+                    transform_worker_pid = worker_pid
+                    # get the exchange name for a hosted data process
+                    exchange_name = self._get_transform_worker_subscription_name(transform_worker_pid)
 
-        input_stream_ids = []
+        #link the Process to the DataProcess that it is hosting
+        self.clients.resource_registry.create_association(subject=data_process_id, predicate=PRED.hasProcess, object=transform_worker_pid)
 
-        #------------------------------------------------------------------------------------------------------------------------------------------
-        # get the streams associated with this IN data products
-        #------------------------------------------------------------------------------------------------------------------------------------------
-        for  in_data_product_id in in_data_product_ids:
+        self.event_publisher.publish_event(origin=data_process_id, origin_type='DataProcess', status=DataProcessStatusType.NORMAL,
+                               description='Data process assigned to transform worker. ', values=[transform_worker_pid] )
 
-            # Get the stream associated with this input data product
-            stream_ids, _ = self.clients.resource_registry.find_objects(in_data_product_id, PRED.hasStream, RT.Stream, True)
+        return exchange_name
 
-            validate_is_not_none( stream_ids, "No Stream created for this input Data Product " + str(in_data_product_id))
-            validate_is_not_none( len(stream_ids) != 1, "Input Data Product should only have ONE stream" + str(in_data_product_id))
+    def _initialize_retrieve_process(self, data_process_definition, in_data_product_ids, out_data_product_ids, configuration, argument_map, out_param_name):
+        '''
+        Initializes a retreive process
 
-            # We take for now one stream_id associated with each input data product
-            input_stream_ids.append(stream_ids[0])
+        1. Launch the process
+        2. Create streams for the inputs to replay on
+        3. Subscribe and activate
+        4. Initiate replay
+        '''
 
-        return input_stream_ids
+        configuration = configuration or DotDict()
+        # Manage cases and misconfigurations
+        if not in_data_product_ids:
+            raise BadRequest('Input data products are required')
 
-    def _launch_process(self, queue_name='', out_streams=None, process_definition_id='', configuration=None):
-        """
-        Launches the process
-        """
+        data_product_id = in_data_product_ids[0]
+        data_product = self.clients.data_product_management.read_data_product(data_product_id)
 
-        # ------------------------------------------------------------------------------------
-        # Spawn Configuration and Parameters
-        # ------------------------------------------------------------------------------------
+        data_process = DataProcess()
+        data_process.name = '_on_'.join([data_process_definition.name, data_product.name])
+        data_process.configuration = configuration
+        data_process.argument_map = argument_map
+        data_process.output_param = out_param_name
 
-        if 'process' not in configuration:
-            configuration['process'] = {}
-        configuration['process']['queue_name'] = queue_name
-        configuration['process']['publish_streams'] = out_streams
+        data_process_id, _ = self.clients.resource_registry.create(data_process)
+
+        # Create the associations
+        for data_product_id in in_data_product_ids:
+            self.clients.resource_registry.create_association(subject=data_process_id, predicate=PRED.hasInputProduct, object=data_product_id)
+        for data_product_id in out_data_product_ids:
+            self.clients.resource_registry.create_association(subject=data_process_id, predicate=PRED.hasOutputProduct, object=data_product_id)
+        if data_process_definition._id:
+            self.clients.resource_registry.create_association(data_process_definition._id, PRED.hasDataProcess ,data_process_id)
+
+        # Launch the worker
+        exchange_name = self._assign_worker(data_process_id)
+
+        # Create streams and subscription for a replay
+        self._create_replay(data_process_id, in_data_product_ids, exchange_name, configuration)
+
+        self.event_publisher.publish_event(origin=data_process_id, origin_type='DataProcess', status=DataProcessStatusType.NORMAL,
+                           description='Data process created for data product ', values= in_data_product_ids )
+
+        return data_process_id
+
+
+    def _create_replay(self, data_process_id, in_data_product_ids, exchange_name, configuration):
+        streams = []
+        replay_ids = []
+        for data_product_id in in_data_product_ids:
+            '''
+            For each data product
+                1. Create a stream for the replay
+                2. Setup the query
+                3. Define the replay
+            '''
+            data_product = self.clients.data_product_management.read_data_product(data_product_id)
+            stream_defs, _ = self.clients.resource_registry.find_objects(data_product_id, PRED.hasStreamDefinition, id_only=True)
+            stream_def_id = stream_defs[0]
+            # Create the stream for replay
+            stream_id, stream_route = self.clients.pubsub_management.create_stream(
+                    name='Replay stream for %s' % data_product.name,
+                    exchange_point=configuration.get_safe('exchange_point','science_data'),
+                    stream_definition_id=stream_def_id)
+
+            # Associate the stream with the data process
+            # We have to cleanup the streams when we're done with the data process
+            self.clients.resource_registry.create_association(data_process_id, PRED.hasStream, stream_id)
+            # Store the stream for the subscription
+            streams.append(stream_id)
+
+            # Get the dataset id for the replay definition
+            dataset_ids, _ = self.clients.resource_registry.find_objects(data_product_id, PRED.hasDataset, id_only=True)
+            if not dataset_ids:
+                raise BadRequest("Data Product has no dataset")
+            dataset_id = dataset_ids[0]
+
+            # Setup the replay query
+            query = {"start_time" : configuration.get_safe("start_time"),
+                    "end_time" : configuration.get_safe("end_time"),
+                    "parameters" : configuration.get_safe("parameters"),
+                    "publish_limit": configuration.get_safe("publish_limit")}
+            
+            # Create the replay
+            replay_id, pid = self.clients.data_retriever.define_replay(dataset_id, 
+                    query=query, delivery_format=stream_def_id, stream_id=stream_id)
+            replay_ids.append(replay_id)
+            self.clients.data_retriever.start_replay_agent(replay_id)
+
+            # Link the data process to this replay
+            self.clients.resource_registry.create_association(data_process_id, PRED.hasReplay, replay_id)
+
+            log.debug('data process _create_replay: %s. ', data_product_id)
+            self.event_publisher.publish_event(origin=data_process_id, origin_type='DataProcess', status=DataProcessStatusType.NORMAL,
+                                   description='data process replay created from data product. ', values= [data_product_id] )
+
+        subscription_id = self.clients.pubsub_management.create_subscription(name=exchange_name, 
+                                                                             stream_ids=streams)
+        self.clients.resource_registry.create_association(data_process_id, PRED.hasSubscription, object=subscription_id)
+        return replay_ids
+
+
+
+
+    #--------------------------------------------------------------------------------
+    # Validation
+    #--------------------------------------------------------------------------------
+    def validate_argument_input(self, data_product_id='', argument_map=None, output_param=''):
+        '''
+        Returns true if the argument map or output parameter is valid for a particular data product
+        '''
+        if not ( argument_map or output_param):
+            raise BadRequest("A valid arugment map or output parameter is required")
+        if not data_product_id:
+            raise BadRequest("A valid data product is required")
+
+        parameters = self.parameters_for_data_product(data_product_id)
+        parameter_names = parameters.keys()
+        if argument_map:
+            for argument_name in argument_map.itervalues():
+                if argument_name not in parameter_names:
+                    return False
+        else:
+            if output_param not in parameter_names:
+                return False
+
+        return True
+
+    def parameters_for_data_product(self, data_product_id='', filtered=False):
+        '''
+        Returns a dict of parameter and parameter ids for a data product. Applies a
+        filter if specified (using the stream def)
+        '''
+
+        stream_defs, _ = self.clients.resource_registry.find_objects(data_product_id, PRED.hasStreamDefinition, id_only=False)
+        if not stream_defs:
+            raise BadRequest("No Stream Definition Found for data product %s" % data_product_id)
+        stream_def = stream_defs[0]
+
+        pdicts, _ = self.clients.resource_registry.find_objects(stream_def._id, PRED.hasParameterDictionary, id_only=True)
+        if not pdicts:
+            raise BadRequest("No Parameter Dictionary Found for data product %s" % data_product_id)
+        pdict_id = pdicts[0]
+        parameters, _ = self.clients.resource_registry.find_objects(pdict_id, PRED.hasParameterContext, id_only=False)
+
+        # too complicated for one line of code
+        #retval = { p.name : p._id for p in parameters if not filtered or (filtered and p in stream_def.available_fields) }
+        retval = {}
+        for p in parameters:
+            if filtered and p.name in stream_def.available_fields:
+                retval[p.name] = p._id
+            elif not filtered:
+                retval[p.name] = p._id
+        return retval
+
+
+
+
+    #--------------------------------------------------------------------------------
+    # Transform Worker Management
+    #--------------------------------------------------------------------------------
+
+
+    def _start_transform_worker(self):
+
+        def create_queue_name():
+            import uuid
+            id = str(uuid.uuid4())
+            #import re
+            #queue_name = re.sub(r'[ -]','_',id)
+            queue_name = id.replace('-', '_')
+            log.debug('_create_queue_name:  %s', queue_name)
+            return queue_name
+
+        log.debug('_start_transform_worker: ')
+        config = DotDict()
+        config.process.queue_name = create_queue_name()
+        log.debug('_create_queue_name config  %s', config)
+
+        #create the process definition
+        process_definition = ProcessDefinition()
+        process_definition.name = 'TransformWorker'
+        process_definition.executable['module'] = 'ion.processes.data.transforms.transform_worker'
+        process_definition.executable['class'] = 'TransformWorker'
+        process_definition_id = self.clients.process_dispatcher.create_process_definition(process_definition)
 
         # Setting the restart mode
         schedule = ProcessSchedule()
-        schedule.restart_mode = ProcessRestartMode.ABNORMAL
+        schedule.restart_mode = ProcessRestartMode.ALWAYS
         schedule.queueing_mode = ProcessQueueingMode.ALWAYS
 
-        # ------------------------------------------------------------------------------------
-        # Process Spawning
-        # ------------------------------------------------------------------------------------
         # Spawn the process
         pid = self.clients.process_dispatcher.schedule_process(
             process_definition_id=process_definition_id,
             schedule= schedule,
-            configuration=configuration
+            configuration=config
         )
-        validate_is_not_none( pid, "Process could not be spawned")
+        log.debug('_create_queue_name pid  %s', pid)
 
-        return pid
+        return pid, config.process.queue_name
 
 
-    def _find_lookup_tables(self, resource_id="", configuration=None):
-        #check if resource has lookup tables attached
+    def _find_transform_workers(self):
 
-        configuration = configuration or DotDict()
+        transform_worker_map = {}
+        # returns a map of process resources that are transform workers and the list of data processes they are hosting
+        # { transformworker1 : [ dataprocess1, dataprocess2] }
 
-        attachment_objs, _ = self.clients.resource_registry.find_objects(resource_id, PRED.hasAttachment, RT.Attachment, False)
+        # DataProcess hasProcess Process
+        #    Subj        Pred       Object
 
-        for attachment_obj in attachment_objs:
+        dataprocess_ids, _ = self.clients.resource_registry.find_resources(restype=RT.DataProcess, id_only=True)
+        log.debug('_find_transform_workers data_process_ids: %s ', dataprocess_ids)
 
-            words = set(attachment_obj.keywords)
+        #todo: look for Process resources that are assoc with DataProcess resources
 
-            if 'DataProcessInput' in words:
-                configuration[attachment_obj.name] = attachment_obj.content
-                log.debug("Lookup table, %s, found in attachment %s" % (attachment_obj.content, attachment_obj.name))
+        # now look for hasProcess associations to determine which Processes are TransformWorkers
+        objects, associations = self.clients.resource_registry.find_objects_mult(subjects=dataprocess_ids)
+        log.debug('have %d dataprocess-associated objects, %d are hasProcess', len(associations), sum([1 if assoc.p==PRED.hasProcess else 0 for assoc in associations]))
+        for subject, assoc in zip(objects, associations):
+            if assoc.p == PRED.hasProcess:
+                if assoc.o in transform_worker_map:
+                    transform_worker_map[assoc.o].append(assoc.s)
+                else:
+                    transform_worker_map[assoc.o] = [assoc.s]
+
+        log.debug('find_transform_workers  transform_worker_map:  %s', transform_worker_map)
+        return transform_worker_map
+
+
+
+    def _get_transform_worker_subscription_name(self, transform_worker_pid=''):
+
+        # returns the
+
+        #todo: find a data process assoc (hosted by) this transform worker process and retrieve its subscription to get exchange name
+        data_process_ids, _ = self.clients.resource_registry.find_subjects(subject_type=RT.DataProcess, predicate=PRED.hasProcess, object=transform_worker_pid, id_only=True)
+        if not data_process_ids: raise BadRequest('No data processes associated with this transform worker process')
+
+        subscription_ids, _ = self.clients.resource_registry.find_objects(subject=data_process_ids[0], predicate=PRED.hasSubscription, object_type=RT.Subscription, id_only=True)
+        if not subscription_ids: raise BadRequest('No Subscription associated with this transform worker process')
+
+        #todo: retrieve the subscrption exchange name
+
+        subscription_obj = self.clients.pubsub_management.read_subscription(subscription_ids[0])
+        log.debug('get_transform_worker_subscription_name subscription_obj: %s ', subscription_obj)
+
+        return subscription_obj.exchange_name
+
+
+    #--------------------------------------------------------------------------------
+    # Inspection
+    #--------------------------------------------------------------------------------
+
+    def get_data_process_definition_url(self, data_process_definition_id=''):
+        '''
+        Returns the github URL for the data process definition if available
+        '''
+        dpd = self.read_data_process_definition(data_process_definition_id)
+        if dpd.data_process_type == DataProcessTypeEnum.PARAMETER_FUNCTION:
+            return self._get_parameter_function_url(data_process_definition_id)
+        elif dpd.data_process_type == DataProcessTypeEnum.TRANSFORM_PROCESS:
+            return self._get_transform_worker_subscription_name(data_process_definition_id)
+        else:
+            raise BadRequest("Data process type not yet supported")
+
+    def _get_parameter_function_url(self, data_process_definition_id):
+        '''
+        Generates an appropriate github URL for a parameter function 
+        if it was defined within ion-functions
+        '''
+        pfuncs, _ = self.clients.resource_registry.find_objects(data_process_definition_id, PRED.hasParameterFunction, id_only=False)
+        if not pfuncs:
+            raise BadRequest('Data Process Definition %s has no parameter functions' % data_process_definition_id)
+        pfunc = pfuncs[0]
+        if pfunc.function_type == PFT.PYTHON:
+            owner = pfunc.owner
+            egg_uri = pfunc.egg_uri
+            if owner.startswith('ion_functions'):
+                url = 'https://github.com/ooici/ion-functions/blob/master/%s.py' % owner.replace('.','/')
+            elif egg_uri and egg_uri.startswith('http'):
+                url = egg_uri
             else:
-                log.debug("NO lookup table in attachment %s" % attachment_obj.name)
+                raise BadRequest("No valid URL exists")
+        elif pfunc.function_type == PFT.NUMEXPR:
+            raise BadRequest("Numexpr expressions do not have URLs")
+        else:
+            raise BadRequest("Unknown parameter function type")
+        return url
 
-        return configuration
+    def _get_transform_function_url(self):
+        raise BadRequest("Transform function URL not supported yet")
 
-    def update_data_process_inputs(self, data_process_id="", in_stream_ids=None):
-        #@TODO: INPUT STREAM VALIDATION
-        log.debug("Updating inputs to data process '%s'", data_process_id)
-        data_process_obj = self.clients.resource_registry.read(data_process_id)
-        subscription_id = data_process_obj.input_subscription_id
-        was_active = False 
-        if subscription_id:
-            # get rid of all the current streams
-            try:
-                log.debug("Deactivating subscription '%s'", subscription_id)
-                self.clients.pubsub_management.deactivate_subscription(subscription_id)
-                was_active = True
+    def inspect_data_process_definition(self, data_process_definition_id=''):
+        '''
+        Returns the source code for the data process definition
+        '''
+        dpd = self.read_data_process_definition(data_process_definition_id)
+        if dpd.data_process_type == DataProcessTypeEnum.PARAMETER_FUNCTION:
+            return self._inspect_parameter_function(data_process_definition_id)
+        elif dpd.data_process_type == DataProcessTypeEnum.TRANSFORM_PROCESS:
+            return self._inspect_transform_function(data_process_definition_id)
+        #TODO: add the rest of the types
+        else:
+            raise BadRequest("Data process type not yet supported")
 
-            except BadRequest:
-                log.info('Subscription was not active')
+    def _inspect_parameter_function(self, data_process_definition_id):
+        '''
+        Returns the source code definition for the DPD's parameter function
+        '''
+        pfuncs, _ = self.clients.resource_registry.find_objects(data_process_definition_id, PRED.hasParameterFunction, id_only=False)
+        if not pfuncs:
+            raise BadRequest('Data Process Definition %s has no parameter functions' % data_process_definition_id)
+        func = DatasetManagementService.get_coverage_function(pfuncs[0])
+        if isinstance(func, PythonFunction):
+            func._import_func()
+            # Gets a list of lines of the source code
+            src = inspect.getsourcelines(func._callable)[0]
+            # Join the lines into one contiguous string
+            src = ''.join(src)
 
-            self.clients.pubsub_management.delete_subscription(subscription_id)
+        elif isinstance(func, NumexprFunction):
+            src = func.expression
 
-        new_subscription_id = self.clients.pubsub_management.create_subscription(data_process_obj.name,
-                                                                                 stream_ids=in_stream_ids)
-        data_process_obj.input_subscription_id = new_subscription_id
+        else:
+            raise BadRequest('%s is not supported for inspection' % type(func))
 
-        self.clients.resource_registry.update(data_process_obj)
+        return src
 
-        if was_active:
-            log.debug("Activating subscription '%s'", new_subscription_id)
-            self.clients.pubsub_management.activate_subscription(new_subscription_id)
 
-            
+    def _inspect_transform_function(self, data_process_definition_id):
+        '''
+        Returns the source code definition for the DPD's transform function
+        '''
+        import importlib
+
+        data_process_definition_obj = self.read_data_process_definition(data_process_definition_id)
+
+        tfuncs, _ = self.clients.resource_registry.find_objects(data_process_definition_id, PRED.hasTransformFunction, id_only=False)
+        if not tfuncs:
+            raise BadRequest('Data Process Definition %s has no transform functions' % data_process_definition_id)
+        tfunc_obj =  tfuncs[0]
+
+        module = None
+        #first try to load the module, if not avaialable, then import the egg
+        try:
+            module = importlib.import_module(tfunc_obj.module)
+        except ImportError:
+        #load the associated transform function
+            import ion.processes.data.transforms.transform_worker.TransformWorker
+            if tfunc_obj.uri:
+                egg = TransformWorker.download_egg(tfunc_obj.uri)
+                import pkg_resources
+                pkg_resources.working_set.add_entry(egg)
+
+                module = importlib.import_module(tfunc_obj.module)
+            else:
+                log.warning('No uri provided for module in data process definition.')
+
+        function = getattr(module, tfunc_obj.function)
+        # Gets a list of lines of the source code
+        src = inspect.getsourcelines(function)[0]
+        # Join the lines into one contiguous string
+        src = ''.join(src)
+
+        return src
+
+
+    #--------------------------------------------------------------------------------
+    # Parameter Function Support
+    #--------------------------------------------------------------------------------
+
+    def _initialize_parameter_function(self, data_process_definition_id, data_product_ids, param_map, out_param_name):
+        '''
+        For each data product, append a parameter according to the dpd
+
+        1. Get a parameter context
+        2. Load the data product's datasets and check if the name is in the dict
+        3. Append parameter to all datasets
+        4. Associate context with data products' parameter dicts
+        '''
+        dpd = self.read_data_process_definition(data_process_definition_id)
+        ctxt, ctxt_id = self._get_param_ctx_from_dpd(data_process_definition_id, param_map, out_param_name)
+        # For each data product check for and add the parameter
+        data_process_ids = []
+        for data_product_id in data_product_ids:
+            self._check_data_product_for_parameter(data_product_id, out_param_name)
+            self._add_parameter_to_data_products(ctxt_id, data_product_id)
+            # Create a data process and we'll return all the ids we make
+            dp_id = self._create_data_process_for_parameter_function(dpd, data_product_id, param_map)
+            data_process_ids.append(dp_id)
+
+            self.event_publisher.publish_event(origin=dp_id, origin_type='DataProcess', status=DataProcessStatusType.NORMAL,
+                        description='Data process created for data product ', values= [data_product_id] )
+
+        return data_process_ids
+
+    def _get_param_ctx_from_dpd(self, data_process_definition_id, param_map, out_param_name):
+        '''
+        Creates a parameter context for the data process definition using the param_map
+        '''
+        # Get the parameter function associated with this data process definition
+        parameter_functions, _ = self.clients.resource_registry.find_objects(data_process_definition_id, PRED.hasParameterFunction, id_only=False)
+        if not parameter_functions:
+            raise BadRequest("No associated parameter functions with data process definition %s" % data_process_definition_id)
+        # Make a context specific to this data process
+        pf = DatasetManagementService.get_coverage_function(parameter_functions[0])
+
+        # Assign the parameter map
+        if not param_map:
+            raise BadRequest('A parameter map must be specified for ParameterFunctions')
+        if not out_param_name:
+            raise BadRequest('A parameter name is required')
+        # TODO: Add sanitary check
+        pf.param_map = param_map
+        ctxt = ParameterContext(out_param_name, param_type=ParameterFunctionType(pf))
+        ctxt_id = self.clients.dataset_management.create_parameter_context(out_param_name, ctxt.dump())
+        return ctxt, ctxt_id
+
+    def _check_data_product_for_parameter(self, data_product_id, param_name):
+        '''
+        Verifies that the named parameter does not exist in the data product already
+        '''
+        parameters = self.clients.data_product_management.get_data_product_parameters(data_product_id, id_only=False)
+
+        param_dict = {p.name : p for p in parameters}
+        if param_name in param_dict:
+            raise BadRequest("Named parameter %s already exists in this data product: %s" % (param_name, data_product_id))
+
+    def _add_parameter_to_data_products(self, parameter_context_id, data_product_id):
+        '''
+        Adds the parameter context to the data product
+        '''
+        # Add the parameter
+        self.clients.data_product_management.add_parameter_to_data_product(parameter_context_id, data_product_id)
+
+    def _create_data_process_for_parameter_function(self, data_process_definition, data_product_id, param_map):
+        '''
+        Creates a data process to represent a parameter function on a data product
+        '''
+        # Get the data product object for the name
+        data_product = self.clients.data_product_management.read_data_product(data_product_id)
+        # There may or may not be a need to keep more information here
+        dp = DataProcess()
+        dp.name = 'Data Process %s for Data Product %s' % (data_process_definition.name, data_product.name)
+        dp.argument_map = param_map
+        # We make a data process
+        dp_id, _ = self.clients.resource_registry.create(dp)
+        self.clients.resource_registry.create_association(data_process_definition._id, PRED.hasDataProcess, dp_id)
+        return dp_id
+
+
+
 
     def update_data_process(self):
         raise BadRequest('Cannot update an existing data process.')
@@ -419,15 +849,57 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         return data_proc_obj
 
 
+    def read_data_process_for_stream(self, stream_id="", worker_process_id=""):
+        dataprocess_details_list = []
+
+        #get the data product assoc with this stream
+        dataprocess_ids = []
+        dataproduct_id = self._get_dataproduct_from_stream(stream_id)
+        if dataproduct_id:
+            dataprocess_ids.extend(self._get_dataprocess_from_input_product(dataproduct_id))
+        
+        replay_id = self._get_replay_from_stream(stream_id)
+        if replay_id:
+            dataprocess_ids.extend(self._get_data_process_from_replay(replay_id))
+
+
+        #create a dict of information for each data process assoc with this stream is
+        for dataprocess_id in dataprocess_ids:
+
+            #only send the info required by the TW
+            dataprocess_details = DotDict()
+
+            dp_obj = self.read_data_process(dataprocess_id)
+            dataprocess_details.dataprocess_id = dataprocess_id
+            dataprocess_details.in_stream_id = stream_id
+
+            out_stream_id, out_stream_route, out_stream_definition = self.load_out_stream_info(dataprocess_id)
+            dataprocess_details.out_stream_id = out_stream_id
+            dataprocess_details.out_stream_route = out_stream_route
+            dataprocess_details.output_param = dp_obj.output_param
+            dataprocess_details.out_stream_def = out_stream_definition
+
+            dpd_obj, pfunction_obj = self.load_data_process_definition_and_transform(dataprocess_id)
+
+            dataprocess_details.module = pfunction_obj.module
+            dataprocess_details.function = pfunction_obj.function
+            dataprocess_details.arguments = pfunction_obj.arguments
+            dataprocess_details.argument_map=dp_obj.argument_map
+            dataprocess_details.uri=pfunction_obj.uri
+
+            log.debug('read_data_process_for_stream   dataprocess_details:  %s', dataprocess_details)
+            dataprocess_details_list.append( dataprocess_details.as_dict() )
+
+        return dataprocess_details_list
+
     def delete_data_process(self, data_process_id=""):
 
-        #Stops processes and deletes the data process associations
-        #TODO: Delete the processes also?
-        self.deactivate_data_process(data_process_id)
-        processes, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasProcess, id_only=False)
-        for process, assoc in zip(processes,assocs):
-            self._stop_process(data_process=process)
-            self.clients.resource_registry.delete_association(assoc)
+        data_process_obj = self.read_data_process(data_process_id)
+
+        dpd = ''
+        data_process_definitions, _ = self.clients.resource_registry.find_subjects(object=data_process_id, predicate=PRED.hasDataProcess, subject_type=RT.DataProcessDefinition, id_only=False)
+        if data_process_definitions:
+            dpd = data_process_definitions[0]
 
         #Delete all subscriptions associations
         subscription_ids, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasSubscription, id_only=True)
@@ -435,25 +907,33 @@ class DataProcessManagementService(BaseDataProcessManagementService):
             self.clients.resource_registry.delete_association(assoc)
             self.clients.pubsub_management.delete_subscription(subscription_id)
 
-        #Unassign data products
-        data_product_ids, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasOutputProduct, id_only=True)
-        for data_product_id, assoc in zip(data_product_ids, assocs):
-            self.clients.data_acquisition_management.unassign_data_product(input_resource_id=data_process_id, data_product_id=data_product_id)
+        #Remove assocs to the TransformWorker process which hosts this data process
+        process_ids, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasProcess, object_type=RT.Process)
+        for process_id, assoc in zip(process_ids, assocs):
+            self.clients.resource_registry.delete_association(assoc)
+
+        # Remove the streams associated with the data process if it's a retrieve process
+        if dpd and dpd.data_process_type == DataProcessTypeEnum.RETRIEVE_PROCESS:
+            stream_ids, _ = self.clients.find_objects(data_process_id, PRED.hasStream, id_only=True)
+            for stream_id in stream_ids:
+                self.clients.pubsub_management.delete_stream(stream_id)
 
         #Unregister the data process with acquisition
+        #todo update when Data acquisition/Data Producer is ready
         self.clients.data_acquisition_management.unregister_process(data_process_id=data_process_id)
 
         #Delete the data process from the resource registry
-        self.RR2.retire(data_process_id, RT.DataProcess)
+        self.clients.resource_registry.retire(data_process_id)
+
 
     def force_delete_data_process(self, data_process_id=""):
 
         # if not yet deleted, the first execute delete logic
         dp_obj = self.read_data_process(data_process_id)
-        if dp_obj.lcstate != LCS.RETIRED:
+        if dp_obj.lcstate != LCS.DELETED:
             self.delete_data_process(data_process_id)
 
-        self.RR2.pluck_delete(data_process_id, RT.DataProcess)
+        self.RR2.force_delete(data_process_id, RT.DataProcess)
 
     def _stop_process(self, data_process):
         log.debug("stopping data process '%s'" % data_process.process_id)
@@ -472,14 +952,28 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         return data_process_list
 
     def activate_data_process(self, data_process_id=''):
-        #@Todo: Data Process Producer context stuff
-        subscription_ids, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasSubscription, id_only=True)
-        for subscription_id in subscription_ids:
-            if not self.clients.pubsub_management.subscription_is_active(subscription_id):
-                self.clients.pubsub_management.activate_subscription(subscription_id)
-        return True
+
+        #used for DataProcessTypeEnum.RETRIEVE_PROCESS to activate the replay.
+        #for other DataProcess types this is a no-op
+
+         # Start the replays
+         replays, _ = self.clients.resource_registry.find_objects(data_process_id, PRED.hasReplay, id_only=False)
+         # replays only get associated if it's a RETRIEVE_PROCESS, so I don't need to make that check
+         for replay in replays:
+             process_id = replay.process_id
+             replay_client = ReplayClient(process_id)
+             replay_client.start_replay()
+         return True
+
 
     def deactivate_data_process(self, data_process_id=''):
+        # Stop the replays
+        replays, _ = self.clients.resource_registry.find_objects(data_process_id, PRED.hasReplay, id_only=False)
+        # replays only get associated if it's a RETRIEVE_PROCESS, so I don't need to make that check
+        for replay in replays:
+            process_id = replay.process_id
+            replay_client = ReplayClient(process_id)
+            replay_client.stop_replay()
         #@todo: data process producer context stuff
         subscription_ids, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasSubscription, id_only=True)
         for subscription_id in subscription_ids:
@@ -488,20 +982,31 @@ class DataProcessManagementService(BaseDataProcessManagementService):
 
         return True
 
-
-    def attach_process(self, process=''):
-        """
-        @param      process: Should this be the data_process_id?
-        @retval
-        """
-        # TODO: Determine the proper input param
-        pass
-
-
-    def _get_stream_from_dp(self, dp_id):
-        stream_ids, _ = self.clients.resource_registry.find_objects(subject=dp_id, predicate=PRED.hasStream, id_only=True)
+    def _get_stream_from_dataproduct(self, dataproduct_id):
+        stream_ids, _ = self.clients.resource_registry.find_objects(subject=dataproduct_id, predicate=PRED.hasStream, id_only=True)
         if not stream_ids: raise BadRequest('No streams associated with this data product')
         return stream_ids[0]
+
+    def _get_dataproduct_from_stream(self, stream_id):
+        data_product_ids, _ = self.clients.resource_registry.find_subjects(subject_type=RT.DataProduct, predicate=PRED.hasStream, object=stream_id, id_only=True)
+        if not data_product_ids: return None
+        return data_product_ids[0]
+
+
+    def _get_dataprocess_from_input_product(self, data_product_id):
+        data_process_ids, _ = self.clients.resource_registry.find_subjects(subject_type=RT.DataProcess, predicate=PRED.hasInputProduct, object=data_product_id, id_only=True)
+        if not data_process_ids: raise BadRequest('No data processes associated with this input product')
+        log.debug('_get_dataprocess_from_input_product data_process_ids: %s ', data_process_ids)
+        return data_process_ids
+
+    def _get_replay_from_stream(self, stream_id):
+        replays, _ = self.clients.resource_registry.find_subjects(object=stream_id, predicate=PRED.hasStream, subject_type=RT.Replay, id_only=True)
+        if not replays: return None
+        return replays[0]
+
+    def _get_data_process_from_replay(self, replay_id):
+        data_process_ids, _ = self.clients.resource_registry.find_subjects(object=replay_id, predicate=PRED.hasReplay, subject_type=RT.DataProcess, id_only=True)
+        return data_process_ids
 
     def _has_lookup_values(self, data_product_id):
         stream_ids, _ = self.clients.resource_registry.find_objects(subject=data_product_id, predicate=PRED.hasStream, id_only=True)
@@ -512,9 +1017,9 @@ class DataProcessManagementService(BaseDataProcessManagementService):
             raise BadRequest('No stream definitions found for this stream')
         stream_def_id = stream_def_ids[0]
         retval = self.clients.pubsub_management.has_lookup_values(stream_def_id)
-        
+
         return retval
-    
+
     def _get_lookup_docs(self, input_data_product_ids=[], output_data_product_ids=[]):
         retval = []
         need_lookup_docs = False
@@ -533,15 +1038,15 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         retval = {}
         for in_data_product_id,route in routes.iteritems():
             for out_data_product_id, actor in route.iteritems():
-                in_stream_id = self._get_stream_from_dp(in_data_product_id)
-                out_stream_id = self._get_stream_from_dp(out_data_product_id)
+                in_stream_id = self._get_stream_from_dataproduct(in_data_product_id)
+                out_stream_id = self._get_stream_from_dataproduct(out_data_product_id)
                 if actor:
                     actor = self.clients.resource_registry.read(actor)
                     if isinstance(actor,TransformFunction):
                         actor = {'module': actor.module, 'class':actor.cls}
                     else:
                         raise BadRequest('This actor type is not currently supported')
-                        
+
                 if in_stream_id not in retval:
                     retval[in_stream_id] =  {}
                 retval[in_stream_id][out_stream_id] = actor
@@ -559,18 +1064,24 @@ class DataProcessManagementService(BaseDataProcessManagementService):
 
             self.clients.data_acquisition_management.assign_data_product(input_resource_id=data_process_id, data_product_id=data_product_id)
 
-            if not self._get_stream_from_dp(data_product_id):
+            if not self._get_stream_from_dataproduct(data_product_id):
                 raise BadRequest('No Stream was found for this DataProduct')
 
 
     def _manage_attachments(self):
         pass
 
-    def _create_subscription(self, dproc, in_data_product_ids):
-        stream_ids = [self._get_stream_from_dp(i) for i in in_data_product_ids]
-        #@TODO Maybe associate a data process with an exchange point but in the mean time: 
-        queue_name = 'sub_%s' % dproc.name
+    def _create_subscription(self, dproc, in_data_product_ids=None, queue_name=None):
+
+        if not queue_name:
+            queue_name = 'sub_%s' % dproc.name
+
+        stream_ids = [self._get_stream_from_dataproduct(i) for i in in_data_product_ids]
+
+        #@TODO Maybe associate a data process with an exchange point but in the mean time:
+
         subscription_id = self.clients.pubsub_management.create_subscription(name=queue_name, stream_ids=stream_ids)
+        log.debug('_create_subscription subscription_id: %s', subscription_id)
         self.clients.resource_registry.create_association(subject=dproc._id, predicate=PRED.hasSubscription, object=subscription_id)
         return queue_name
 
@@ -599,76 +1110,18 @@ class DataProcessManagementService(BaseDataProcessManagementService):
                 process_definition_id = self.clients.process_dispatcher.create_process_definition(process_definition)
         return process_definition_id
 
-    def _launch_data_process(self, queue_name='', data_process_definition_id='', out_data_product_ids=[], configuration={}):
-        process_definition_id = self._get_process_definition(data_process_definition_id)
-
-        out_streams = {}
-        if data_process_definition_id:
-            dpd = self.read_data_process_definition(data_process_definition_id)
-            for dp_id in out_data_product_ids:
-                stream_id = self._get_stream_from_dp(dp_id)
-                stream_definition = self.clients.pubsub_management.read_stream_definition(stream_id=stream_id)
-                stream_definition_id = stream_definition._id
-
-                # Check the binding to see if it applies here
-
-                for binding,stream_def_id in dpd.output_bindings.iteritems():
-                    if stream_def_id == stream_definition_id:
-                        out_streams[binding] = stream_id
-                        break
-        if not out_streams: # Either there was no process definition or it doesn't have any bindings
-            for dp_id in out_data_product_ids:
-                stream_id = self._get_stream_from_dp(dp_id)
-                out_streams[stream_id] = stream_id
-
-        return self._launch_process(queue_name, out_streams, process_definition_id, configuration)
-
 
     def _validator(self, in_data_product_id, out_data_product_id):
-        in_stream_id = self._get_stream_from_dp(dp_id=in_data_product_id)
+        in_stream_id = self._get_stream_from_dataproduct(dataproduct_id=in_data_product_id)
         in_stream_defs, _ = self.clients.resource_registry.find_objects(subject=in_stream_id, predicate=PRED.hasStreamDefinition, id_only=True)
         if not len(in_stream_defs):
             raise BadRequest('No valid stream definition defined for data product stream')
-        out_stream_id = self._get_stream_from_dp(dp_id=out_data_product_id)
+        out_stream_id = self._get_stream_from_dataproduct(dataproduct_id=out_data_product_id)
         out_stream_defs, _  = self.clients.resource_registry.find_objects(subject=out_stream_id, predicate=PRED.hasStreamDefinition, id_only=True)
         if not len(out_stream_defs):
             raise BadRequest('No valid stream definition defined for data product stream')
         return self.clients.pubsub_management.compatible_stream_definitions(in_stream_definition_id=in_stream_defs[0], out_stream_definition_id=out_stream_defs[0])
-    
-    def validate_compatibility(self, data_process_definition_id='', in_data_product_ids=None, out_data_product_ids=None, routes=None):
-        '''
-        Validates compatibility between input and output data products
-        routes are in this form:
-        { (in_data_product_id, out_data_product_id) : actor }
-            if actor is None then the data process is assumed to use parameter functions.
-            if actor is a TransformFunction, the validation is done at runtime
-        '''
-        if data_process_definition_id:
-            input_stream_def_ids, _ = self.clients.resource_registry.find_objects(subject=data_process_definition_id, predicate=PRED.hasInputStreamDefinition, id_only=True)
-            output_stream_def_ids, _ = self.clients.resource_registry.find_objects(subject=data_process_definition_id, predicate=PRED.hasStreamDefinition, id_only=True)
-            for in_data_product_id in in_data_product_ids:
-                input_stream_def = self.stream_def_from_data_product(in_data_product_id)
-                if input_stream_def not in input_stream_def_ids:
-                    log.warning('Creating a data process with an unmatched stream definition input')
-            for out_data_product_id in out_data_product_ids:
-                output_stream_def = self.stream_def_from_data_product(out_data_product_id)
-                if output_stream_def not in output_stream_def_ids:
-                    log.warning('Creating a data process with an unmatched stream definition output')
-        
-        if not out_data_product_ids and data_process_definition_id:
-            return True
-        if len(out_data_product_ids)>1 and not routes and not data_process_definition_id:
-            raise BadRequest('Multiple output data products but no routes defined')
-        if len(out_data_product_ids)==1:
-            return all( [self._validator(i, out_data_product_ids[0]) for i in in_data_product_ids] )
-        elif len(out_data_product_ids)>1:
-            for in_dp_id,out in routes.iteritems():
-                for out_dp_id, actor in out.iteritems():
-                    if not self._validator(in_dp_id, out_dp_id):
-                        return False
-            return True
-        else:
-            raise BadRequest('No input data products specified')
+
 
 
     def stream_def_from_data_product(self, data_product_id=''):
@@ -681,11 +1134,53 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         return stream_def_id
 
 
-    def _get_process_producer(self, data_process_id=""):
-        producer_objs, _ = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasDataProducer, object_type=RT.DataProducer, id_only=False)
-        if not producer_objs:
-            raise NotFound("No Producers created for this Data Process " + str(data_process_id))
-        return producer_objs[0]
+    def load_out_stream_info(self, data_process_id=None):
+
+        #get the input stream id
+        out_stream_id = ''
+        out_stream_route = ''
+        out_stream_definition = ''
+
+        out_dataprods_objs, _ = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasOutputProduct, object_type=RT.DataProduct, id_only=False)
+        if len(out_dataprods_objs) != 1:
+            log.exception('The data process is not correctly associated with a ParameterFunction resource.')
+        else:
+            out_stream_definition = self.stream_def_from_data_product(out_dataprods_objs[0]._id)
+            stream_ids, assoc_ids = self.clients.resource_registry.find_objects(out_dataprods_objs[0], PRED.hasStream, RT.Stream, True)
+            out_stream_id = stream_ids[0]
+
+            self.pubsub_client = PubsubManagementServiceClient()
+
+            out_stream_route = self.pubsub_client.read_stream_route(out_stream_id)
+
+        return out_stream_id, out_stream_route, out_stream_definition
+
+
+    def load_data_process_definition_and_transform(self, data_process_id=None):
+
+        data_process_def_obj = None
+        transform_function_obj = None
+
+        dpd_objs, _ = self.clients.resource_registry.find_subjects(subject_type=RT.DataProcessDefinition, predicate=PRED.hasDataProcess, object=data_process_id, id_only=False)
+
+        if len(dpd_objs) != 1:
+            log.exception('The data process not correctly associated with a Data Process Definition resource.')
+        else:
+            data_process_def_obj = dpd_objs[0]
+
+        if data_process_def_obj.data_process_type in (DataProcessTypeEnum.TRANSFORM_PROCESS, DataProcessTypeEnum.RETRIEVE_PROCESS):
+
+            tfunc_objs, _ = self.clients.resource_registry.find_objects(subject=data_process_def_obj, predicate=PRED.hasTransformFunction, id_only=False)
+
+            if len(tfunc_objs) != 1:
+                log.exception('The data process definition for a data process is not correctly associated with a TransformFunction resource.')
+            else:
+                transform_function_obj = tfunc_objs[0]
+
+
+        return data_process_def_obj, transform_function_obj
+
+
 
 
     ############################

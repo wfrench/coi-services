@@ -11,12 +11,9 @@ __author__ = 'Carlos Rueda'
 __license__ = 'Apache 2.0'
 
 from ion.agents.platform.rsn.oms_client import CIOMSClient
-from ion.agents.platform.rsn.oms_client import REQUIRED_INSTRUMENT_ATTRIBUTES
 from ion.agents.platform.responses import NormalResponse, InvalidResponse
-from ion.agents.platform.util.network import InstrumentNode
 from ion.agents.platform.util.network_util import NetworkUtil
 
-from ion.agents.platform.rsn.simulator.oms_events import EventInfo
 from ion.agents.platform.rsn.simulator.oms_events import EventNotifier
 from ion.agents.platform.rsn.simulator.oms_events import EventGenerator
 from ion.agents.platform.rsn.simulator.oms_values import generate_values
@@ -26,11 +23,6 @@ import ntplib
 
 from ion.agents.platform.rsn.simulator.logger import Logger
 log = Logger.get_logger()
-
-###########################################################################
-# NOTE: several operations related with "event types" were removed/adjusted
-# from the CI-OMS interface per April/2013 telecons.
-###########################################################################
 
 
 class CIOMSSimulator(CIOMSClient):
@@ -59,10 +51,13 @@ class CIOMSSimulator(CIOMSClient):
         """
         cls._raise_exception = False
 
-    def __init__(self, yaml_filename='ion/agents/platform/rsn/simulator/network.yml'):
+    def __init__(self, yaml_filename='ion/agents/platform/rsn/simulator/network.yml',
+                 events_filename='ion/agents/platform/rsn/simulator/events.yml'):
         self._ndef = NetworkUtil.deserialize_network_definition(file(yaml_filename))
-        self._platform_types = self._ndef.platform_types
         self._pnodes = self._ndef.pnodes
+
+        # note that all ports are implicitly init'ed with state='OFF'
+        self._portState = {}
 
         # registered event listeners: {url: reg_time, ...},
         # where reg_time is the NTP time of (latest) registration.
@@ -72,10 +67,11 @@ class CIOMSSimulator(CIOMSClient):
         self._event_notifier = EventNotifier()
         # EventGenerator only kept while there are listeners registered
         self._event_generator = None
+        self._events_filename = events_filename
 
     def _start_event_generator_if_listeners(self):
         if not self._event_generator and len(self._reg_event_listeners):
-            self._event_generator = EventGenerator(self._event_notifier)
+            self._event_generator = EventGenerator(self._event_notifier, self._events_filename)
             self._event_generator.start()
             log.debug("event generator started (%s listeners registered)",
                       len(self._reg_event_listeners))
@@ -118,16 +114,6 @@ class CIOMSSimulator(CIOMSClient):
 
         return "pong"
 
-    def get_platform_map(self):
-        self._enter()
-
-        return self._ndef.get_map()
-
-    def get_platform_types(self):
-        self._enter()
-
-        return self._platform_types
-
     def get_platform_metadata(self, platform_id):
         self._enter()
 
@@ -142,23 +128,8 @@ class CIOMSSimulator(CIOMSClient):
             md['name'] = pnode.name
         if pnode.parent:
             md['parent_platform_id'] = pnode.parent.platform_id
-        md['platform_types'] = pnode.platform_types
 
         return {platform_id: md}
-
-    def get_platform_attributes(self, platform_id):
-        self._enter()
-
-        if platform_id not in self._pnodes:
-            return {platform_id: InvalidResponse.PLATFORM_ID}
-
-        attrs = self._pnodes[platform_id].attrs
-        ret_infos = {}
-        for attrName in attrs:
-            attr = attrs[attrName]
-            ret_infos[attrName] = attr.defn
-
-        return {platform_id: ret_infos}
 
     def get_platform_attribute_values(self, platform_id, req_attrs):
         self._enter()
@@ -181,33 +152,13 @@ class CIOMSSimulator(CIOMSClient):
 
         return {platform_id: vals}
 
-    def set_platform_attribute_values(self, platform_id, input_attrs):
-        self._enter()
+    def _set_port_state(self, platform_id, port_id, state):
+        pp_id = '%s %s' % (platform_id, port_id)
+        self._portState[pp_id] = state
 
-        if platform_id not in self._pnodes:
-            return {platform_id: InvalidResponse.PLATFORM_ID}
-
-        assert isinstance(input_attrs, list)
-
-        timestamp = ntplib.system_to_ntp_time(time.time())
-        attrs = self._pnodes[platform_id].attrs
-        vals = {}
-        for (attrName, attrValue) in input_attrs:
-            if attrName in attrs:
-                attr = attrs[attrName]
-                if attr.writable:
-                    #
-                    # TODO check given attrValue
-                    #
-                    vals[attrName] = (attrValue, timestamp)
-                else:
-                    vals[attrName] = InvalidResponse.ATTRIBUTE_NOT_WRITABLE
-            else:
-                vals[attrName] = InvalidResponse.ATTRIBUTE_ID
-
-        retval = {platform_id: vals}
-        log.debug("set_platform_attribute_values returning: %s", str(retval))
-        return retval
+    def _get_port_state(self, platform_id, port_id):
+        pp_id = '%s %s' % (platform_id, port_id)
+        return self._portState.get(pp_id, 'OFF')
 
     def get_platform_ports(self, platform_id):
         self._enter()
@@ -216,13 +167,13 @@ class CIOMSSimulator(CIOMSClient):
             return {platform_id: InvalidResponse.PLATFORM_ID}
 
         ports = {}
-        for port_id, port in self._pnodes[platform_id].ports.iteritems():
-            ports[port_id] = {'network': port.network,
-                              'state'  : port.state}
+        for port_id in self._pnodes[platform_id].ports:
+            state = self._get_port_state(platform_id, port_id)
+            ports[port_id] = {'state': state}
 
         return {platform_id: ports}
 
-    def connect_instrument(self, platform_id, port_id, instrument_id, attributes):
+    def turn_on_platform_port(self, platform_id, port_id, src):
         self._enter()
 
         if platform_id not in self._pnodes:
@@ -231,103 +182,18 @@ class CIOMSSimulator(CIOMSClient):
         if port_id not in self._pnodes[platform_id].ports :
             return {platform_id: {port_id: InvalidResponse.PORT_ID}}
 
-        port = self._pnodes[platform_id].get_port(port_id)
-
-        result = None
-        if instrument_id in port.instruments:
-            result = InvalidResponse.INSTRUMENT_ALREADY_CONNECTED
-        elif port.state == "ON":
-            # TODO: confirm that port must be OFF so instrument can be connected
-            result = InvalidResponse.PORT_IS_ON
-
-        if result is None:
-            # verify required attributes are provided:
-            for key in REQUIRED_INSTRUMENT_ATTRIBUTES:
-                if not key in attributes:
-                    result = InvalidResponse.MISSING_INSTRUMENT_ATTRIBUTE
-                    log.warn("connect_instrument called with missing attribute: %s"% key)
-                    break
-
-        if result is None:
-            # verify given attributes are recognized:
-            for key in attributes.iterkeys():
-                if not key in REQUIRED_INSTRUMENT_ATTRIBUTES:
-                    result = InvalidResponse.INVALID_INSTRUMENT_ATTRIBUTE
-                    log.warn("connect_instrument called with invalid attribute: %s"% key)
-                    break
-
-        if result is None:
-            # NOTE: values simply accepted without any validation
-            connected_instrument = InstrumentNode(instrument_id)
-            port.add_instrument(connected_instrument)
-            attrs = connected_instrument.attrs
-            result = {}
-            for key, val in attributes.iteritems():
-                attrs[key] = val  # set the value of the attribute:
-                result[key] = val # in the result, indicate that the value was set
-
-        return {platform_id: {port_id: {instrument_id: result}}}
-
-    def disconnect_instrument(self, platform_id, port_id, instrument_id):
-        self._enter()
-
-        if platform_id not in self._pnodes:
-            return {platform_id: InvalidResponse.PLATFORM_ID}
-
-        if port_id not in self._pnodes[platform_id].ports :
-            return {platform_id: {port_id: InvalidResponse.PORT_ID}}
-
-        port = self._pnodes[platform_id].get_port(port_id)
-
-        if instrument_id not in port.instruments:
-            result = InvalidResponse.INSTRUMENT_NOT_CONNECTED
-        elif port.state == "ON":
-            # TODO: confirm that port must be OFF so instrument can be disconnected
-            result = InvalidResponse.PORT_IS_ON
-        else:
-            port.remove_instrument(instrument_id)
-            result = NormalResponse.INSTRUMENT_DISCONNECTED
-
-        return {platform_id: {port_id: {instrument_id: result}}}
-
-    def get_connected_instruments(self, platform_id, port_id):
-        self._enter()
-
-        if platform_id not in self._pnodes:
-            return {platform_id: InvalidResponse.PLATFORM_ID}
-
-        if port_id not in self._pnodes[platform_id].ports :
-            return {platform_id: {port_id: InvalidResponse.PORT_ID}}
-
-        port = self._pnodes[platform_id].get_port(port_id)
-
-        result = {}
-        for instrument_id in port.instruments:
-            result[instrument_id] = port.instruments[instrument_id].attrs
-
-        return {platform_id: {port_id: result}}
-
-    def turn_on_platform_port(self, platform_id, port_id):
-        self._enter()
-
-        if platform_id not in self._pnodes:
-            return {platform_id: InvalidResponse.PLATFORM_ID}
-
-        if port_id not in self._pnodes[platform_id].ports :
-            return {platform_id: {port_id: InvalidResponse.PORT_ID}}
-
-        port = self._pnodes[platform_id].get_port(port_id)
-        if port.state == "ON":
+        state = self._get_port_state(platform_id, port_id)
+        if state == "ON":
             result = NormalResponse.PORT_ALREADY_ON
-            log.warn("port %s in platform %s already turned on." % (port_id, platform_id))
+            log.debug("port %s in platform %s already turned on." % (port_id, platform_id))
         else:
-            port.set_state("ON")
+            self._set_port_state(platform_id, port_id, 'ON')
             result = NormalResponse.PORT_TURNED_ON
             log.info("port %s in platform %s turned on." % (port_id, platform_id))
 
         return {platform_id: {port_id: result}}
 
-    def turn_off_platform_port(self, platform_id, port_id):
+    def turn_off_platform_port(self, platform_id, port_id, src):
         self._enter()
 
         if platform_id not in self._pnodes:
@@ -336,14 +202,28 @@ class CIOMSSimulator(CIOMSClient):
         if port_id not in self._pnodes[platform_id].ports :
             return {platform_id: {port_id: InvalidResponse.PORT_ID}}
 
-        port = self._pnodes[platform_id].get_port(port_id)
-        if port.state == "OFF":
+        state = self._get_port_state(platform_id, port_id)
+        if state == "OFF":
             result = NormalResponse.PORT_ALREADY_OFF
-            log.warn("port %s in platform %s already turned off." % (port_id, platform_id))
+            log.debug("port %s in platform %s already turned off." % (port_id, platform_id))
         else:
-            port.set_state("OFF")
+            self._set_port_state(platform_id, port_id, 'OFF')
             result = NormalResponse.PORT_TURNED_OFF
             log.info("port %s in platform %s turned off." % (port_id, platform_id))
+
+        return {platform_id: {port_id: result}}
+
+    def set_over_current(self, platform_id, port_id, ma, us, src):
+        self._enter()
+
+        if platform_id not in self._pnodes:
+            return {platform_id: InvalidResponse.PLATFORM_ID}
+
+        if port_id not in self._pnodes[platform_id].ports :
+            return {platform_id: {port_id: InvalidResponse.PORT_ID}}
+
+        # OK, but we don't do anything else here, just accept.
+        result = NormalResponse.PORT_SET_OVER_CURRENT
 
         return {platform_id: {port_id: result}}
 
@@ -428,20 +308,3 @@ class CIOMSSimulator(CIOMSClient):
 
         else:  # there are *no* listeners registered.
             return False
-
-    def get_checksum(self, platform_id):
-        """
-        @note the checksum is always computed, which is fine for the simulator.
-        A more realistic and presumably more efficient implementation would
-        exploit some caching mechanism along with appropriate invalidation
-        upon modifications to the platform information.
-        """
-        self._enter()
-
-        if platform_id not in self._pnodes:
-            return {platform_id: InvalidResponse.PLATFORM_ID}
-
-        pnode = self._pnodes[platform_id]
-        checksum = pnode.compute_checksum()
-
-        return {platform_id: checksum}

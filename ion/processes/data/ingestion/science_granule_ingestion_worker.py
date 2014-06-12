@@ -92,7 +92,10 @@ class ScienceGranuleIngestionWorker(TransformStreamListener, BaseIngestionWorker
         self.lookup_docs = self.CFG.get_safe('process.lookup_docs',[])
         self.input_product = self.CFG.get_safe('process.input_product','')
         self.qc_enabled = self.CFG.get_safe('process.qc_enabled', True)
-        self.ignore_gaps = self.CFG.get_safe('service.ingestion.ignore_gaps', False)
+        self.ignore_gaps = self.CFG.get_safe('service.ingestion.ignore_gaps', True)
+        if not self.ignore_gaps:
+            log.warning("Gap handling is not supported in release 2")
+        self.ignore_gaps = True
         self.new_lookups = Queue()
         self.lookup_monitor = EventSubscriber(event_type=OT.ExternalReferencesUpdatedEvent, callback=self._add_lookups, auto_delete=True)
         self.add_endpoint(self.lookup_monitor)
@@ -154,11 +157,17 @@ class ScienceGranuleIngestionWorker(TransformStreamListener, BaseIngestionWorker
         '''
         Adds a new dataset to the internal cache of the ingestion worker
         '''
-        rr_client = ResourceRegistryServiceClient()
+        rr_client = self.container.resource_registry
         datasets, _ = rr_client.find_subjects(subject_type=RT.Dataset,predicate=PRED.hasStream,object=stream_id,id_only=True)
         if datasets:
             return datasets[0]
         return None
+
+    def _get_data_products(self, dataset_id):
+        rr_client = self.container.resource_registry
+        data_products, _ = rr_client.find_subjects(object=dataset_id, predicate=PRED.hasDataset, subject_type=RT.DataProduct, id_only=False)
+        return data_products
+
 
     def initialize_metadata(self, dataset_id, rdt):
         '''
@@ -191,6 +200,9 @@ class ScienceGranuleIngestionWorker(TransformStreamListener, BaseIngestionWorker
         '''
         Updates the metada document with the latest information available
         '''
+
+        self.update_data_product_metadata(dataset_id, rdt)
+
         # Grab the document
         object_store = self.container.object_store
         key = dataset_id
@@ -220,9 +232,93 @@ class ScienceGranuleIngestionWorker(TransformStreamListener, BaseIngestionWorker
             # How about the last value?
 
             rough_size += len(rdt) * 4
+            doc['size'] = rough_size
         # Sanitize it
         doc = numpy_walk(doc)
         object_store.update_doc(doc)
+
+    def update_data_product_metadata(self, dataset_id, rdt):
+        data_products = self._get_data_products(dataset_id)
+        for data_product in data_products:
+            self.update_time(data_product, rdt[rdt.temporal_parameter][:])
+            self.update_geo(data_product, rdt)
+            try:
+                self.container.resource_registry.update(data_product)
+            except: # TODO: figure out WHICH Exception gets raised here when the bounds are off
+                log.error("Problem updating the data product metadata", exc_info=True)
+                # Carry on :(
+
+
+
+    def update_time(self, data_product, t):
+        t0, t1 = self.get_datetime_bounds(data_product)
+        #TODO: Account for non NTP-based timestamps
+        min_t = np.min(t) - 2208988800
+        max_t = np.max(t) - 2208988800
+        if t0:
+            t0 = min(t0, min_t)
+        else:
+            t0 = min_t
+
+        if t1:
+            t1 = max(t1, max_t)
+        else:
+            t1 = max_t
+
+        if t0 > t1:
+            log.error("This should never happen but t0 > t1")
+
+        data_product.nominal_datetime.start_datetime = t0
+        data_product.nominal_datetime.end_datetime = t1
+
+    def get_datetime(self, nominal_datetime):
+        '''
+        Returns a floating point value for the datetime or None if it's an
+        empty string
+        '''
+        t = None
+        # So normally this is a string
+        if isinstance(nominal_datetime, (float, int)):
+            t = nominal_datetime # simple enough
+        elif isinstance(nominal_datetime, basestring):
+            if nominal_datetime: # not an empty string
+                # Try to convert it to a float
+                try:
+                    t = float(nominal_datetime)
+                except ValueError:
+                    pass
+        return t
+
+    def get_datetime_bounds(self, data_product):
+        '''Returns the min and max for the bounds in the nominal_datetime
+        attr
+        '''
+        
+        t0 = self.get_datetime(data_product.nominal_datetime.start_datetime)
+        t1 = self.get_datetime(data_product.nominal_datetime.end_datetime)
+        return (t0, t1)
+
+
+    def update_geo(self, data_product, rdt):
+        lat = None
+        lon = None
+        for p in rdt:
+            if rdt._rd[p] is None:
+                continue
+            # TODO: Not an all encompassing list of acceptable names for lat and lon
+            if p.lower() in ('lat', 'latitude', 'y_axis'):
+                lat = np.asscalar(rdt[p][-1])
+            elif p.lower() in ('lon', 'longitude', 'x_axis'):
+                lon = np.asscalar(rdt[p][-1])
+            if lat and lon:
+                break
+
+        if lat and lon:
+            data_product.geospatial_bounds.geospatial_latitude_limit_north = lat
+            data_product.geospatial_bounds.geospatial_latitude_limit_south = lat
+            data_product.geospatial_bounds.geospatial_longitude_limit_east = lon
+            data_product.geospatial_bounds.geospatial_longitude_limit_west = lon
+
 
     
     def get_dataset(self,stream_id):
@@ -418,7 +514,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener, BaseIngestionWorker
 
         self.fill_lookup_values(rdt)
         for field in rdt.fields:
-            if rdt[field] is None:
+            if rdt._rd[field] is None:
                 continue
             if not isinstance(rdt.context(field).param_type, SparseConstantType):
                 # We only set sparse values before insert

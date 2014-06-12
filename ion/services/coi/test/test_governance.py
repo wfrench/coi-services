@@ -1585,7 +1585,7 @@ class TestGovernanceInt(IonIntegrationTestCase):
 
         resource_commitment, _ = self.rr_client.find_objects(actor_id,PRED.hasCommitment, RT.Commitment)
         self.assertEqual(len(resource_commitment),1)
-        self.assertNotEqual(resource_commitment[0].lcstate, LCS.RETIRED)
+        self.assertNotEqual(resource_commitment[0].lcstate, LCS.DELETED)
 
 
         subjects, _ = self.rr_client.find_subjects(None,PRED.hasCommitment, commitments[0]._id)
@@ -1632,20 +1632,20 @@ class TestGovernanceInt(IonIntegrationTestCase):
 
 
         #Check exclusive commitment to be inactive
-        commitments, _ = self.rr_client.find_resources(restype=RT.Commitment, lcstate=LCS.RETIRED)
+        commitments, _ = self.rr_client.find_resources(restype=RT.Commitment, lcstate=LCS.DELETED)
         self.assertEqual(len(commitments),1)
         self.assertEqual(commitments[0].commitment.exclusive, True)
 
         #Shared commitment is still actove
         commitments, _ = self.rr_client.find_objects(ia_list[0],PRED.hasCommitment, RT.Commitment)
         self.assertEqual(len(commitments),1)
-        self.assertNotEqual(commitments[0].lcstate, LCS.RETIRED)
+        self.assertNotEqual(commitments[0].lcstate, LCS.DELETED)
 
         #Now release the shared commitment
         self.org_client.release_commitment(resource_commitment[0]._id, headers=actor_header)
 
         #Check for both commitments to be inactive
-        commitments, _ = self.rr_client.find_resources(restype=RT.Commitment, lcstate=LCS.RETIRED)
+        commitments, _ = self.rr_client.find_resources(restype=RT.Commitment, lcstate=LCS.DELETED)
         self.assertEqual(len(commitments),2)
 
         commitments, _ = self.rr_client.find_objects(ia_list[0],PRED.hasCommitment, RT.Commitment)
@@ -1858,17 +1858,16 @@ class TestGovernanceInt(IonIntegrationTestCase):
         #Check the availability of the get_instrument_device_extension operation for various user types - some of the
         #agent related status should not be allowed for users without the proper role
 
-        #Anonymous get extended is allowed, but internal agent status should be unavailable
+        #Anonymous get extended is allowed, the internal agent status should be available.
         extended_inst = self.ims_client.get_instrument_device_extension(inst_obj_id, headers=self.anonymous_actor_headers)
         self.assertEqual(extended_inst._id, inst_obj_id)
-        self.assertEqual(extended_inst.computed.communications_status_roll_up.status, ComputedValueAvailability.NOTAVAILABLE)
-        self.assertIn('InstrumentDevice(get_agent) has been denied',extended_inst.computed.communications_status_roll_up.reason)
-
-        #Org member get extended is allowed, but internal agent status should be unavailable
+        self.assertEqual(extended_inst.computed.communications_status_roll_up.status, ComputedValueAvailability.PROVIDED)
+        self.assertEqual('', extended_inst.computed.communications_status_roll_up.reason)
+        #Org member get extended is allowed, but internal agent status should be available
         extended_inst = self.ims_client.get_instrument_device_extension(inst_obj_id, headers=actor_header)
         self.assertEqual(extended_inst._id, inst_obj_id)
-        self.assertEqual(extended_inst.computed.communications_status_roll_up.status, ComputedValueAvailability.NOTAVAILABLE)
-        self.assertIn('InstrumentDevice(get_agent) has been denied',extended_inst.computed.communications_status_roll_up.reason)
+        self.assertEqual(extended_inst.computed.communications_status_roll_up.status, ComputedValueAvailability.PROVIDED)
+        self.assertEqual('', extended_inst.computed.communications_status_roll_up.reason)
 
 
         #Grant the role of Instrument Operator to the user
@@ -1890,7 +1889,7 @@ class TestGovernanceInt(IonIntegrationTestCase):
         extended_inst = self.ims_client.get_instrument_device_extension(inst_obj_id, headers=actor_header)
         self.assertEqual(extended_inst._id, inst_obj_id)
         self.assertEqual(extended_inst.computed.communications_status_roll_up.status, ComputedValueAvailability.PROVIDED)
-        self.assertEqual(extended_inst.computed.communications_status_roll_up.reason, None)
+        self.assertEqual(extended_inst.computed.communications_status_roll_up.reason, '')
 
         #This agent operation should now be allowed for a user that is an Instrument Operator
         retval = ia_client.get_agent_state(headers=actor_header)
@@ -1962,7 +1961,7 @@ class TestGovernanceInt(IonIntegrationTestCase):
 
         resource_commitment, _ = self.rr_client.find_objects(actor_id,PRED.hasCommitment, RT.Commitment)
         self.assertEqual(len(resource_commitment),1)
-        self.assertNotEqual(resource_commitment[0].lcstate, LCS.RETIRED)
+        self.assertNotEqual(resource_commitment[0].lcstate, LCS.DELETED)
 
         #Request for the instrument to be put into Direct Access mode - should be denied for anonymous users
         with self.assertRaises(Unauthorized) as cm:
@@ -2039,20 +2038,20 @@ class TestGovernanceInt(IonIntegrationTestCase):
         self.assertIn('InstrumentDevice(execute_agent) has been denied',cm.exception.message)
 
         #Check exclusive commitment to be inactive
-        commitments, _ = self.rr_client.find_resources(restype=RT.Commitment, lcstate=LCS.RETIRED)
+        commitments, _ = self.rr_client.find_resources(restype=RT.Commitment, lcstate=LCS.DELETED)
         self.assertEqual(len(commitments),1)
         self.assertEqual(commitments[0].commitment.exclusive, True)
 
         #Shared commitment is still active
         commitments, _ = self.rr_client.find_objects(inst_obj_id,PRED.hasCommitment, RT.Commitment)
         self.assertEqual(len(commitments),1)
-        self.assertNotEqual(commitments[0].lcstate, LCS.RETIRED)
+        self.assertNotEqual(commitments[0].lcstate, LCS.DELETED)
 
         #Now release the shared commitment
         self.org_client.release_commitment(resource_commitment[0]._id, headers=actor_header)
 
         #Check for both commitments to be inactive
-        commitments, _ = self.rr_client.find_resources(restype=RT.Commitment, lcstate=LCS.RETIRED)
+        commitments, _ = self.rr_client.find_resources(restype=RT.Commitment, lcstate=LCS.DELETED)
         self.assertEqual(len(commitments),2)
 
         commitments, _ = self.rr_client.find_objects(inst_obj_id,PRED.hasCommitment, RT.Commitment)
@@ -2088,7 +2087,7 @@ class TestGovernanceInt(IonIntegrationTestCase):
         extended_inst = self.ims_client.get_instrument_device_extension(inst_obj_id, headers=actor_header)
         self.assertEqual(extended_inst._id, inst_obj_id)
         self.assertEqual(extended_inst.computed.communications_status_roll_up.status, ComputedValueAvailability.PROVIDED)
-        self.assertEqual(extended_inst.computed.communications_status_roll_up.reason, None)
+        self.assertEqual(extended_inst.computed.communications_status_roll_up.reason, '')
 
         #Now reset the agent for checking operation based policy
         #The reset command should now be allowed for the Org Manager
@@ -2504,17 +2503,20 @@ class TestGovernanceInt(IonIntegrationTestCase):
 
         with self.assertRaises(BadRequest) as cm:
             self.ims_client.execute_instrument_device_lifecycle(inst_dev_id, LCE.ANNOUNCE, headers=obs_operator_actor_header)
-        self.assertIn( 'PLANNED_AVAILABLE has no transition for event',cm.exception.message)
+        self.assertIn('has no transition for event announce', cm.exception.message)
 
         with self.assertRaises(BadRequest) as cm:
             self.ims_client.execute_instrument_device_lifecycle(inst_dev_id, LCE.ENABLE, headers=obs_operator_actor_header)
-        self.assertIn( 'PLANNED_AVAILABLE has no transition for event',cm.exception.message)
+        self.assertIn('has no transition for event enable', cm.exception.message)
 
         #Should be able to retire a device anytime
         self.ims_client.execute_instrument_device_lifecycle(inst_dev_id, LCE.RETIRE, headers=obs_operator_actor_header)
         inst_dev_obj = self.ims_client.read_instrument_device(inst_dev_id)
         self.assertEquals(inst_dev_obj.lcstate, LCS.RETIRED)
 
+        self.ims_client.execute_instrument_device_lifecycle(inst_dev_id, LCE.DELETE, headers=obs_operator_actor_header)
+        inst_dev_obj = self.ims_client.read_instrument_device(inst_dev_id)
+        self.assertEquals(inst_dev_obj.lcstate, LCS.DELETED)
 
         self.ims_client.force_delete_instrument_device(inst_dev_id, headers=self.system_actor_header)
 

@@ -9,10 +9,11 @@ from pyon.datastore.datastore import DataStore
 from pyon.event.event import EventSubscriber
 from pyon.ion.exchange import ExchangeNameQueue
 from pyon.ion.stream import StandaloneStreamSubscriber, StandaloneStreamPublisher
-from pyon.public import RT, log, OT, PRED
+from pyon.public import RT, log, OT, PRED, CFG
 from pyon.util.containers import DotDict
 from pyon.util.poller import poll
 from pyon.util.int_test import IonIntegrationTestCase
+from pyon.container.cc import Container
 
 from ion.processes.data.replay.replay_client import ReplayClient
 from ion.services.dm.ingestion.test.ingestion_management_test import IngestionManagementIntTest
@@ -32,7 +33,7 @@ from interface.services.dm.idata_retriever_service import DataRetrieverServiceCl
 from interface.services.dm.idataset_management_service import DatasetManagementServiceClient
 from interface.services.dm.iingestion_management_service import IngestionManagementServiceClient
 from interface.services.dm.ipubsub_management_service import PubsubManagementServiceClient
-from interface.objects import Granule
+from interface.objects import Granule, Dataset
 
 from gevent.event import Event
 from nose.plugins.attrib import attr
@@ -72,13 +73,11 @@ class TestDMEnd2End(IonIntegrationTestCase):
         '''
         Creates a time-series dataset
         '''
-        tdom, sdom = time_series_domain()
-        sdom = sdom.dump()
-        tdom = tdom.dump()
         if not parameter_dict_id:
             parameter_dict_id = self.dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
 
-        dataset_id = self.dataset_management.create_dataset('test_dataset_%i'%self.i, parameter_dictionary_id=parameter_dict_id, spatial_domain=sdom, temporal_domain=tdom)
+        dataset = Dataset('test_dataset_%i'%self.i)
+        dataset_id = self.dataset_management.create_dataset(dataset, parameter_dictionary_id=parameter_dict_id)
         self.addCleanup(self.dataset_management.delete_dataset, dataset_id)
         return dataset_id
     
@@ -189,7 +188,6 @@ class TestDMEnd2End(IonIntegrationTestCase):
     # Test Methods
     #--------------------------------------------------------------------------------
 
-    @attr('SMOKE') 
     def test_dm_end_2_end(self):
         #--------------------------------------------------------------------------------
         # Set up a stream and have a mock instrument (producer) send data
@@ -309,7 +307,7 @@ class TestDMEnd2End(IonIntegrationTestCase):
         self.addCleanup(dataset_monitor.stop)
 
         publisher.publish(rdt.to_granule())
-        self.assertTrue(dataset_monitor.event.wait(30))
+        self.assertTrue(dataset_monitor.wait())
 
         replay_granule = self.data_retriever.retrieve(dataset_id)
         rdt_out = RecordDictionaryTool.load_from_granule(replay_granule)
@@ -354,7 +352,7 @@ class TestDMEnd2End(IonIntegrationTestCase):
         self.addCleanup(dataset_monitor.stop)
 
         publisher.publish(granule)
-        self.assertTrue(dataset_monitor.event.wait(30))
+        self.assertTrue(dataset_monitor.wait())
         
         replay_granule = self.data_retriever.retrieve(dataset_id)
         rdt_out = RecordDictionaryTool.load_from_granule(replay_granule)
@@ -376,7 +374,7 @@ class TestDMEnd2End(IonIntegrationTestCase):
         gevent.sleep(2)
 
         publisher.publish(granule)
-        self.assertTrue(dataset_monitor.event.wait(30))
+        self.assertTrue(dataset_monitor.wait())
 
         replay_granule = self.data_retriever.retrieve(dataset_id)
         rdt_out = RecordDictionaryTool.load_from_granule(replay_granule)
@@ -400,7 +398,7 @@ class TestDMEnd2End(IonIntegrationTestCase):
         monitor = DatasetMonitor(dataset_id)
         self.addCleanup(monitor.stop)
         publisher.publish(rdt.to_granule())
-        self.assertTrue(monitor.event.wait(10))
+        self.assertTrue(monitor.wait())
         granule = self.data_retriever.retrieve(dataset_id)
 
 
@@ -413,48 +411,11 @@ class TestDMEnd2End(IonIntegrationTestCase):
 
         self.ingestion_management.resume_data_stream(ctd_stream_id, ingestion_config_id)
 
-        self.assertTrue(monitor.event.wait(10))
+        self.assertTrue(monitor.wait())
 
         granule = self.data_retriever.retrieve(dataset_id)
         rdt2 = RecordDictionaryTool.load_from_granule(granule)
         np.testing.assert_array_almost_equal(rdt2['time'], np.arange(20))
-
-    def test_retrieve_and_transform(self):
-        # Make a simple dataset and start ingestion, pretty standard stuff.
-        ctd_stream_id, route, stream_def_id, dataset_id = self.make_simple_dataset()
-        self.start_ingestion(ctd_stream_id, dataset_id)
-        self.addCleanup(self.stop_ingestion, ctd_stream_id)
-
-        # Stream definition for the salinity data
-        salinity_pdict_id = self.dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
-        sal_stream_def_id = self.pubsub_management.create_stream_definition('sal data', parameter_dictionary_id=salinity_pdict_id)
-
-
-        rdt = RecordDictionaryTool(stream_definition_id=stream_def_id)
-        rdt['time'] = np.arange(10)
-        rdt['temp'] = np.random.randn(10) * 10 + 30
-        rdt['conductivity'] = np.random.randn(10) * 2 + 10
-        rdt['pressure'] = np.random.randn(10) * 1 + 12
-
-        publisher = StandaloneStreamPublisher(ctd_stream_id, route)
-        publisher.publish(rdt.to_granule())
-
-        rdt['time'] = np.arange(10,20)
-
-        publisher.publish(rdt.to_granule())
-
-
-        self.wait_until_we_have_enough_granules(dataset_id, 20)
-
-        granule = self.data_retriever.retrieve(dataset_id, 
-                                             None,
-                                             None, 
-                                             'ion.processes.data.transforms.ctd.ctd_L2_salinity',
-                                             'CTDL2SalinityTransformAlgorithm', 
-                                             kwargs=dict(params=sal_stream_def_id))
-        rdt = RecordDictionaryTool.load_from_granule(granule)
-        for i in rdt['salinity']:
-            self.assertNotEquals(i,0)
 
     def test_last_granule(self):
         stream_id, route, stream_def_id, dataset_id = self.make_simple_dataset()
@@ -527,7 +488,7 @@ class TestDMEnd2End(IonIntegrationTestCase):
 
         self.publish_fake_data(stream_id, route)
 
-        self.assertTrue(dataset_monitor.event.wait(30))
+        self.assertTrue(dataset_monitor.wait())
 
         query = {
             'start_time': 0 - 2208988800,
@@ -648,19 +609,6 @@ class TestDMEnd2End(IonIntegrationTestCase):
         
         self.assertTrue(dataset_id in DataRetrieverService._retrieve_cache)
 
-        DataRetrieverService._refresh_interval = 100
-        self.publish_hifi(stream_id,route,1)
-        self.wait_until_we_have_enough_granules(dataset_id, data_size=20)
-            
- 
-        event = gevent.event.Event()
-        with gevent.Timeout(20):
-            while not event.wait(0.1):
-                if dataset_id not in DataRetrieverService._retrieve_cache:
-                    event.set()
-
-
-        self.assertTrue(event.is_set())
 
         
     def publish_and_wait(self, dataset_id, granule):
@@ -671,8 +619,9 @@ class TestDMEnd2End(IonIntegrationTestCase):
         dataset_monitor = DatasetMonitor(dataset_id)
         self.addCleanup(dataset_monitor.stop)
         publisher.publish(granule)
-        self.assertTrue(dataset_monitor.event.wait(20))
+        self.assertTrue(dataset_monitor.wait())
 
+    @unittest.skip('Gap support disabled')
     @attr('LOCOINT')
     @unittest.skipIf(os.getenv('CEI_LAUNCH_TEST', False), 'Host requires file-system access to coverage files, CEI mode does not support.')
     def test_thorough_gap_analysis(self):
@@ -731,6 +680,8 @@ class TestDMEnd2End(IonIntegrationTestCase):
         self.start_ingestion(stream_id,dataset_id)
         self.addCleanup(self.stop_ingestion, stream_id)
 
+        # Publish initial granule
+        # the first one has the sparse value set inside it, sets lat to 45 and lon to -71
         ntp_now = time.time() + 2208988800
         rdt = ph.get_rdt(stream_def_id)
         rdt['time'] = [ntp_now]
@@ -749,12 +700,13 @@ class TestDMEnd2End(IonIntegrationTestCase):
         dataset_monitor = DatasetMonitor(dataset_id)
         self.addCleanup(dataset_monitor.stop)
         publisher.publish(rdt.to_granule())
-        self.assertTrue(dataset_monitor.event.wait(30))
-        dataset_monitor.event.clear()
+        self.assertTrue(dataset_monitor.wait())
+        dataset_monitor.reset()
 
         replay_granule = self.data_retriever.retrieve(dataset_id)
         rdt_out = RecordDictionaryTool.load_from_granule(replay_granule)
 
+        # Check the values and make sure they're correct
         np.testing.assert_array_almost_equal(rdt_out['time'], rdt['time'])
         np.testing.assert_array_almost_equal(rdt_out['temp'], rdt['temp'])
         np.testing.assert_array_almost_equal(rdt_out['lat'], np.array([45]))
@@ -767,19 +719,23 @@ class TestDMEnd2End(IonIntegrationTestCase):
         np.testing.assert_array_almost_equal(rdt_out['salinity'], np.array([30.935132729668283], dtype='float32'))
 
 
+        # We're going to change the lat/lon
         rdt = ph.get_rdt(stream_def_id)
         rdt['lat'] = [46]
         rdt['lon'] = [-73]
         
         publisher.publish(rdt.to_granule())
-        self.assertTrue(dataset_monitor.event.wait(30))
-        dataset_monitor.event.clear()
+        self.assertTrue(dataset_monitor.wait())
+        dataset_monitor.reset()
         
         rdt = ph.get_rdt(stream_def_id)
         rdt['lat'] = [1000]
         rdt['lon'] = [3]
         
         publisher.publish(rdt.to_granule())
+        # We need to wait AGAIN here, an event was still published and therefore it's on the queue.
+        self.assertTrue(dataset_monitor.wait())
+        dataset_monitor.reset()
 
         rdt = ph.get_rdt(stream_def_id)
         rdt['time'] = [ntp_now]
@@ -792,10 +748,9 @@ class TestDMEnd2End(IonIntegrationTestCase):
         rdt['driver_timestamp'] = [ntp_now]
         rdt['pressure'] = [256.8]
         
-        dataset_monitor.event.clear()
         publisher.publish(rdt.to_granule())
-        self.assertTrue(dataset_monitor.event.wait(30))
-        dataset_monitor.event.clear()
+        self.assertTrue(dataset_monitor.wait())
+        dataset_monitor.reset()
 
 
         replay_granule = self.data_retriever.retrieve(dataset_id)
@@ -805,9 +760,10 @@ class TestDMEnd2End(IonIntegrationTestCase):
 
 
 
-
 class DatasetMonitor(object):
-    def __init__(self, dataset_id):
+    def __init__(self, dataset_id=None, data_product_id=None):
+        if data_product_id and not dataset_id:
+            dataset_id = Container.instance.resource_registry.find_objects(data_product_id, PRED.hasDataset, id_only=True)[0][0]
         self.dataset_id = dataset_id
         self.event = Event()
 
@@ -819,4 +775,13 @@ class DatasetMonitor(object):
 
     def stop(self):
         self.es.stop()
+
+    def wait(self, timeout=None):
+        if timeout is None:
+            timeout = CFG.get_safe('endpoint.receive.timeout', 10)
+        return self.event.wait(timeout)
+
+    def reset(self):
+        self.event.clear()
+
 

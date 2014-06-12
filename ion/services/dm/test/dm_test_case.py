@@ -10,17 +10,19 @@ from interface.services.coi.iresource_registry_service import ResourceRegistrySe
 from interface.services.dm.ipubsub_management_service import PubsubManagementServiceClient
 from interface.services.dm.idataset_management_service import DatasetManagementServiceClient
 from interface.services.sa.idata_product_management_service import DataProductManagementServiceClient
+from interface.services.dm.idiscovery_service import DiscoveryServiceClient
 from interface.services.sa.iinstrument_management_service import InstrumentManagementServiceClient
 from interface.services.sa.idata_acquisition_management_service import DataAcquisitionManagementServiceClient
 from interface.services.cei.iprocess_dispatcher_service import ProcessDispatcherServiceClient
 from interface.services.sa.idata_process_management_service import DataProcessManagementServiceClient
 from interface.services.dm.idata_retriever_service import DataRetrieverServiceClient
 from interface.services.dm.iuser_notification_service import UserNotificationServiceClient
-from interface.services.ans.iworkflow_management_service import WorkflowManagementServiceClient
+from interface.services.sa.iobservatory_management_service import ObservatoryManagementServiceClient
 from interface.services.ans.ivisualization_service import VisualizationServiceClient
+from ion.processes.data.registration.registration_process import RegistrationProcess
 
-from pyon.public import RT
-from interface.objects import DataProduct
+from pyon.public import RT, PRED, CFG
+from interface.objects import DataProduct, StreamConfiguration, StreamConfigurationType
 from ion.services.dm.utility.granule_utils import time_series_domain
 from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
 from pyon.util.context import LocalContextMixin
@@ -28,9 +30,11 @@ from pyon.util.int_test import IonIntegrationTestCase
 from pyon.util.breakpoint import breakpoint
 from pyon.container.cc import Container
 from ion.services.dm.utility.test.parameter_helper import ParameterHelper
+from pyon.util.containers import DotDict
 from uuid import uuid4
 
 import numpy as np
+import os
 import time
 import gevent
 from gevent.event import Event
@@ -52,7 +56,7 @@ class DMTestCase(IonIntegrationTestCase):
         self.data_acquisition_management = DataAcquisitionManagementServiceClient()
         self.pubsub_management =  PubsubManagementServiceClient()
         self.instrument_management = InstrumentManagementServiceClient()
-        self.data_product_management = DataProductManagementServiceClient()
+        self.discovery = DiscoveryServiceClient()
         self.dataset_management =  DatasetManagementServiceClient()
         self.process_dispatcher = ProcessDispatcherServiceClient()
         self.data_process_management = DataProcessManagementServiceClient()
@@ -60,36 +64,228 @@ class DMTestCase(IonIntegrationTestCase):
         self.data_retriever = DataRetrieverServiceClient()
         self.dataset_management = DatasetManagementServiceClient()
         self.user_notification = UserNotificationServiceClient()
-        self.workflow_management = WorkflowManagementServiceClient()
+        self.observatory_management = ObservatoryManagementServiceClient()
         self.visualization = VisualizationServiceClient()
+        self.ph = ParameterHelper(self.dataset_management, self.addCleanup)
+        self.ctd_count = 0
 
     def create_stream_definition(self, *args, **kwargs):
         stream_def_id = self.pubsub_management.create_stream_definition(*args, **kwargs)
         self.addCleanup(self.pubsub_management.delete_stream_definition, stream_def_id)
         return stream_def_id
 
-    def create_data_product(self,name, stream_def_id='', param_dict_name='', pdict_id=''):
+    def create_data_product(self,name, stream_def_id='', param_dict_name='', pdict_id='', stream_configuration=None):
         if not (stream_def_id or param_dict_name or pdict_id):
             raise AssertionError('Attempted to create a Data Product without a parameter dictionary')
 
-        tdom, sdom = time_series_domain()
 
-        dp = DataProduct(name=name,
-                spatial_domain = sdom.dump(),
-                temporal_domain = tdom.dump(),
-                )
+        dp = DataProduct(name=name)
 
         stream_def_id = stream_def_id or self.create_stream_definition('%s stream def' % name, 
                 parameter_dictionary_id=pdict_id or self.RR2.find_resource_by_name(RT.ParameterDictionary,
                     param_dict_name, id_only=True))
 
-        data_product_id = self.data_product_management.create_data_product(dp, stream_definition_id=stream_def_id)
+
+        stream_config = stream_configuration or StreamConfiguration(stream_name='parsed_ctd', stream_type=StreamConfigurationType.PARSED)
+
+        data_product_id = self.data_product_management.create_data_product(dp, stream_definition_id=stream_def_id, default_stream_configuration=stream_config)
         self.addCleanup(self.data_product_management.delete_data_product, data_product_id)
         return data_product_id
 
     def activate_data_product(self, data_product_id):
         self.data_product_management.activate_data_product_persistence(data_product_id)
         self.addCleanup(self.data_product_management.suspend_data_product_persistence, data_product_id)
+    
+    def data_product_by_id(self, alt_id):
+        data_products, _ = self.container.resource_registry.find_resources_ext(alt_id=alt_id, alt_id_ns='PRE', id_only=True)
+        if data_products:
+            return data_products[0]
+        return None
+    def dataset_of_data_product(self, data_product_id):
+        return self.resource_registry.find_objects(data_product_id, PRED.hasDataset, id_only=True)[0][0]
+
+    #--------------------------------------------------------------------------------
+    # Preload Support
+    #--------------------------------------------------------------------------------
+
+    def preload_beta(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA'
+        config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary'
+        config.path = 'master'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+
+    def preload_full_beta(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA'
+        config.path = 'master'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+
+    def preload_alpha(self):
+        config = DotDict()
+        config.cfg = 'res/preload/r2_ioc/config/ooi_alpha.yml'
+        config.path = 'master'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+
+    def preload_tmpsf(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,TMPSF'
+        config.path = 'master'
+        #config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+    
+    def preload_example1(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,EXAMPLE1'
+        config.path = 'master'
+        #config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary,StreamDefinition,DataProduct'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+    
+    def preload_example2(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,EXAMPLE2'
+        config.path = 'master'
+        #config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary,StreamDefinition,DataProduct'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+
+    def preload_prest(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,PREST'
+        config.path = 'master'
+        #config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary,StreamDefinition,DataProduct'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+
+    def preload_ctdpf(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,CTDPF'
+        config.path = 'master'
+        #config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary,StreamDefinition,DataProduct'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+        self.container.spawn_process('import_dataset', 'ion.processes.data.import_dataset', 'ImportDataset', {'op':'load', 'instrument':'CTDPF'})
+
+    def preload_lctest(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,LC_TEST'
+        config.path = 'master'
+        config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+
+    def preload_sptest(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,SP_TEST'
+        config.path = 'master'
+        config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+
+    def preload_ctdgv(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,GLIDER,CTDGV,CTDGV01'
+        config.path = 'master'
+        #config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary,StreamDefinition,DataProduct'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+        self.container.spawn_process('import_dataset', 'ion.processes.data.import_dataset', 'ImportDataset', {'op':'load', 'instrument':'CTDGV'})
+
+    def preload_vel3d_cd(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,VEL3D_C'
+        config.path = 'master'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+
+    def preload_mflm(self):
+        config = DotDict()
+        config.op = 'load'
+        config.loadui=True
+        config.ui_path =  "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        config.attachments = "res/preload/r2_ioc/attachments"
+        config.scenario = 'BETA,SP_MFLM'
+        config.path = 'master'
+        #config.categories='ParameterFunctions,ParameterDefs,ParameterDictionary'
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+    
+    def make_ctd_data_product(self):
+        pdict_id = self.dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict')
+        stream_def_id = self.create_stream_definition('ctd %d' % self.ctd_count, parameter_dictionary_id=pdict_id)
+        data_product_id = self.create_data_product('ctd %d' % self.ctd_count, stream_def_id=stream_def_id)
+        self.activate_data_product(data_product_id)
+        self.ctd_count += 1
+        return data_product_id
+    
+    def preload_ui(self):
+        config = DotDict()
+        config.op='loadui'
+        config.loadui=True
+        config.attachments='res/preload/r2_ioc/attachments'
+        config.ui_path = "http://userexperience.oceanobservatories.org/database-exports/Candidates"
+        
+        self.container.spawn_process('preloader', 'ion.processes.bootstrap.ion_loader', 'IONLoader', config)
+    
+    def strap_erddap(self, data_product_id=None, open_page=True):
+        '''
+        Copies the datasets.xml to /tmp
+        '''
+        datasets_xml_path = RegistrationProcess.get_datasets_xml_path(CFG)
+        if os.path.lexists('/tmp/datasets.xml'):
+            os.unlink('/tmp/datasets.xml')
+        os.symlink(datasets_xml_path, '/tmp/datasets.xml')
+        if data_product_id:
+            with open('/tmp/erddap/flag/data%s' % data_product_id, 'a'):
+                pass
+
+        if open_page:
+            gevent.sleep(5)
+            from subprocess import call
+            call(['open', 'http://localhost:9000/erddap/tabledap/data%s.html' % data_product_id])
+    
+    def launch_ui_facepage(self, data_product_id):
+        '''
+        Opens the UI face page on localhost for a particular data product
+        '''
+        from subprocess import call
+        call(['open', 'http://localhost:3000/DataProduct/face/%s/' % data_product_id])
 
 class Streamer(object):
     def __init__(self, data_product_id, interval=1, simple_time=False, connection=False):

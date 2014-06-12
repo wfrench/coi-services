@@ -1,14 +1,14 @@
 ===========================================================
 Ocean Observatories Initiative Cyberinfrastructure (OOI CI)
-Integrated Observatory Network (ION) - OOI Network
+Integrated Observatory Network (ION) - OOINet
 
-coi-services - ION Release 2 system and services
+coi-services - OOINet system and services
 
-(C) UC Regents, 2010-2013
+(C) UC Regents, 2010-2014
 ===========================================================
 
-This is the repository that defines the OOI Network with its services and agents.
-The OOI Network system is started from this repository.
+This is the repository that defines the OOINet with its services and agents.
+The OOINet system is started from this repository.
 Submodules provide additional required functionality, such as the Pyon
 Capability Container.
 
@@ -36,14 +36,24 @@ For Mac, use homebrew
 - git 1.7.7 or higher: Use brew or download the Mac or Linux installer and run it
     > brew install git
 
-- Install core packages with Homebrew (including CouchDB and RabbitMQ)
+- Install core packages with Homebrew
 
-    > brew install libevent libyaml zeromq couchdb rabbitmq hdf5 pkg-config netcdf udunits
+    > brew install libevent libyaml zeromq rabbitmq hdf5 pkg-config netcdf udunits
 
     Linux: Note that many installs have much older versions installed by default.
     (If you have trouble with brew 'MD5 mismatch' errors, try running 'brew update'
     and try the install again)
     For any kind of installation trouble run 'brew doctor' and fix any issues.
+
+- Install Postgres with Homebrew
+
+    > brew install postgres postgis
+
+    If you have trouble with the installation, please see:
+    https://confluence.oceanobservatories.org/display/CIDev/Postgres+Datastore
+
+    As user postgres:
+    > createuser -s ion
 
 - Install libgswteos-10 for marine science calculations
     > brew tap lukecampbell/homebrew-libgswteos
@@ -119,67 +129,14 @@ Generate service definition interfaces and abstract base classes files:
 RUN-TIME DEPENDENCIES
 =====================
 
-COUCHDB (DATA STORE):
+POSTGRESQL (DATABASE):
 
-Run couchdb in second terminal before starting the container or running tests:
-Note: See the New Developer Tutorial for automatic start using supervisord
-    > couchdb
+Run postgresql in second terminal before starting the container or running tests:
+    > /usr/local/bin/postgres -D /usr/local/var/postgres
 
 
 RABBITMQ (MESSAGE BROKER):
-
-Run RabbitMQ in second terminal before starting the container or running tests:
-Note: See the New Developer Tutorial for automatic start using supervisord
-    > cd rabbitmq_server-2.x.x
-    > sudo sbin/rabbitmq-server
-
-
-ELASTICSEARCH (SEARCH ENGINE):
-
-    ------------
-    Installation
-    ------------
-    
-    Installation is performed with a script which downloads the file from 
-    github, extracts the contents to the INSTALL_DIR and installs the correct 
-    version of the plugins.
-        > bash scripts/install_es.sh 
-    Note: Works on both Mac and (Untested) Linux. This installs ElasticSearch 
-    to /usr/local/elasticsearch-$(VERSION)/ by default and can be overridden 
-    with the INSTALL_DIR environment variable
-    e.g. > INSTALL_DIR=/opt/elasticsearch bash scripts/install_es.sh
-
-    ---------------------
-    Running ElasticSearch
-    ---------------------
-    
-    After ElasticSearch has been installed it can be started in foreground mode 
-    or daemon mode.  Assuming that the install directory was /usr/local
-    Foreground mode:
-        > /usr/local/elasticsearch-0.18.7/bin/elasticsearch -f
-
-    Daemon mode:
-        > /usr/local/elasticsearch-0.18.7/bin/elasticsearch
-
-    ElasticSearch is an instance of the JVM with the ElasticSearch cluster node,
-    each node is equivalent to one JVM instance running ElasticSearch.  
-    Additional nodes means more instances of the JVM running ElasticSearch.  The
-    JVM minimum heap and maximum heap size and performance flags can be changed 
-    in the script /usr/local/elasticsearch-0.18.7/bin/elasticsearch which is 
-    strongly recommended for production. 
-
-    To install the ElasticSearch-Head plugin which provides a graphical 
-    interface for browsing and viewing the contents 
-    of the engine run:
-        > bash scripts/install_es.sh -h
-    
-    ---------------------------------
-    Viewing ElasticSearch Graphically
-    ---------------------------------
-    
-    If the ElasticSearch-Head plugin is installed (see above) then access to the
-    plugin is located at:
-        http://localhost:9200/_plugin/head/
+    > rabbitmq-server
 
 
 SOURCE PATH
@@ -201,7 +158,6 @@ Provide local configuration overrides (e.g. broker host, debug levels) in:
 List supported Pyon Capability Container arguments:
     > bin/pycc --help
 
-
 Run unit tests:
     > bin/nosetests -v -a UNIT
 
@@ -211,17 +167,15 @@ Run smoke tests to verify sanity of the system:
 Run full integration tests - this will take a long time so may be optional:
     > bin/nosetests -v -a INT
 
-
-Start an example (bank) locally:
-    > bin/pycc --rel res/deploy/examples/bank_complete.yml
-    Note: It does not do anything but start a service. You need a client to trigger actions.
-
 Start development instance of the ION system with all services:
     > bin/pycc --rel res/deploy/r2deploy.yml
 
 
 TROUBLESHOOTING
 ===============
+
+To reset the system use:
+    > bin/pycc -X -fc -bc
 
 Outdated *.pyc files can causes your
 tests to fail unexpectedly.  Do an ant clean and try again.
@@ -237,6 +191,10 @@ might be corrupted.
     > rm and create the virtualenv again
     > re-run bootstrap.py and buildout
     > If you suspect an egg is bad, remove the suspected egg from the eggs/ dir. Re-run buildout.
+
+See also:
+  https://confluence.oceanobservatories.org/display/CIDev/Python+and+Virtualenv+Mac+Troubleshooting
+  https://confluence.oceanobservatories.org/display/CIDev/Troubleshooting+OOINet+and+the+developer+environment
 
 
 DEBUG

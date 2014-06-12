@@ -23,6 +23,20 @@ class BootstrapProcessDispatcher(BootstrapPlugin):
         self.notification_worker(process,config)
         self.registration_worker(process,config)
         self.pydap_server(process,config)
+        self.eoi_services(process,config)
+
+    def eoi_services(self,process,config):
+        eoi_module = config.get_safe('bootstrap.processes.registration.module', 'ion.processes.data.registration.eoi_registration_process')
+        eoi_class  = config.get_safe('bootstrap.processes.registration.class', 'EOIRegistrationProcess')
+
+        process_definition = ProcessDefinition(
+                name = 'eoi_server',
+                description = 'Process for eoi data sources')
+        process_definition.executable['module'] = eoi_module
+        process_definition.executable['class'] = eoi_class
+
+        self._create_and_launch(process_definition)
+
 
     def pydap_server(self, process, config):
         pydap_module = config.get_safe('bootstrap.processes.pydap.module', 'ion.processes.data.externalization.lightweight_pydap')
@@ -39,8 +53,6 @@ class BootstrapProcessDispatcher(BootstrapPlugin):
 
         self._create_and_launch(process_definition,use_pydap)
 
-
-
     def registration_worker(self, process, config):
         res, meta = self.resource_registry.find_resources(name='registration_worker', restype=RT.ProcessDefinition)
         if len(res):
@@ -48,7 +60,7 @@ class BootstrapProcessDispatcher(BootstrapPlugin):
 
         registration_module = config.get_safe('bootstrap.processes.registration.module', 'ion.processes.data.registration.registration_process')
         registration_class  = config.get_safe('bootstrap.processes.registration.class', 'RegistrationProcess')
-        use_pydap = config.get_safe('bootstrap.use_pydap', False)
+        use_pydap = True
 
 
         process_definition = ProcessDefinition(
@@ -64,9 +76,9 @@ class BootstrapProcessDispatcher(BootstrapPlugin):
         proc_def_id = self.pds_client.create_process_definition(process_definition=process_definition)
 
         if conditional:
-
             process_res_id = self.pds_client.create_process(process_definition_id=proc_def_id)
             self.pds_client.schedule_process(process_definition_id=proc_def_id, process_id=process_res_id)
+
 
     def ingestion_worker(self, process, config):
         # ingestion

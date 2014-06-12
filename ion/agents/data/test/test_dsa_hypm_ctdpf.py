@@ -23,7 +23,7 @@ import unittest
 ###############################################################################
 
 
-@attr('INT', group='mi')
+@attr('INT', group='sa')
 class HypmCTDTest(DatasetAgentTestCase):
     """
     Verify dataset agent can harvest data fails, parse the date, publish,
@@ -49,6 +49,8 @@ class HypmCTDTest(DatasetAgentTestCase):
         self.assert_set_pubrate(0)
 
         self.create_sample_data("hypm_ctdpf/test_data_1.txt", "DATA0003.txt")
+        # Add time between file creation
+        gevent.sleep(2)
         self.create_sample_data("hypm_ctdpf/test_data_4.txt", "DATA0004.txt")
 
         granules = self.get_samples(self.test_config.stream_name, 9)

@@ -258,11 +258,14 @@ class StatusManager(object):
         @param sub_resource_id   resource id of child
         """
 
+        description = "Child device %r has been added to platform %r (%r)" % \
+                      (sub_resource_id, self.resource_id, self._platform_id)
         values = [sub_resource_id]
         evt = dict(event_type='DeviceStatusEvent',
                    sub_type="device_added",
                    origin_type="PlatformDevice",
                    origin=self.resource_id,
+                   description=description,
                    values=values)
         try:
             log.debug('%r: publish_device_added_event for %r: %s',
@@ -270,7 +273,7 @@ class StatusManager(object):
 
             self._event_publisher.publish_event(**evt)
 
-        except:
+        except Exception:
             log.exception('%r: platform agent could not publish event: %s',
                           self._platform_id, evt)
 
@@ -282,11 +285,14 @@ class StatusManager(object):
         @param sub_resource_id   resource id of child
         """
 
+        description = "Child device %r has been removed from platform %r (%r)" % \
+                      (sub_resource_id, self.resource_id, self._platform_id)
         values = [sub_resource_id]
         evt = dict(event_type='DeviceStatusEvent',
                    sub_type="device_removed",
                    origin_type="PlatformDevice",
                    origin=self.resource_id,
+                   description=description,
                    values=values)
         try:
             log.debug('%r: publish_device_removed_event for %r: %s',
@@ -294,7 +300,7 @@ class StatusManager(object):
 
             self._event_publisher.publish_event(**evt)
 
-        except:
+        except Exception:
             log.exception('%r: platform agent could not publish event: %s',
                           self._platform_id, evt)
 
@@ -309,7 +315,9 @@ class StatusManager(object):
         """
 
         values = [sub_resource_id]
-        description = "cmd=%r; err_msg=%r" % (str(cmd), err_msg)
+        description = "Child device %r failed to complete command from platform %r (%r)" % \
+                      (sub_resource_id, self.resource_id, self._platform_id)
+        description += ": cmd=%r; err_msg=%r" % (str(cmd), err_msg)
         evt = dict(event_type='DeviceStatusEvent',
                    sub_type="device_failed_command",
                    origin_type="PlatformDevice",
@@ -322,7 +330,7 @@ class StatusManager(object):
 
             self._event_publisher.publish_event(**evt)
 
-        except:
+        except Exception:
             log.exception('%r: platform agent could not publish event: %s',
                           self._platform_id, evt)
 
@@ -577,7 +585,7 @@ class StatusManager(object):
 
             self._event_publisher.publish_event(**evt)
 
-        except:
+        except Exception:
             log.exception('%r: platform agent could not publish event: %s',
                           self._platform_id, evt)
 
@@ -647,7 +655,7 @@ class StatusManager(object):
 
             self._event_publisher.publish_event(**evt)
 
-        except:
+        except Exception:
             log.exception('%r: platform agent could not publish event: %s',
                           self._platform_id, evt)
 

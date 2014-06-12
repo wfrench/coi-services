@@ -1,17 +1,23 @@
-from pyon.core.exception import BadRequest
+from pyon.core.exception import BadRequest, NotFound
 from pyon.ion.process import StandaloneProcess
 from pyon.util.file_sys import FileSystem
 from pyon.util.log import log
 from pyon.public import PRED
+from pyon.core.object import walk
+from interface.objects import ParameterFunctionType as PFT
 
 from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 
-from coverage_model import AbstractCoverage
+from coverage_model import AbstractCoverage, ParameterFunctionType
+from coverage_model.parameter_functions import PythonFunction, NumexprFunction
 #from coverage_model.parameter_types import QuantityType
 
 from xml.dom.minidom import parse, parseString
 from xml.parsers.expat import ExpatError
 from zipfile import ZipFile
+from jinja2 import Environment, FileSystemLoader
+import lxml.etree as etree
+from pyon.util.breakpoint import debug_wrapper
 
 import base64
 import os
@@ -21,6 +27,41 @@ import StringIO
 import re
 
 class RegistrationProcess(StandaloneProcess):
+    catalog_dir_path = '/Externalization/DataCatalog/Config/catalog.xml'
+    # All of the relevant metadata in the DataProduct resource
+    # TODO: Maybe reconsider if this is the place to put this.
+    catalog_metadata = [
+            'name',
+            'comment',
+            'ooi_short_name',
+            'ooi_product_name',
+            'regime',
+            'qc_cmbnflg',
+            'qc_glblrng',
+            'qc_gradtst',
+            'qc_loclrng',
+            'qc_spketest',
+            'qc_stuckvl',
+            'qc_trndtst',
+            'dps_dcn',
+            'flow_diagram_dcn',
+            'doors_l2_requirement_num',
+            'doors_l2_requirement_text',
+            'provenance_description',
+            'citation_description',
+            'lineage_description',
+            'ioos_category',
+            'iso_spatial_representation_type',
+            'processing_level_code',
+            'ISO_spatial_representation_type',
+            'license_uri',
+            'exclusive_rights_status',
+            'exclusive_rights_end_date',
+            'exclusive_rights_notes',
+            'acknowledgement',
+            'synonyms',
+            'iso_topic_category',
+            'reference_urls']
 
     def on_start(self):
         #these values should come in from a config file, maybe pyon.yml
@@ -28,22 +69,241 @@ class RegistrationProcess(StandaloneProcess):
         self.pydap_port = self.CFG.get_safe('server.pydap.port', '8001')
         self.pydap_url  = 'http://%s:%s/' % (self.pydap_host, self.pydap_port)
         self.pydap_data_path = self.CFG.get_safe('server.pydap.data_path', 'RESOURCE:ext/pydap')
-        self.datasets_xml_path = self.CFG.get_safe('server.pydap.datasets_xml_path', "RESOURCE:ext/datasets.xml")
+        self.datasets_xml_path = self.get_datasets_xml_path(self.CFG)
         self.pydap_data_path = FileSystem.get_extended_url(self.pydap_data_path) + '/'
+        self.ux_url = self.CFG.get_safe('system.web_ui_url','http://localhost:3000/')
+        self.jenv = Environment(loader=FileSystemLoader('res/templates'), trim_blocks=True, lstrip_blocks=True)
+        self.resource_registry = self.container.resource_registry
+        self.setup_filesystem(self.datasets_xml_path)
 
-        filename = self.datasets_xml_path.split('/')[-1]
-        base = '/'.join(self.datasets_xml_path.split('/')[:-1])
-        real_path = FileSystem.get_extended_url(base)
-        self.datasets_xml_path = os.path.join(real_path, filename)
-        self.setup_filesystem(real_path)
+    @classmethod
+    def get_datasets_xml_path(cls, cfg):
+        datasets_xml_path = cfg.get_safe('server.pydap.datasets_xml_path', 'RESOURCE:ext/datasets.xml')
+        base, filename = os.path.split(datasets_xml_path)
+        base = FileSystem.get_extended_url(base)
+        path = os.path.join(base, filename)
+
+        return path
 
     def setup_filesystem(self, path):
-        if os.path.exists(os.path.join(path,'datasets.xml')):
-            return
-        with open(os.path.join(path,'datasets.xml'),'w') as f:
-            f.write(datasets_xml)
+        template = self.jenv.get_template('datasets.xml')
+        buff = template.render()
+        if not os.path.exists(path):
+            with open(path,'w') as f:
+                f.write(buff)
+
+        doc = self.container.directory.lookup(self.catalog_dir_path)
+        if not doc:
+            doc = {'xml':buff}
+            self.container.directory.register(*os.path.split(self.catalog_dir_path), **doc)
+
+
+
+    def slam(self, d, dp, k):
+        v = getattr(dp, k, None)
+        if v:
+            d[k] = v
+
+
+
+    @classmethod
+    def xml_escape(cls, s):
+        if isinstance(s, basestring):
+            s = s.replace('&', '&amp;')
+            s = s.replace('<', '&lt;')
+            s = s.replace('>', '&gt;')
+        return s
+
+    def map_data_product(self, data_product):
+        ds = {} # Catalog Dataset
+        ds['dataset_id'] = 'data' + data_product._id
+        ds['url'] = self.pydap_url + data_product._id
+        ds['face_page'] = self.ux_url + 'DataProduct/face/' + data_product._id
+        ds['title'] = data_product.name
+        ds['summary'] = data_product.description or data_product.name
+        ds['attrs'] = {}
+        metadata_attrs = [ i for i in self.catalog_metadata if i not in ['name', 'synonyms', 'iso_topic_category', 'reference_urls'] ]
+        for attr in metadata_attrs:
+            self.slam(ds['attrs'], data_product, attr)
+        if data_product.synonyms:
+            ds['attrs']['synonyms'] = ','.join(data_product.synonyms)
+        if data_product.iso_topic_category:
+            ds['attrs']['iso_topic_category'] = ','.join(data_product.iso_topic_category)
+        if data_product.reference_urls:
+            ds['attrs']['reference_urls'] = '\n'.join(data_product.reference_urls)
+
+        # Grab the parameters
+        stream_def_id = self.resource_registry.find_objects(data_product._id, PRED.hasStreamDefinition, id_only=True)[0][0]
+        pdict_id = self.resource_registry.find_objects(stream_def_id, PRED.hasParameterDictionary, id_only=True)[0][0]
+        parameter_contexts, _ = self.resource_registry.find_objects(pdict_id, PRED.hasParameterContext, id_only=False)
+
+        ds['vars'] = []
+        for param in parameter_contexts:
+            # Handle the placeholder variables
+            if re.match(r'.*_[a-z0-9]{32}', param.name):
+                continue # Let's not do this
+            var = {}
+            var['name'] = param.name
+            var['attrs'] = {}
+            attrs = var['attrs']
+            attrs['units'] = param.units or '1'
+            attrs['ioos_category'] = self.get_ioos_category(param.name, attrs['units'])
+            attrs['long_name'] = param.display_name
+            if param.standard_name: 
+                attrs['standard_name'] = param.standard_name
+            if 'seconds' in attrs['units'] and 'since' in attrs['units']:
+                attrs['time_precision'] =  '1970-01-01T00:00:00.000Z'
+            if param.ooi_short_name:
+                sname = param.ooi_short_name
+                sname = re.sub('[\t\n ]+', ' ', sname)
+                attrs['ooi_short_name'] = sname
+                m = re.match(r'[A-Z0-9]{7}', sname)
+                if m:
+                    reference_url = 'https://confluence.oceanobservatories.org/display/instruments/' + m.group()
+                    attrs['references'] = reference_url
+                if 'L2' in param.ooi_short_name:
+                    attrs['data_product_level'] = 'L2'
+                    attrs['source'] = 'level 2 calibrated sensor observation'
+                elif 'L1' in param.ooi_short_name:
+                    attrs['data_product_level'] = 'L1'
+                    attrs['source'] = 'level 1 calibrated sensor observation'
+                elif 'L0' in param.ooi_short_name:
+                    attrs['data_product_level'] = 'L0'
+                    attrs['source'] = 'level 0 calibrated sensor observation'
+                elif 'QC' in param.ooi_short_name:
+                    attrs['data_product_level'] = 'QC'
+            elif param.parameter_type != 'function':
+                if attrs['units'] == 'counts':
+                    attrs['data_product_level'] = 'L0'
+                    attrs['source'] = 'sensor observation'
+                elif 'seconds' in attrs['units'] and 'since' in attrs['units']:
+                    attrs['data_product_level'] = 'axis'
+                elif var['name'].lower() in ('time', 'lat', 'lon', 'latitude', 'longitude'):
+                    attrs['data_product_level'] = 'axis'
+                else:
+                    attrs['data_product_level'] = 'unknown'
+            if param.reference_urls:
+                attrs['instrument_type'] = '\n'.join(param.reference_urls)
+
+            if param.parameter_type == 'function':
+                parameter_function = self.resource_registry.read(param.parameter_function_id)
+                if parameter_function.function_type == PFT.PYTHON:
+                    attrs['function_module'] = parameter_function.owner or ''
+                    attrs['function_name'] = parameter_function.function or ''
+                    if attrs['function_module'].startswith('ion_functions'):
+                        s = attrs['function_module']
+                        url = s.replace('.','/') + '.py'
+                        url = 'https://github.com/ooici/ion-functions/blob/master/' + url
+                        attrs['function_url'] = url
+                    elif parameter_function.egg_uri:
+                        attrs['function_url'] = parameter_function.egg_uri
+                elif parameter_function.function_type == PFT.NUMEXPR:
+                    attrs['function_name'] = parameter_function.name
+                    attrs['expression'] = parameter_function.function
+
+            for k,v in param.additional_metadata.iteritems():
+                if re.match(r'[a-z][a-zA-Z0-9_]+', k):
+                    attrs[k] = v
+            ds['vars'].append(var)
+
+        ds = walk(ds, self.xml_escape)
+        return ds
+
+    def create_entry(self, data_product_id):
+        '''
+        Create a catalog entry for a data product
+        '''
+        data_product = self.resource_registry.read(data_product_id)
+        ds = self.map_data_product(data_product)
+
+        template = self.jenv.get_template('dataset.xml')
+        entry = template.render(**ds)
+        doc = self.container.directory.lookup(self.catalog_dir_path)
+        #doc = self.container.object_store.read('datasets.xml')
+        root = etree.fromstring(doc['xml'])
+        dataset_element = etree.fromstring(entry)
+        root.append(dataset_element)
+        doc['xml'] = etree.tostring(root, xml_declaration=True, encoding='utf8', pretty_print=True)
+
+        self.container.directory.register(*os.path.split(self.catalog_dir_path), **doc)
+        with open(self.datasets_xml_path, 'w') as f:
+            f.write(doc['xml'])
+
+        self.touch(data_product_id)
+        
+    
+    def read_entry(self, data_product_id):
+        '''
+        Grab the XML entry from the current catalog
+        '''
+        # Grab the XML document in the object store
+        doc = self.container.directory.lookup(self.catalog_dir_path)
+        root = etree.fromstring(doc['xml'])
+        relevant = []
+        for ele in root:
+            if 'datasetID' in ele.attrib and ele.attrib['datasetID'] == 'data%s' % data_product_id:
+                relevant.append(ele)
+        if relevant:
+            return etree.tostring(relevant[0])
+        raise NotFound('No catalog entry for %s' % data_product_id )
+
+
+    def update_entry(self, data_product_id):
+        '''
+        Update the existing catalog entries (remove then add)
+        '''
+        # Make a new XML entry for this data product from a template
+        data_product = self.resource_registry.read(data_product_id)
+        ds = self.map_data_product(data_product)
+        template = self.jenv.get_template('dataset.xml')
+        entry = template.render(**ds)
+        dataset_element = etree.fromstring(entry)
+        # Grab the XML document in the object store
+        doc = self.container.directory.lookup(self.catalog_dir_path)
+        root = etree.fromstring(doc['xml'])
+        # Remove the existing entries that correspond to this data product
+        relevant = []
+        for ele in root:
+            if 'datasetID' in ele.attrib and ele.attrib['datasetID'] == 'data%s' % data_product_id:
+                relevant.append(ele)
+        for r in relevant:
+            root.remove(r)
+        root.append(dataset_element)
+        doc['xml'] = etree.tostring(root, xml_declaration=True, encoding='utf8', pretty_print=True)
+        self.container.directory.register(*os.path.split(self.catalog_dir_path), **doc)
+        with open(self.datasets_xml_path, 'w') as f:
+            f.write(doc['xml'])
+
+    def delete_entry(self, data_product_id):
+        '''
+        Delete a catalog entry
+        '''
+        # Grab the XML document from the directory
+        doc = self.container.directory.lookup(self.catalog_dir_path)
+        root = etree.fromstring(doc['xml'])
+        relevant = []
+        for ele in root:
+            if 'datasetID' in ele.attrib and ele.attrib['datasetID'] == 'data%s' % data_product_id:
+                relevant.append(ele)
+        if not relevant:
+            raise NotFound('No catalog entry for %s' % data_product_id)
+        for r in relevant:
+            root.remove(r)
+        doc['xml'] = etree.tostring(root, xml_declaration=True, encoding='utf8', pretty_print=True)
+        self.container.directory.register(*os.path.split(self.catalog_dir_path), **doc)
+        with open(self.datasets_xml_path, 'w') as f:
+            f.write(doc['xml'])
+
+
+
+    def touch(self, data_product_id):
+        '''Touches a file, so that pydap can catalog it'''
+        path = os.path.join(self.pydap_data_path, data_product_id)
+        with open(path, 'w'):
+            pass
 
     def register_dap_dataset(self, data_product_id):
+        return self.create_entry(data_product_id)
         dataset_id = self.container.resource_registry.find_objects(data_product_id, PRED.hasDataset, id_only=True)[0][0]
         data_product = self.container.resource_registry.read(data_product_id)
         data_product_name = data_product.name
@@ -51,7 +311,7 @@ class RegistrationProcess(StandaloneProcess):
         coverage_path = DatasetManagementService._get_coverage_path(dataset_id)
         try:
             self.add_dataset_to_xml(coverage_path=coverage_path, product_id=data_product_id, product_name=data_product_name, available_fields=stream_definition.available_fields)
-            self.create_symlink(coverage_path, self.pydap_data_path)
+            #self.create_symlink(coverage_path, self.pydap_data_path)
         except: # We don't re-raise to prevent clients from bombing out...
             log.exception('Problem registering dataset')
             log.error('Failed to register dataset for coverage path %s' % coverage_path)
@@ -87,6 +347,13 @@ class RegistrationProcess(StandaloneProcess):
             else:
                 result[name] = name
         return result
+
+    def xml_attr(self, doc, head, attr_name, attr_value):
+        att_element = doc.createElement('att')
+        att_element.setAttribute('name', attr_name)
+        text_node = doc.createTextNode(attr_value)
+        att_element.appendChild(text_node)
+        head.appendChild(att_element)
 
     def get_dataset_xml(self, coverage_path, product_id, product_name='', available_fields=None):
         #http://coastwatch.pfeg.noaa.gov/erddap/download/setupDatasetsXml.html
@@ -135,135 +402,176 @@ class RegistrationProcess(StandaloneProcess):
             if len(vars)==1:
                 raise BadRequest('A dataset needs a proper range, not just the temporal dimension. %s\n%s' %( coverage_path, cov))
 
-            if not (len(dims) == 1 and dims[0] == vars[0]):
-                dataset_element = doc.createElement('dataset')
-                #dataset_element.setAttribute('type', 'EDDGridFromDap')
-                dataset_element.setAttribute('type', 'EDDTableFromDapSequence')
-                dataset_element.setAttribute('datasetID', product_id)
-                dataset_element.setAttribute('active', 'True')
+            dataset_element = doc.createElement('dataset')
+            #dataset_element.setAttribute('type', 'EDDGridFromDap')
+            dataset_element.setAttribute('type', 'EDDTableFromDapSequence')
+            dataset_element.setAttribute('datasetID', 'data' + product_id)
+            dataset_element.setAttribute('active', 'True')
 
-                source_element = doc.createElement('sourceUrl')
-                text_node = doc.createTextNode(self.pydap_url + paths[1])
-                source_element.appendChild(text_node)
-                dataset_element.appendChild(source_element)
+            source_element = doc.createElement('sourceUrl')
+            text_node = doc.createTextNode(self.pydap_url + paths[1])
+            source_element.appendChild(text_node)
+            dataset_element.appendChild(source_element)
 
-                reload_element = doc.createElement('reloadEveryNMinutes')
-                if self.CFG.get_safe('server.erddap.dataset_caching',True):
-                    text_node = doc.createTextNode('1440')
-                else:
-                    text_node = doc.createTextNode('5')
-                reload_element.appendChild(text_node)
-                dataset_element.appendChild(reload_element)
+            reload_element = doc.createElement('reloadEveryNMinutes')
+            if self.CFG.get_safe('server.erddap.dataset_caching',True):
+                text_node = doc.createTextNode('1440')
+            else:
+                text_node = doc.createTextNode('5')
+            reload_element.appendChild(text_node)
+            dataset_element.appendChild(reload_element)
+            
+            outer_element = doc.createElement('outerSequenceName')
+            text_node = doc.createTextNode('data')
+            outer_element.appendChild(text_node)
+            dataset_element.appendChild(outer_element)
+
+            default_element = doc.createElement('defaultDataQuery')
+            text_node = doc.createTextNode('&amp;time&gt;=1970-01-01')
+            default_element.appendChild(text_node)
+            dataset_element.appendChild(default_element)
+
+            # No longer applicable
+            #if self.CFG.get_safe('server.erddap.dataset_caching',True):
+                #refresh_interval = self.CFG.get_safe('server.erddap.refresh_interval', 30000)
+                #update_element = doc.createElement('updateEveryNMillis')
+                #text_node = doc.createTextNode(str(refresh_interval))
+                #update_element.appendChild(text_node)
+                #dataset_element.appendChild(update_element)
+            
+
+            add_attributes_element = doc.createElement('addAttributes')
+
+            atts = {}
+            atts['title'] = product_name or urllib.unquote(cov.name)
+            atts['infoUrl'] = self.ux_url + 'DataProduct/face/' + product_id
+            atts['institution'] = 'OOI'
+            atts['Conventions'] = "COARDS, CF-1.6, Unidata Dataset Discovery v1.0"
+            atts['license'] = '''These data were collected by the Ocean Observatory Initiative (OOI) project purely for internal system development purposes during the construction phase of the project and are offered for release to the public with no assurance of data quality, consistency, temporal continuity or additional support. The OOI Program assumes no liability resulting from the use of these data for other than the intended purpose. No data quality assurance steps have been implemented on this data to date.'''
+            atts['summary'] = cov.name
+            atts['cdm_data_type'] = 'Other'
+            atts['standard_name_vocabulary'] = 'CF-12'
+            
+            for key, val in atts.iteritems():
+                self.xml_attr(doc, add_attributes_element, key, val)
+
+            if len(add_attributes_element.childNodes) > 0:
+                dataset_element.appendChild(add_attributes_element)
+
+            for var_name in vars:
+                var = cov.get_parameter_context(var_name)
+                if re.match(r'.*_[a-z0-9]{32}', var.name):
+                    continue # Let's not do this
                 
-                outer_element = doc.createElement('outerSequenceName')
-                text_node = doc.createTextNode('data')
-                outer_element.appendChild(text_node)
-                dataset_element.appendChild(outer_element)
 
-                if self.CFG.get_safe('server.erddap.dataset_caching',True):
-                    refresh_interval = self.CFG.get_safe('server.erddap.refresh_interval', 30000)
-                    update_element = doc.createElement('updateEveryNMillis')
-                    text_node = doc.createTextNode(str(refresh_interval))
-                    update_element.appendChild(text_node)
-                    dataset_element.appendChild(update_element)
+
+                #if len(param.shape) >=1 and not param.is_coordinate: #dataVariable
+                data_element = doc.createElement('dataVariable')
+                source_name_element = doc.createElement('sourceName')
+                text_node = doc.createTextNode(var.name)
+                source_name_element.appendChild(text_node)
+                data_element.appendChild(source_name_element)
+
+                destination_name_element = doc.createElement('destinationName')
+                text_node = doc.createTextNode(erd_name_map[var.name])
+                destination_name_element.appendChild(text_node)
+                data_element.appendChild(destination_name_element)
                 
-
                 add_attributes_element = doc.createElement('addAttributes')
+                units = "unknown"
+                if hasattr(var,'uom') and var.uom:
+                    units = var.uom
+                self.xml_attr(doc, add_attributes_element, 'units', units)
+                #if var.ATTRS is not None:
+                    #for key in var.ATTRS:
+                        #if not hasattr(var,key):
+                            #continue
+                        #val = getattr(var,key)
+                        #if not val:
+                            #val = ''
+                        #att_element = doc.createElement('att')
+                        #att_element.setAttribute('name', key)
+                        #text_node = doc.createTextNode(val)
+                        #att_element.appendChild(text_node)
+                        #add_attributes_element.appendChild(att_element)
 
-                atts = {}
-                atts['title'] = product_name or urllib.unquote(cov.name)
-                atts['infoUrl'] = self.pydap_url + paths[1]
-                atts['institution'] = 'OOI'
-                atts['Conventions'] = "COARDS, CF-1.6, Unidata Dataset Discovery v1.0"
-                atts['license'] = '[standard]'
-                atts['summary'] = cov.name
-                atts['cdm_data_type'] = 'Grid'
-                atts['standard_name_vocabulary'] = 'CF-12'
+                ioos_cat = self.get_ioos_category(var.name, units)
+                self.xml_attr(doc, add_attributes_element, 'ioos_category', ioos_cat)
+
+                if hasattr(var,'display_name') and var.display_name is not None:
+                    self.xml_attr(doc, add_attributes_element, 'long_name', var.display_name)
                 
-                for key, val in atts.iteritems():
-                    att_element = doc.createElement('att')
-                    att_element.setAttribute('name', key)
-                    text_node = doc.createTextNode(val)
-                    att_element.appendChild(text_node)
-                    add_attributes_element.appendChild(att_element)
+                if hasattr(var,'standard_name') and var.standard_name is not None:
+                    self.xml_attr(doc, add_attributes_element, 'standard_name', var.standard_name)
 
-                if len(add_attributes_element.childNodes) > 0:
-                    dataset_element.appendChild(add_attributes_element)
+                if 'seconds' in units and 'since' in units:
+                    self.xml_attr(doc, add_attributes_element, 'time_precision', '1970-01-01T00:00:00.000Z')
 
-                for var_name in vars:
-                    var = cov.get_parameter_context(var_name)
-                    if re.match(r'.*_[a-z0-9]{32}', var.name):
-                        continue # Let's not do this
-                    
-                    units = "unknown"
-                    if hasattr(var,'uom') and var.uom:
-                        units = var.uom
+                if hasattr(var, 'ooi_short_name') and var.ooi_short_name:
+                    sname = var.ooi_short_name
+                    sname = re.sub('[\t\n ]+', ' ', sname)
+                    self.xml_attr(doc, add_attributes_element, 'ooi_short_name', sname)
 
-                    #if len(param.shape) >=1 and not param.is_coordinate: #dataVariable
-                    data_element = doc.createElement('dataVariable')
-                    source_name_element = doc.createElement('sourceName')
-                    text_node = doc.createTextNode(var.name)
-                    source_name_element.appendChild(text_node)
-                    data_element.appendChild(source_name_element)
+                    m = re.match(r'[A-Z0-9]{7}', sname)
+                    if m:
+                        reference_url = 'https://confluence.oceanobservatories.org/display/instruments/' + m.group()
+                        self.xml_attr(doc, add_attributes_element, 'references', reference_url)
 
-                    destination_name_element = doc.createElement('destinationName')
-                    text_node = doc.createTextNode(erd_name_map[var.name])
-                    destination_name_element.appendChild(text_node)
-                    data_element.appendChild(destination_name_element)
-                    
-                    add_attributes_element = doc.createElement('addAttributes')
-                    if var.ATTRS is not None:
-                        for key in var.ATTRS:
-                            if not hasattr(var,key):
-                                continue
-                            val = getattr(var,key)
-                            if not val:
-                                val = ''
-                            att_element = doc.createElement('att')
-                            att_element.setAttribute('name', key)
-                            text_node = doc.createTextNode(val)
-                            att_element.appendChild(text_node)
-                            add_attributes_element.appendChild(att_element)
 
-                    att_element = doc.createElement('att')
-                    att_element.setAttribute('name', 'ioos_category')
-                    text_node = doc.createTextNode(self.get_ioos_category(var.name, units))
-                    att_element.appendChild(text_node)
-                    add_attributes_element.appendChild(att_element)
 
-                    att_element = doc.createElement('att')
-                    att_element.setAttribute('name', 'long_name')
-                    long_name = ""
-                    if hasattr(var,'display_name') and var.display_name is not None:
-                        long_name = var.display_name
-                        text_node = doc.createTextNode(long_name)
-                        att_element.appendChild(text_node)
-                        add_attributes_element.appendChild(att_element)
-                    
-                    att_element = doc.createElement('att')
-                    standard_name = ""
-                    if hasattr(var,'standard_name') and var.standard_name is not None:
-                        standard_name = var.standard_name
-                        att_element.setAttribute('name', 'standard_name')
-                        text_node = doc.createTextNode(standard_name)
-                        att_element.appendChild(text_node)
-                        add_attributes_element.appendChild(att_element)
-                    
+                    if 'L2' in var.ooi_short_name:
+                        self.xml_attr(doc, add_attributes_element, 'data_product_level', 'L2')
+                        self.xml_attr(doc, add_attributes_element, 'source', 'level 2 calibrated sensor observation')
+                    elif 'L1' in var.ooi_short_name:
+                        self.xml_attr(doc, add_attributes_element, 'data_product_level', 'L1')
+                        self.xml_attr(doc, add_attributes_element, 'source', 'level 1 calibrated sensor observation')
+                    elif 'L0' in var.ooi_short_name:
+                        self.xml_attr(doc, add_attributes_element, 'data_product_level', 'L0')
+                        self.xml_attr(doc, add_attributes_element, 'source', 'sensor observation')
+                    elif 'QC' in var.ooi_short_name:
+                        self.xml_attr(doc, add_attributes_element, 'data_product_level', 'QC')
 
-                    att_element = doc.createElement('att')
-                    att_element.setAttribute('name', 'units')
-                    text_node = doc.createTextNode(units)
-                    att_element.appendChild(text_node)
-                    add_attributes_element.appendChild(att_element)
+                elif not isinstance(var.param_type, ParameterFunctionType):
+                    self.xml_attr(doc, add_attributes_element, 'ooi_short_name', var.name)
+                    if units == 'counts':
+                        self.xml_attr(doc, add_attributes_element, 'data_product_level', 'L0')
+                        self.xml_attr(doc, add_attributes_element, 'source', 'sensor observation')
+                    elif 'seconds' in units and 'since' in units:
+                        self.xml_attr(doc, add_attributes_element, 'data_product_level', 'axis')
+                    else:
+                        self.xml_attr(doc, add_attributes_element, 'data_product_level', 'unknown')
 
-                    data_element.appendChild(add_attributes_element)
-                    dataset_element.appendChild(data_element)
+                  
+                if hasattr(var, 'reference_urls') and var.reference_urls:
+                    if isinstance(var.reference_urls, list):
+                        references = ','.join(var.reference_urls)
+                    else:
+                        references = var.reference_urls
+                    self.xml_attr(doc, add_attributes_element, 'instrument_type', references)
 
-                index += 1
-                #bug with prettyxml
-                #http://ronrothman.com/public/leftbraned/xml-dom-minidom-toprettyxml-and-silly-whitespace/
-                result += dataset_element.toprettyxml() + '\n'
-                #result += dataset_element.toxml() + '\n'
+
+                if isinstance(var.param_type, ParameterFunctionType):
+                    if isinstance(var.function, PythonFunction):
+                        self.xml_attr(doc, add_attributes_element, 'function_module', var.function.owner or '')
+                        self.xml_attr(doc, add_attributes_element, 'function_name', var.function.func_name or '')
+                        if var.function.owner.startswith('ion_functions'):
+                            s = var.function.owner
+                            url = s.replace('.','/') + '.py'
+                            url = 'https://github.com/ooici/ion-functions/blob/master/' + url
+                            self.xml_attr(doc, add_attributes_element, 'function_url', url)
+                        elif var.function.egg_uri:
+                            self.xml_attr(doc, add_attributes_element, 'function_url', var.function.egg_uri or '')
+                    elif isinstance(var.function, NumexprFunction):
+                        self.xml_attr(doc, add_attributes_element, 'function_name', var.function.name or '')
+
+                data_element.appendChild(add_attributes_element)
+                dataset_element.appendChild(data_element)
+
+            index += 1
+            #bug with prettyxml
+            #http://ronrothman.com/public/leftbraned/xml-dom-minidom-toprettyxml-and-silly-whitespace/
+            result += dataset_element.toprettyxml() + '\n'
+            #result += dataset_element.toxml() + '\n'
 
         cov.close()
 

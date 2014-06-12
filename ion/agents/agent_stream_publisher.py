@@ -36,7 +36,7 @@ from ion.agents.populate_rdt import populate_rdt
 class AgentStreamPublisher(object):
     """
     """
-    def __init__(self, agent):
+    def __init__(self, agent, flush_on_publish=False):
         self._agent = agent
         self._stream_defs = {}
         self._publishers = {}
@@ -44,6 +44,7 @@ class AgentStreamPublisher(object):
         self._stream_buffers = {}
         self._connection_ID = None
         self._connection_index = {}
+        self._flush_on_publish = flush_on_publish
         
         stream_info = self._agent.CFG.get('stream_config', None)
         if not stream_info:
@@ -51,8 +52,8 @@ class AgentStreamPublisher(object):
                       self._agent._proc_name)
             return
         
-        log.info('Instrument agent %s stream config: %s', self._agent._proc_name,
-                 str(stream_info))
+        #log.info('Instrument agent %s stream config: %s', self._agent._proc_name,
+                 #str(stream_info))
 
         self._construct_streams(stream_info)
         self._construct_publishers(stream_info)
@@ -187,6 +188,15 @@ class AgentStreamPublisher(object):
         """
 
         try:
+            ### Flush the agent state to the object store.  This was added for the dataset agent publishers who store
+            ### their driver state in the object store.  We had talked about about flushing the state after publiction
+            ### by grabbing current state here, doing out work, and then saving this state.  However, flush_state
+            ### doesn't accept parameters.  It seems more complex than simply flushing here.  There is a slight downside
+            ### if publishing fails then the state will be slightly out of sync.
+            if self._flush_on_publish:
+                log.debug("ASP Flush Agent State")
+                self._agent._flush_state()
+
             buf_len = len(self._stream_buffers[stream_name])
             if buf_len == 0:
                 return
@@ -198,25 +208,24 @@ class AgentStreamPublisher(object):
                 rdt = RecordDictionaryTool(stream_definition=stream_def)
                 
             publisher = self._publishers[stream_name]
-                
             vals = []
             for x in xrange(buf_len):
                 vals.append(self._stream_buffers[stream_name].pop())
     
             rdt = populate_rdt(rdt, vals)
             
-            log.info('Outgoing granule: %s',
-                     ['%s: %s'%(k,v) for k,v in rdt.iteritems()])
-            log.info('Outgoing granule preferred timestamp: %s' % rdt['preferred_timestamp'][0])
-            log.info('Outgoing granule destined for stream: %s', stream_name)
+            #log.info('Outgoing granule: %s',
+                     #['%s: %s'%(k,v) for k,v in rdt.iteritems()])
+            #log.info('Outgoing granule preferred timestamp: %s' % rdt['preferred_timestamp'][0])
+            #log.info('Outgoing granule destined for stream: %s', stream_name)
             g = rdt.to_granule(data_producer_id=self._agent.resource_id, connection_id=self._connection_ID.hex,
                     connection_index=str(self._connection_index[stream_name]))
             
             publisher.publish(g)
-            log.info('Instrument agent %s published data granule on stream %s.',
-                self._agent._proc_name, stream_name)
-            log.info('Connection id: %s, connection index: %i.',
-                     self._connection_ID.hex, self._connection_index[stream_name])
+            #log.info('Instrument agent %s published data granule on stream %s.',
+                #self._agent._proc_name, stream_name)
+            #log.info('Connection id: %s, connection index: %i.',
+                     #self._connection_ID.hex, self._connection_index[stream_name])
             self._connection_index[stream_name] += 1
         except:
             log.exception('Instrument agent %s could not publish data on stream %s.',

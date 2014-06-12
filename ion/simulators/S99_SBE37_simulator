@@ -1,0 +1,68 @@
+#!/bin/sh
+#
+# service for starting SBE37 simulators
+#
+
+# switch to simulator folder in git coi-services repository 
+cd /opt/simulator/coi-services/ion/simulators
+echo -n $"changed working directory to "
+pwd
+
+# rm logs on restart....
+# in general don't want to do this because you loose any of the debugging info in them
+#rm simulator.[0-9].log
+ 
+start() {
+   echo $"Updating SBE37_SMP_simulator.py python file (by doing git pull on coi-services repository): "
+   su simulator -c "git pull"
+   
+   echo $"Starting SBE37 simulator 1: "
+   su simulator -c "while [ true ] ; do python2.7 SBE37_SMP_simulator.py --port=4001 &>> simulator.1.log; sleep 60; w | Mail -s 'sim 4001 died' wbollenbacher@ucsd.edu ; done" &
+   echo $"Starting SBE37 simulator 2: "
+   su simulator -c "while [ true ] ; do python2.7 SBE37_SMP_simulator.py --port=4002 --class SBE37_sine &>> simulator.2.log; sleep 60; w | Mail -s 'sim 4002 died' wbollenbacher@ucsd.edu ; done" &
+   echo $"Starting SBE37 simulator 3: "
+   su simulator -c "while [ true ] ; do python2.7 SBE37_SMP_simulator.py --port=4003 --class SBE37_sine &>> simulator.3.log; sleep 60; w | Mail -s 'sim 4003 died' wbollenbacher@ucsd.edu ; done" &
+   echo $"Starting SBE37 simulator 4: "
+   su simulator -c "while [ true ] ; do python2.7 SBE37_SMP_simulator.py --port=4004 --class SBE37_sine &>> simulator.4.log; sleep 60; w | Mail -s 'sim 4004 died' wbollenbacher@ucsd.edu ; done" &
+   echo $"Starting SBE37 simulator 5: "
+   su simulator -c "while [ true ] ; do python2.7 SBE37_SMP_simulator.py --port=4005 --class SBE37_sine &>> simulator.5.log; sleep 60; w | Mail -s 'sim 4005 died' wbollenbacher@ucsd.edu ; done" &
+   echo $"Starting SBE37 simulator 6: "
+   su simulator -c "while [ true ] ; do python2.7 SBE37_SMP_simulator.py --port=4006 &>> simulator.6.log; sleep 60; w | Mail -s 'sim 4006 died' wbollenbacher@ucsd.edu ; done" &
+
+   sleep 10
+   su simulator -c "ps aux | grep python" 
+   netstat -lpn | grep 400
+   echo $"completed starting SBE37 simulators"
+
+   return
+}      
+ 
+stop() {
+   echo $"Shutting down simulator: "
+   su simulator -c "killall bash &> /dev/null"
+   su simulator -c "killall python2.7 &> /dev/null"
+   return
+}    
+
+case "$1" in
+  start)
+        start
+        ;;
+  stop)
+        stop
+        ;;
+  restart)
+        stop
+        sleep 5
+        start
+        ;;
+  reload)
+        stop
+        start
+        ;;
+  *)
+        echo $"Usage: $prog {start|stop|restart|reload}"
+        exit 1
+esac
+ 
+exit $?

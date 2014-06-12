@@ -175,7 +175,21 @@ AGENT_SCHEMA_V1 = {
                 "description" : "Reset the agent to uninitialized mode.",
                 "args" : [],
                 "kwargs" : {}
-            }            
+            },
+        PlatformAgentCapability.RUN_MISSION :
+            {
+                "display_name" : "Run Mission",
+                "description" : "Commence mission execution.",
+                "args" : [],
+                "kwargs" : {}
+            },
+        PlatformAgentCapability.ABORT_MISSION :
+            {
+                "display_name" : "Abort Mission",
+                "description" : "Shutdown mission gracefully at next appropriate time.",
+                "args" : [],
+                "kwargs" : {}
+            },
         },
     "parameters" : {
         "streams" :
@@ -273,7 +287,14 @@ AGENT_SCHEMA_V1 = {
                         "value_map" : DeviceStatusType._value_map
                         }                    
                     }]
-                }
+                },
+        "mission":
+            {
+                "display_name" : "Mission.",
+                "description" : "Mission filename.",
+                "visibility" : "READ_WRITE",
+                "type" : "string"
+            }
         },
     "states" : {
         PlatformAgentState.UNINITIALIZED : {

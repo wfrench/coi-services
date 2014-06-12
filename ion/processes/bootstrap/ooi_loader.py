@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-"""Parses OOI SAF Instrument Application assets from CSV reports."""
+"""Parses OOI SAF Instrument Application assets from CSV reports and a mapping spreadsheet."""
 
 __author__ = 'Michael Meisinger'
 
@@ -10,7 +10,7 @@ import os.path
 import re
 import requests
 
-from pyon.public import log, iex
+from pyon.public import log, BadRequest
 from ion.core.ooiref import OOIReferenceDesignator
 from pyon.datastore.datastore import DatastoreManager, DataStore
 from ion.util.geo_utils import GeoUtils
@@ -21,7 +21,7 @@ DEFAULT_MAX_DATE = datetime.datetime(2020, 1, 1)
 class OOILoader(object):
     def __init__(self, process, container=None, asset_path=None, mapping_path=None):
         self.process = process
-        self.container = container or self.process.container
+        self.container = container or (self.process.container if process else None)
         self.asset_path = asset_path
         self.mapping_path = mapping_path or self.asset_path + "/OOIResourceMappings.xlsx"
         self._extracted = False
@@ -35,9 +35,9 @@ class OOILoader(object):
             return
 
         if not self.asset_path:
-            raise iex.BadRequest("Must provide path for assets: path=dir or assets=dir")
+            raise BadRequest("Must provide path for assets: path=dir or assets=dir")
         if self.asset_path.startswith('http'):
-            raise iex.BadRequest('Asset path must be local directory, not URL: ' + self.asset_path)
+            raise BadRequest('Asset path must be local directory, not URL: ' + self.asset_path)
 
         log.info("Parsing OOI assets from path=%s", self.asset_path)
 
@@ -68,10 +68,14 @@ class OOILoader(object):
                        'MAP:Subsites',
                        'MAP:NodeType',
                        'MAP:Nodes',
+                       'MAP:Instruments',
                        'MAP:PlatformAgents',
                        'MAP:Series',
                        'MAP:InstAgents',
                        'MAP:DataAgents',
+                       'MAP:AgentMap',
+                       'MAP:ModelMap',
+                       'MAP:DPS',
         ]
 
         # Holds the object representations of parsed OOI assets by type
@@ -107,7 +111,7 @@ class OOILoader(object):
                 reader = csv.DictReader(csv_doc, delimiter=',')
             else:
                 filename = "%s/%s.csv" % (self.asset_path, category)
-                log.debug("Loading category %s from file %s", category, filename)
+                #log.debug("Loading category %s from file %s", category, filename)
                 try:
                     csvfile = open(filename, "rb")
                     for i in xrange(9):
@@ -134,8 +138,8 @@ class OOILoader(object):
         if self.warnings:
             log.warn("WARNINGS:\n%s", "\n".join(["%s: %s" % (a, b) for a, b in self.warnings]))
 
-        for ot, oo in self.ooi_objects.iteritems():
-            log.info("Type %s has %s entries", ot, len(oo))
+        log.info("Found entries: %s", ", ".join(["%s: %s" % (ot, len(self.ooi_objects[ot])) for ot in sorted(self.ooi_objects.keys())]))
+
             #import pprint
             #pprint.pprint(oo)
             #log.debug("Type %s has %s attributes", ot, self.ooi_obj_attrs[ot])
@@ -147,16 +151,14 @@ class OOILoader(object):
     def get_type_assets(self, objtype):
         return self.ooi_objects.get(objtype, {})
 
-    def _add_object_attribute(self, objtype, objid, key, value, value_is_list=False, list_dup_ok=False, change_ok=False, mapping=None, **kwargs):
+    def _add_object_attribute(self, objtype, objid, key, value, value_is_list=False, list_dup_ok=False, change_ok=False, list_sort=True, mapping=None, **kwargs):
         """
         Add a single attribute to an identified object of given type. Create object/type on first occurrence.
         The kwargs are static attributes"""
-        if objtype not in self.ooi_objects:
-            self.ooi_objects[objtype] = {}
-        ot_objects = self.ooi_objects[objtype]
-        if objtype not in self.ooi_obj_attrs:
-            self.ooi_obj_attrs[objtype] = set()
-        ot_obj_attrs = self.ooi_obj_attrs[objtype]
+        if not objid:
+            raise Exception("Empty ID")
+        ot_objects = self.ooi_objects.setdefault(objtype, {})
+        ot_obj_attrs = self.ooi_obj_attrs.setdefault(objtype, set())
 
         if objid not in ot_objects:
             ot_objects[objid] = dict(id=objid)
@@ -171,7 +173,8 @@ class OOILoader(object):
                             self.warnings.append((objid, msg))
                     else:
                         obj_entry[key].append(value)
-                        obj_entry[key].sort()
+                        if list_sort:
+                            obj_entry[key].sort()
                 else:
                     obj_entry[key] = [value]
             elif key in obj_entry and not change_ok:
@@ -212,7 +215,7 @@ class OOILoader(object):
             return
         self._add_object_attribute('class',
             ooi_rd.rd, row['Attribute'], row['AttributeValue'],
-            mapping={'Description':'description'},
+            mapping={'Description':'description', 'Alternate Instrument Class Name':'alt_name'},
             name=row['Class_Name'])
 
     def _parse_AttributeReportDataProducts(self, row):
@@ -460,6 +463,9 @@ class OOILoader(object):
                                    name, None, None, **coord_dict)
 
     def _parse_Nodes(self, row):
+        """Asset mappings override for SAF nodes"""
+        if row.get('Ignore', None) == "Yes":
+            return
         ooi_rd = row['Reference ID']
         name=row['Full Name']
         local_name = row['Name Extension']
@@ -470,15 +476,33 @@ class OOILoader(object):
             platform_config_type=row['Platform Configuration Type'],
             platform_agent_type=row['Platform Agent Type'],
             is_platform=row['Platform Reference ID'] == ooi_rd,
+            in_saf=row['SAF'] != "No",
             self_port=row['Self Port'],
             uplink_node=row['Uplink Node'],
             uplink_port=row['Uplink Port'],
-            deployment_start=row['Start Deployment Cruise'],
+            deployment_start=row['Start Deployment Cruise'],  # The column type is date. We get it as yyyy-mm-dd
+            clone_rd=row.get('Clone', None),
+            in_mapping=True,
         )
+        if row['Push'] == "Yes" and not row.get('Clone', None):  # Make it break if run with an outdated preload sheet!!
+            node_entry["deployment_start"] = "2019-01-01"   # This pushes the node out in deploy date (different from unset)
+
         self._add_object_attribute('node',
             ooi_rd, None, None, **node_entry)
         self._add_object_attribute('node',
             ooi_rd, 'name', name, change_ok=True)
+
+        node_entry = {}
+        if row["lat"] or row["lon"] or row["depth"]:
+            #log.debug("Use updated geospatial info from mapping spreadsheet for %s", ooi_rd)
+            if row["lat"]:
+                node_entry["latitude"] = row["lat"]
+            if row["lon"]:
+                node_entry["longitude"] = row["lon"]
+            if row["depth"]:
+                node_entry["depth_subsite"] = row["depth"]
+            self._add_object_attribute('node',
+                ooi_rd, None, None, change_ok=True, **node_entry)
 
         # Determine on which arrays the nodetype is used
         self._add_object_attribute('nodetype',
@@ -487,14 +511,43 @@ class OOILoader(object):
     def _parse_NodeType(self, row):
         code = row['Code']
         name = row['Name']
+        comp_name = row['Composite Name']
         pa_code = row['PA Code']
+        platform_family = row['Platform Family']
+        platform_type = row['Platform Type']
 
-        # Only add new stuff from spreadsheet
-        if code not in self.ooi_objects['nodetype']:
-            self._add_object_attribute('nodetype',
-                code, None, None, name=name)
         self._add_object_attribute('nodetype',
-            code, None, None, pa_code=pa_code)
+            code, None, None, name=name, change_ok=True)
+        self._add_object_attribute('nodetype',
+            code, None, None, pa_code=pa_code, platform_family=platform_family, platform_type=platform_type, comp_name=comp_name)
+
+    def _parse_Instruments(self, row):
+        """Asset mappings override for SAF instruments (reference designators)"""
+        if row.get('Ignore', None) == "Yes":
+            return
+        ooi_rd = row['Reference ID']
+        entry = dict(
+            deployment_start=row['First Deploy Date'],  # Column data type is date. Parsed in yyyy-mm-dd
+            clone_rd=row.get('Clone', None),
+        )
+        if row['Push'] == "Yes":
+            entry["deployment_start"] = "2019-02-01"
+
+        self._add_object_attribute('instrument',
+            ooi_rd, None, None, **entry)
+
+        entry = {}
+        if row["lat"] or row["lon"] or row["depth_min"] or row["depth_max"]:
+            if row["lat"]:
+                entry["latitude"] = row["lat"]
+            if row["lon"]:
+                entry["longitude"] = row["lon"]
+            if row["depth_min"]:
+                entry["depth_port_min"] = row["depth_min"]
+            if row["depth_max"]:
+                entry["depth_port_max"] = row["depth_max"]
+            self._add_object_attribute('instrument',
+                ooi_rd, None, None, change_ok=True, **entry)
 
     def _parse_PlatformAgents(self, row):
         code = row['Code']
@@ -524,7 +577,11 @@ class OOILoader(object):
         first_avail = row['First Availability']
 
         if len(series) != 1:
-            log.warn("Ignoring Series row %s-%s", code, series)
+            log.warn("Ignoring asset mappings Series row %s-%s - not a valid code", code, series)
+            return
+        if series_rd not in self.get_type_assets("series"):
+            # This will allow OOI Preload spreadsheet to move ahead of current SAF export
+            log.warn("Ignoring asset mappings Series %s-%s - not in current SAF export", code, series)
             return
 
         entry = dict(
@@ -561,19 +618,63 @@ class OOILoader(object):
 
     def _parse_InstAgents(self, row):
         agent_code = row['Agent Code']
-        self._add_object_attribute('instagent',
-                                   agent_code, None, None,
-                                   active=row['Active'] == "Yes",
-                                   present=row['Present'] == "Yes",
-                                   parsed_sc=row['Parsed SC'])
+        if agent_code:
+            self._add_object_attribute('instagent',
+                                       agent_code, None, None,
+                                       active=row['Active'] == "Yes",
+                                       present=row['Present'] == "Yes")
 
     def _parse_DataAgents(self, row):
         agent_code = row['Agent Code']
-        self._add_object_attribute('dataagent',
-                                   agent_code, None, None,
-                                   active=row['Active'] == "Yes",
-                                   present=row['Present'] == "Yes",
-                                   parsed_sc=row['Parsed SC'])
+        if agent_code:
+            self._add_object_attribute('dataagent',
+                                       agent_code, None, None,
+                                       active=row['Active'] == "Yes",
+                                       present=row['Present'] == "Yes")
+
+    def _parse_AgentMap(self, row):
+        series = row['Instrument Series']
+        node_type = row['Node Type']
+        agent_code = row['Agent Code']
+
+        mapping = [agent_code, row['RD Prefix']]
+
+        if series and series in self.get_type_assets("series"):
+            self._add_object_attribute('series',
+                series, 'agentmap', mapping, value_is_list=True, list_sort=False)
+
+            if agent_code in self.get_type_assets('dataagent'):
+                self._add_object_attribute('dataagent',
+                                           agent_code, 'series_list', series, value_is_list=True, list_dup_ok=True)
+                self._add_object_attribute('dataagent',
+                                           agent_code, None, None, inst_class=series[:5])
+            if agent_code in self.get_type_assets('instagent'):
+                self._add_object_attribute('instagent',
+                                           agent_code, 'series_list', series, value_is_list=True, list_dup_ok=True)
+                self._add_object_attribute('instagent',
+                                           agent_code, None, None, inst_class=series[:5])
+
+        if node_type and node_type in self.get_type_assets("nodetype"):
+            self._add_object_attribute('nodetype',
+                node_type, 'agentmap', mapping, value_is_list=True, list_sort=False)
+
+
+    def _parse_ModelMap(self, row):
+        series = row['Instrument Series']
+        self._add_object_attribute('modelmap',
+                                   series, None, None,
+                                   primary_series=row['Primary Series'])
+
+    def _parse_DPS(self, row):
+        code = row['Code']
+        ref_type=row['Ref Type']
+        document_name=row['Document Name']
+        variant=row['Variant']
+        if ref_type and code:
+            self._add_object_attribute('datalink',
+                                       code, ref_type, row['URL'], value_is_list=True)
+            self._add_object_attribute('datalink',
+                                       code, ref_type + "_doc", document_name, value_is_list=True)
 
     # ---- Post-processing and validation ----
 
@@ -649,6 +750,72 @@ class OOILoader(object):
             raise Exception("Invalid date string: %s" % datestr)
         return res_date
 
+    def _get_child_devices(self):
+        """Returns a dict of device to child device ids (nodes and instruments)"""
+        node_objs = self.get_type_assets("node")
+        inst_objs = self.get_type_assets("instrument")
+
+        res_tree = {}
+
+        for node_id, node_obj in node_objs.iteritems():
+            parent_id = node_obj.get("parent_id", None)
+            if node_id != parent_id:
+                res_tree.setdefault(parent_id, []).append(node_id)
+        for inst_id, inst_obj in inst_objs.iteritems():
+            ooi_rd = OOIReferenceDesignator(inst_id)
+            res_tree.setdefault(ooi_rd.node_rd, []).append(inst_id)
+
+        return res_tree
+
+    @classmethod
+    def is_cabled(cls, ooi_rd):
+        """Returns True if given RD is associated with the cabled infrastructure"""
+        if isinstance(ooi_rd, str):
+            ooi_rd = OOIReferenceDesignator(ooi_rd)
+        return ooi_rd.marine_io == "RSN" or ooi_rd.subsite_rd == "CE02SHBP" or ooi_rd.subsite_rd == "CE04OSBP"
+
+    @classmethod
+    def is_dataagent(cls, ooi_rd):
+        """Returns True if given RD is serviced by a dataset agent"""
+        if isinstance(ooi_rd, str):
+            ooi_rd = OOIReferenceDesignator(ooi_rd)
+        cabled = cls.is_cabled(ooi_rd)
+        if not cabled:
+            return True
+        if ooi_rd.inst_class in {"HYDBB", "HYDLF", "OBSBB", "OBSBK", "OBSSP", "FLOBN", "OSMOI"}:
+            return True
+        return False
+
+    def get_agent_code(self, ooi_rd):
+        # TODO: This mirrors the get_agent_definition() in the ion_loader - redundancy
+        if isinstance(ooi_rd, str):
+            ooi_rd = OOIReferenceDesignator(ooi_rd)
+        nodetype_objs = self.get_type_assets("nodetype")
+        series_objs = self.get_type_assets("series")
+
+        if ooi_rd.rd_type == "asset" and ooi_rd.rd_subtype == "instrument":
+            series_obj = series_objs[ooi_rd.series_rd]
+            agent_map = series_obj.get("agentmap", [])
+        elif ooi_rd.rd_type == "asset" and ooi_rd.rd_subtype == "node":
+            nodetype_obj = nodetype_objs[ooi_rd.node_type]
+            agent_map = nodetype_obj.get("agentmap", [])
+        else:
+            raise BadRequest("Must provide instrument or node RD: %s" % ooi_rd.rd)
+
+        is_da = self.is_dataagent(ooi_rd)
+        if agent_map:
+            for agent_id, rd_prefix in agent_map:
+                if ooi_rd.rd.startswith(rd_prefix):
+                    return agent_id
+
+        if ooi_rd.rd_subtype == "instrument":
+            return series_obj["dart_code"] if is_da else series_obj["ia_code"]
+        elif ooi_rd.rd_subtype == "node":
+            pa_code = nodetype_obj.get("pa_code", None)
+            if pa_code:
+                return pa_code
+            return "DART_" + ooi_rd.node_type if is_da else ooi_rd.node_type
+
     def _post_process(self):
         node_objs = self.get_type_assets("node")
         nodetypes = self.get_type_assets('nodetype')
@@ -692,15 +859,31 @@ class OOILoader(object):
             osite.update(bbox)
             osite['rd'] = site_rd_list[0]
 
+        self.child_devices = self._get_child_devices()
+
         # Post-process "node" objects:
         # - Make sure all nodes have a name, geospatial coordinates and platform agent connection info
         # - Convert available node First Deploy Date and override date into datetime objects
         for node_id, node_obj in node_objs.iteritems():
+            if not node_obj.get("in_mapping", False):
+                log.warn("Node %s has no entry in mapping spreadsheet", node_id)
             if not node_obj.get('name', None):
                 name = subsites[node_id[:8]]['name'] + " - " + nodetypes[node_id[9:11]]['name']
                 node_obj['name'] = name
             if not node_obj.get('latitude', None):
-                pass
+                # Get bbox from child devices
+                ch_nodes = self.child_devices.get(node_id, [])  # This gets child nodes and instruments
+                node_lats = [float(node_objs[nid]["latitude"]) for nid in ch_nodes if node_objs[nid].get("latitude", None)]
+                node_lons = [float(node_objs[nid]["longitude"]) for nid in ch_nodes if node_objs[nid].get("longitude", None)]
+                node_deps = [float(node_objs[nid]["depth_subsite"]) for nid in ch_nodes if node_objs[nid].get("depth_subsite", None)]
+                if not node_obj.get("latitude", None) and node_lats:
+                    node_obj["latitude"] = str(min(node_lats)) + "," + str(max(node_lats))
+                if not node_obj.get("longitude", None) and node_lons:
+                    node_obj["longitude"] = str(min(node_lons)) + "," + str(max(node_lons))
+                if not node_obj.get("depth_subsite", None) and node_deps:
+                    node_obj["depth_subsite"] = str(min(node_deps)) + "," + str(max(node_deps))
+            if not node_obj.get('latitude', None):
+                log.warn("Node %s has no geospatial info", node_id)
 
             pagent_type = node_obj.get('platform_agent_type', "")
             pagent_obj = pagent_objs.get(pagent_type, None)
@@ -714,8 +897,13 @@ class OOILoader(object):
 
             if 'deployment_start' not in node_obj:
                 log.warn("Node %s appears not in mapping spreadsheet - inconsistency?!", node_id)
+            if not node_obj['in_saf']:
+                # Get date from SAF subsite
+                subsite_obj = subsites[node_id[:8]]
+                node_deploy_date = subsite_obj.get('First Deployment Date', None)
+            else:
                 # Parse SAF date
-            node_deploy_date = node_obj.get('First Deployment Date', None)
+                node_deploy_date = node_obj.get('First Deployment Date', None)
             node_obj['SAF_deploy_date'] = self._parse_date(node_deploy_date, DEFAULT_MAX_DATE)
             # Parse override date if available or set to SAF date
             node_obj['deploy_date'] = self._parse_date(node_obj.get('deployment_start', None), node_obj['SAF_deploy_date'])
@@ -732,7 +920,7 @@ class OOILoader(object):
             inst_rd = OOIReferenceDesignator(inst_id)
             # Parse override date if available or set to SAF date
             inst_obj['SAF_deploy_date'] = self._parse_date(inst_obj.get('First Deployment Date', None), DEFAULT_MAX_DATE)
-            inst_obj['deploy_date'] = inst_obj['SAF_deploy_date']
+            inst_obj['deploy_date'] = self._parse_date(inst_obj.get('deployment_start', None), inst_obj['SAF_deploy_date'])
 
             # Set instrument connection info based on node platform agent connection and instrument agent
             series_obj = series_objs[inst_rd.series_rd]
@@ -742,14 +930,70 @@ class OOILoader(object):
             pagent_type = node_obj['platform_agent_type']
             pagent_obj = pagent_objs[pagent_type]
 
-            instrument_agent_rt = (pagent_obj['rt_data_path'] == "Direct") and series_obj['ia_exists']
-            data_agent_rt = (pagent_obj['rt_data_path'] == "File Transfer") and series_obj['dart_exists']
-            data_agent_recovery = pagent_obj['rt_data_acquisition'] == "Partial" or not (series_obj['ia_exists'] or series_obj['dart_exists'])
-            inst_obj['ia_rt_data'] = instrument_agent_rt
-            inst_obj['da_rt'] = data_agent_rt
-            inst_obj['da_pr'] = data_agent_recovery
+            # Make sure geospatial values are set or inherited from node
+            inst_obj['latitude'] = inst_obj['latitude'] or node_obj['latitude']
+            inst_obj['longitude'] = inst_obj['longitude'] or node_obj['longitude']
+            inst_obj['depth_port_min'] = inst_obj['depth_port_min'] or node_obj['depth_subsite'].split(",", 1)[0]
+            inst_obj['depth_port_max'] = inst_obj['depth_port_max'] or node_obj['depth_subsite'].split(",", 1)[-1]
 
+        # Create SAF node clones with all instruments
+        new_nodes, new_insts = [], []
+        for node_id, node_obj in node_objs.iteritems():
+            clone_rdstr = node_obj.get("clone_rd", None)
+            if not clone_rdstr:
+                continue
+            node_rd = OOIReferenceDesignator(node_id)
+            # The parent clone object is already in the node list because of the assetmappings row
+            clone_obj = node_objs.get(clone_rdstr, None)
+            if not clone_obj:
+                log.warn("Node %s: clone node %s not found!", node_id, clone_rdstr)
+                continue
+            log.info("Cloning node %s from %s, recursively", node_id, clone_rdstr)
+            # Set attributes from clone unless already present
+            node_obj.update({k: v for k, v in clone_obj.iteritems() if not node_obj.get(k, None)})
+            # Recursively clone child devices
+            def clone_child(chdev):
+                if chdev in inst_objs:
+                    chdev_obj = inst_objs[chdev]
+                    clonech_obj = chdev_obj.copy()
+                    new_insts.append(clonech_obj)
+                elif chdev in node_objs:
+                    # chdev_obj = node_objs[chdev]
+                    # clonech_obj = chdev_obj.copy()
+                    # new_nodes.append(clonech_obj)
+                    raise BadRequest("Cannot clone platform with child nodes")
+                else:
+                    raise BadRequest("Child device not found: %s" % chdev)
+                # Build new child RD - not trivial
+                clonech_rdstr = "%s-%s" % (node_rd.node_rd, clonech_obj["id"][15:])
+                clonech_obj["id"] = clonech_rdstr
+                log.debug("Cloning %s into %s", chdev, clonech_rdstr)
 
+                # Recurse child devices
+                for chdev1 in self.child_devices.get(chdev, []):
+                    clone_child(chdev1)
+            for chdev in self.child_devices.get(clone_rdstr, []):
+                clone_child(chdev)
+
+        # Create SAF instrument clones
+        for inst_id, inst_obj in inst_objs.iteritems():
+            clone_rdstr = inst_obj.get("clone_rd", None)
+            if not clone_rdstr:
+                continue
+            inst_rd = OOIReferenceDesignator(inst_id)
+            # The clone object is already in the node list because of the assetmappings row
+            clone_obj = inst_objs.get(clone_rdstr, None)
+            if not clone_obj:
+                log.warn("Instrument %s: clone instrument %s not found!", inst_id, clone_rdstr)
+                continue
+            log.info("Cloning instrument %s from %s", inst_id, clone_rdstr)
+            inst_obj.update({k: v for k, v in clone_obj.iteritems() if not inst_obj.get(k, None)})
+
+        # Add clones to list of instruments
+        if new_nodes or new_insts:
+            node_objs.update({no["id"]: no for no in new_nodes})
+            inst_objs.update({io["id"]: io for io in new_insts})
+            self.child_devices = self._get_child_devices()
 
     def get_marine_io(self, ooi_rd_str):
         ooi_rd = OOIReferenceDesignator(ooi_rd_str)
@@ -832,6 +1076,7 @@ class OOILoader(object):
         inst_objs = self.get_type_assets("instrument")
         series_objs = self.get_type_assets("series")
         instagent_objs = self.get_type_assets("instagent")
+        dataagent_objs = self.get_type_assets("dataagent")
         pagent_objs = self.get_type_assets("platformagent")
 
         deploy_platforms = {}
@@ -916,46 +1161,54 @@ class OOILoader(object):
                     inst_rd = OOIReferenceDesignator(inst_id)
                     patype = node_objs[node_id]['platform_agent_type']
                     deploy_date = inst_obj.get('deploy_date', DEFAULT_MAX_DATE)
-                    series_obj = series_objs[inst_rd.series_rd]
-                    iatype = series_obj.get('ia_code', None)
-                    instagent_obj = instagent_objs[iatype] if iatype else None
+                    iatype, datype = None, None
+                    is_data = self.is_dataagent(inst_rd)
+                    if is_data:
+                        datype = self.get_agent_code(inst_rd)
+                        dataagent_obj = dataagent_objs[datype] if datype else None
+                        acode = datype if datype else "undefined"
+                    else:
+                        iatype = self.get_agent_code(inst_rd)
+                        instagent_obj = instagent_objs[iatype] if iatype else None
+                        acode = iatype if iatype else "undefined"
+
                     di_dict = dict(
+                        is_data=is_data,
+                        acode=acode,
                         series=inst_rd.series_rd,
                         patype=patype,
                         series_patype=patype + ":" + inst_rd.series_rd,
                         iatype=iatype,
-                        iart=inst_obj['ia_rt_data'],
                         ia_ready=instagent_obj['present'] if iatype else False,
                         ia_active=instagent_obj['active'] if iatype else False,
-                        ia_sc=bool(instagent_obj['parsed_sc']) if iatype else False,
-                        dart=inst_obj['da_rt'],
-                        dapr=inst_obj['da_pr'],
+                        da_ready=dataagent_obj['present'] if datype else False,
+                        da_active=dataagent_obj['active'] if datype else False,
                         )
                     qualifiers = []
-                    if di_dict['iart']: qualifiers.append("IA")
-                    if di_dict['dart']: qualifiers.append("DA_RT")
-                    if di_dict['dapr']: qualifiers.append("DA_POST")
-                    if iatype and di_dict['iart'] and not di_dict['ia_ready']: qualifiers.append("IA_NOT_READY")
-                    if iatype and di_dict['iart'] and not di_dict['ia_active']: qualifiers.append("IA_NOT_ACTIVE")
-                    if iatype and di_dict['iart'] and di_dict['ia_active'] and not di_dict['ia_sc']: qualifiers.append('STREAM_CONF_UNDEF')
+                    if is_data:
+                        if datype and not di_dict['da_ready']: qualifiers.append("NOT_READY")
+                        if datype and not di_dict['da_active']: qualifiers.append("NOT_ACTIVE")
+                    else:
+                        if iatype and not di_dict['ia_ready']: qualifiers.append("NOT_READY")
+                        if iatype and not di_dict['ia_active']: qualifiers.append("NOT_ACTIVE")
 
                     if not end_date or deploy_date <= end_date:
                         deploy_instruments[inst_id] = di_dict
                         self._asset_counts["instd"] += 1
                         inst_series.add((inst_rd.series_rd, None))
-                        inst_lines.append((2, "%s               +-%s: %s" % (
-                            "  " * level, inst_id, ", ".join(qualifiers))))
+                        inst_lines.append((2, "%s               +-%s: %s %s (%s)" % (
+                            "  " * level, inst_id, "DA" if is_data else "IA", acode, ", ".join(qualifiers))))
                     else:
                         qualifiers.insert(0, "DEPLOY_POSTPONED")
                         self._asset_counts["insti"] += 1
-                        inst_lines.append((2, "%s               +-%s: %s" % (
-                            "  " * level, inst_id, ", ".join(qualifiers))))
+                        inst_lines.append((2, "%s               +-%s: %s %s (%s)" % (
+                            "  " * level, inst_id, "DA" if is_data else "IA", acode, ", ".join(qualifiers))))
 
                     for dp in inst_obj.get("data_product_list", []):
                         if dp not in deploy_dataproducts:
                             deploy_dataproducts[dp] = []
                         deploy_dataproducts[dp].append(inst_id)
-                        dpt,_ = dp.split("_")
+                        dpt,_ = dp.rsplit("_", 1)
                         if dpt not in deploy_dataproducttypes:
                             deploy_dataproducttypes[dpt] = set()
                         deploy_dataproducttypes[dpt].add(inst_rd.series_rd)
@@ -969,17 +1222,38 @@ class OOILoader(object):
                     deploy_date = ch_obj.get('deploy_date', DEFAULT_MAX_DATE)
                     if not end_date or deploy_date <= end_date:
                         self._asset_counts["node"] += 1
+                        chnode_id = ch_obj['id']
+                        chnode_rd = OOIReferenceDesignator(chnode_id)
+                        is_data = self.is_dataagent(chnode_rd)
+                        if is_data:
+                            datype = self.get_agent_code(chnode_rd)
+                            acode = datype if datype else "undefined"
+                        else:
+                            patype = self.get_agent_code(chnode_rd)
+                            acode = patype if patype else "undefined"
+
                         inst_lines, inst_series = follow_node_inst(ch_id, level)
-                        report_lines.append((1, "%s             +-%s %s %s: %s" % ("  "*level, ch_obj['id'],
+                        inst_series_list = ", ".join([i for i,p in sorted(list(inst_series))])
+                        report_lines.append((1, "%s             +-%s %s %s: %s %s (%s)" % ("  "*level, chnode_id,
                                                                                    ch_obj['name'], ch_obj.get('platform_agent_type', ""),
-                                                                                   ", ".join([i for i,p in sorted(list(inst_series))]))))
+                                                                                   "DA" if is_data else "PA", acode, inst_series_list)))
                         report_lines.extend(inst_lines)
                         follow_child_nodes(level+1, platform_children.get(ch_id,None))
 
+            pnode_id = ooi_obj['id']
+            pnode_rd = OOIReferenceDesignator(pnode_id)
+            is_data = self.is_dataagent(pnode_rd)
+            if is_data:
+                datype = self.get_agent_code(pnode_rd)
+                acode = datype if datype else "undefined"
+            else:
+                patype = self.get_agent_code(pnode_rd)
+                acode = patype if patype else "undefined"
             inst_lines, inst_series = follow_node_inst(ooi_obj['id'], 0)
-            report_lines.append((0, "  %s %s %s %s: %s" % (ooi_obj['deployment_start'], ooi_obj['id'], ooi_obj['name'],
+            inst_series_list = ", ".join([i for i,p in sorted(list(inst_series))])
+            report_lines.append((0, "  %s %s %s %s: %s %s (%s)" % (ooi_obj['deploy_date'].strftime('%Y-%m-%d'), pnode_id, ooi_obj['name'],
                                                            ooi_obj.get('platform_agent_type', ""),
-                                                           ", ".join([i for i,p in sorted(list(inst_series))]))))
+                                                           "DA" if is_data else "PA", acode, inst_series_list)))
             report_lines.extend(inst_lines)
 
             follow_child_nodes(0, platform_children.get(ooi_obj['id'], None))
@@ -1016,9 +1290,9 @@ class OOILoader(object):
             report_lines.append((1, "    %s: (%s) %s" % (patype, len(series), ",".join(series))))
         report_lines.append((0, "  Data product types: (%s) %s" % (len(deploy_dataproducttypes), ",".join(sorted(deploy_dataproducttypes.keys())))))
         report_lines.append((0, "  Data product variants: (%s) %s" % (len(deploy_dataproducts), ",".join(sorted(deploy_dataproducts.keys())))))
-        for dpt in sorted(deploy_dataproducttypes.keys()):
-            dpt_series = deploy_dataproducttypes[dpt]
-            report_lines.append((1, "    %s: (%s) %s" % (dpt, len(dpt_series), ",".join(sorted(dpt_series)))))
+        # for dpt in sorted(deploy_dataproducttypes.keys()):
+        #     dpt_series = deploy_dataproducttypes[dpt]
+        #     report_lines.append((1, "    %s: (%s) %s" % (dpt, len(dpt_series), ",".join(sorted(dpt_series)))))
 
 
 

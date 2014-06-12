@@ -114,6 +114,7 @@ class BaseHighAvailabilityAgentTest(IonIntegrationTestCase):
         self.container_client = ContainerAgentClient(node=self.container.node,
             name=self.container.name)
         self._spawn_haagent()
+        self.addCleanup(self._stop_haagent)
 
         self._setup_haa_client()
 
@@ -153,7 +154,7 @@ class BaseHighAvailabilityAgentTest(IonIntegrationTestCase):
     def _kill_haagent(self):
         self.container.terminate_process(self._haa_pid)
 
-    def tearDown(self):
+    def _stop_haagent(self):
 
         new_policy = {'preserve_n': 0}
         self.haa_client.reconfigure_policy(new_policy)
@@ -162,12 +163,21 @@ class BaseHighAvailabilityAgentTest(IonIntegrationTestCase):
         self.assertEqual(len(self.get_running_procs()), 0)
 
         self.waiter.stop()
+        # Going in for an extra kill if pthread is stilling running
+        ha_proc = self.container.proc_manager.procs.get(self._haa_pid, None)
+        pthread = None
+        if ha_proc:
+            pthread = ha_proc.policy_thread
         try:
             self._kill_haagent()
         except BadRequest:
-            log.warning("Couldn't terminate HA Agent in teardown (May have been terminated by a test)")
-        self.container.resource_registry.delete(self.service_def_id, del_associations=True)
-        self._stop_container()
+            log.exception("Couldn't terminate HA Agent in teardown (May have been terminated by a test)")
+            if pthread:
+                pthread.kill()
+            raise
+        finally:
+            self.container.resource_registry.delete(self.service_def_id, del_associations=True)
+            self._stop_container()
 
     def get_running_procs(self):
         """returns a normalized set of running procs (removes the ones that
@@ -733,9 +743,21 @@ class HighAvailabilityAgentSensorPolicyTest(IonIntegrationTestCase):
         self.assertEqual(len(self.get_running_procs()), 0)
 
         self.waiter.stop()
-        self.container.terminate_process(self._haa_pid)
-        self._stop_webserver()
-        self._stop_container()
+        # Going in for an extra kill if pthread is stilling running
+        ha_proc = self.container.proc_manager.procs.get(self._haa_pid, None)
+        pthread = None
+        if ha_proc:
+            pthread = ha_proc.policy_thread
+        try:
+            self.container.terminate_process(self._haa_pid)
+        except BadRequest:
+            log.exception("Couldn't terminate HA Agent in teardown (May have been terminated by a test)")
+            raise
+        finally:
+            if pthread:
+                pthread.kill()
+            self._stop_webserver()
+            self._stop_container()
 
     def get_running_procs(self):
         """returns a normalized set of running procs (removes the ones that

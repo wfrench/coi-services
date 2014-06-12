@@ -130,7 +130,7 @@ class PubsubManagementService(BasePubsubManagementService):
 
     #--------------------------------------------------------------------------------
     
-    def create_stream(self, name='', exchange_point='', topic_ids=None, credentials=None, stream_definition_id='', description=''):
+    def create_stream(self, name='', exchange_point='', topic_ids=None, credentials=None, stream_definition_id='', description='', stream_name='', stream_type=''):
         # Argument Validation
         if name and self.clients.resource_registry.find_resources(restype=RT.Stream, name=name, id_only=True)[0]:
             raise Conflict("The named stream '%s' already exists on XP '%s'" % (name, exchange_point))
@@ -172,6 +172,8 @@ class PubsubManagementService(BasePubsubManagementService):
         stream.stream_route.routing_key = routing_key
         #@todo: validate credentials
         stream.stream_route.credentials = credentials
+        stream.stream_name = stream_name
+        stream.stream_type = stream_type
 
         stream_id, rev = self.clients.resource_registry.create(stream)
 
@@ -377,7 +379,7 @@ class PubsubManagementService(BasePubsubManagementService):
         if self.subscription_is_active(subscription_id):
             raise BadRequest('Clients can not delete an active subscription.')
 
-        xn_objs, assocs = self.clients.resource_registry.find_subjects(object=subscription_id, predicate=PRED.hasSubscription, id_only=False)
+        xn_objs, assocs = self.clients.resource_registry.find_subjects(object=subscription_id, predicate=PRED.hasSubscription, subject_type=RT.ExchangeName, id_only=False)
         if len(xn_objs) > 1:
             log.warning('Subscription %s was attached to multiple queues')
         self._deassociate_subscription(subscription_id)

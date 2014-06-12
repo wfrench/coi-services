@@ -90,12 +90,6 @@ class TestDriverEgg(IonIntegrationTestCase):
 
 
 
-    def get_datastore(self, dataset_id):
-        dataset = self.datasetclient.read_dataset(dataset_id)
-        datastore_name = dataset.datastore_name
-        datastore = self.container.datastore_manager.get_datastore(datastore_name, DataStore.DS_PROFILE.SCIDATA)
-        return datastore
-
     def get_streamConfigs(self):
         raw_config = StreamConfiguration(stream_name='raw',
                                          parameter_dictionary_name='ctd_raw_param_dict')
@@ -242,9 +236,6 @@ class TestDriverEgg(IonIntegrationTestCase):
                                                                                instAgent_id,
                                                                                instDevice_id)
 
-        tdom, sdom = time_series_domain()
-        sdom = sdom.dump()
-        tdom = tdom.dump()
 
 
         parsed_pdict_id = self.dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict',
@@ -264,9 +255,7 @@ class TestDriverEgg(IonIntegrationTestCase):
 
         dp_obj = IonObject(RT.DataProduct,
                            name='the parsed data',
-                           description='ctd stream test',
-                           temporal_domain = tdom,
-                           spatial_domain = sdom)
+                           description='ctd stream test')
 
         data_product_id1 = self.dpclient.create_data_product(data_product=dp_obj, stream_definition_id=parsed_stream_def_id)
         print  'new dp_id = %s' % data_product_id1
@@ -284,15 +273,11 @@ class TestDriverEgg(IonIntegrationTestCase):
         dataset_ids, _ = self.rrclient.find_objects(data_product_id1, PRED.hasDataset, RT.Dataset, True)
         print  'Data set for data_product_id1 = %s' % dataset_ids[0]
         self.parsed_dataset = dataset_ids[0]
-        #create the datastore at the beginning of each int test that persists data
-        self.get_datastore(self.parsed_dataset)
 
 
         dp_obj = IonObject(RT.DataProduct,
                            name='the raw data',
-                           description='raw stream test',
-                           temporal_domain = tdom,
-                           spatial_domain = sdom)
+                           description='raw stream test')
 
         data_product_id2 = self.dpclient.create_data_product(data_product=dp_obj,
                                                              stream_definition_id=raw_stream_def_id)

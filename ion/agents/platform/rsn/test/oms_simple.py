@@ -1,5 +1,8 @@
 #!/usr/bin/env python
 
+# NOTE(2014-05-23):  This program has not been run now for several months.
+# Need to coordinate with RSN before attempting to run it again.
+
 """
 @package ion.agents.platform.rsn.test.oms_simple
 @file    ion/agents/platform/rsn/test/oms_simple.py
@@ -21,7 +24,8 @@ __author__ = 'Carlos Rueda'
 __license__ = 'Apache 2.0'
 
 
-from ion.agents.platform.rsn.oms_event_listener import OmsEventListener
+from pyon.public import log
+from gevent.pywsgi import WSGIServer
 from ion.agents.platform.responses import InvalidResponse
 from pyon.util.breakpoint import breakpoint
 
@@ -29,6 +33,167 @@ import xmlrpclib
 import sys
 import pprint
 import socket
+import yaml
+import os
+
+
+#
+# OmsEventListener: Almost exact copy from a previous version of
+# ion/agents/platform/rsn/oms_event_listener.py which was later on changed
+# to listen to the relayed OMSDeviceStatusEvent's by the service gateway.
+# Some comments in the code may not be relevant anymore.
+#
+class OmsEventListener(object):
+    """
+    HTTP server to get RSN OMS event notifications and do corresponding
+    notifications to driver/agent via callback.
+    """
+
+    def __init__(self, platform_id, notify_driver_event):
+        """
+        Creates a listener.
+
+        @param notify_driver_event callback to notify event events. Must be
+                                    provided.
+        """
+
+        self._platform_id = platform_id
+        self._notify_driver_event = notify_driver_event
+
+        self._http_server = None
+        self._url = None
+
+        # _notifications: if not None, [event_instance, ...]
+        self._notifications = None
+
+        # _no_notifications: flag only intended for developing purposes
+        # see ion.agents.platform.rsn.simulator.oms_events
+        self._no_notifications = os.getenv("NO_OMS_NOTIFICATIONS") is not None
+        if self._no_notifications:  # pragma: no cover
+            log.warn("%r: NO_OMS_NOTIFICATIONS env variable defined: "
+                     "no notifications will be done", self._platform_id)
+            self._url = "http://NO_OMS_NOTIFICATIONS"
+
+    @property
+    def url(self):
+        """
+        The URL that can be used to register a listener to the OMS.
+        This is None if there is no HTTP server currently running.
+        """
+        return self._url
+
+    def keep_notifications(self, keep=True, reset=True):
+        """
+        By default, received event notifications are not kept. Call this with
+        True (the default) to keep them, or with False to not keep them.
+        If they are currently kept and the reset param is True (the default),
+        then the notifications list is reinitialized.
+        """
+        if keep:
+            if not self._notifications or reset:
+                self._notifications = []
+        else:
+            self._notifications = None
+
+    @property
+    def notifications(self):
+        """
+        The current list of received notifications. This will be None if such
+        notifications are not being kept.
+        """
+        return self._notifications
+
+    def start_http_server(self, host='localhost', port=0):
+        """
+        Starts a HTTP server that handles the notification of received events.
+
+        @param host Host, by default 'localhost'.
+        @param port Port, by default 0 to get one dynamically.
+        """
+
+        # reinitialize notifications if we are keeping them:
+        if self._notifications:
+            self._notifications = []
+
+        if self._no_notifications:
+            return
+
+        log.info("%r: starting http server for receiving event notifications at"
+                 " %s:%s ...", self._platform_id, host, port)
+        try:
+            self._http_server = WSGIServer((host, port), self._application,
+                                           log=sys.stdout)
+            self._http_server.start()
+        except Exception:
+            log.exception("%r: Could not start http server for receiving event"
+                          " notifications", self._platform_id)
+            raise
+
+        host_name, host_port = self._http_server.address
+
+        log.info("%r: http server started at %s:%s", self._platform_id, host_name, host_port)
+
+        exposed_host_name = host_name
+
+        ######################################################################
+        # adjust exposed_host_name:
+        # **NOTE**: the adjustment below is commented out because is not robust
+        # enough. For example, the use of the external name for the host would
+        # require the particular port to be open to the world.
+        # And in any case, this overall handling needs a different approach.
+        #
+        # # If the given host is 'localhost', need to get the actual hostname
+        # # for the exposed URL:
+        # if host is 'localhost':
+        #     exposed_host_name = socket.gethostname()
+        ######################################################################
+
+        self._url = "http://%s:%s" % (exposed_host_name, host_port)
+        log.info("%r: http server exposed URL = %r", self._platform_id, self._url)
+
+    def _application(self, environ, start_response):
+
+        input = environ['wsgi.input']
+        body = "\n".join(input.readlines())
+        # log.trace('%r: notification received payload=%s', self._platform_id, body)
+        event_instance = yaml.load(body)
+
+        self._event_received(event_instance)
+
+        # generic OK response  TODO determine appropriate variations if any
+        status = '200 OK'
+        headers = [('Content-Type', 'text/plain')]
+        start_response(status, headers)
+        return status
+
+    def _event_received(self, event_instance):
+        log.trace('%r: received event_instance=%s', self._platform_id, event_instance)
+
+        if self._notifications:
+            self._notifications.append(event_instance)
+        else:
+            self._notifications = [event_instance]
+
+        log.debug('%r: notifying event_instance=%s', self._platform_id, event_instance)
+
+        # driver_event = ExternalEventDriverEvent(event_instance)
+        # self._notify_driver_event(driver_event)
+        self._notify_driver_event(event_instance)
+
+    def stop_http_server(self):
+        """
+        Stops the http server.
+        @retval the dict of received notifications or None if they are not kept.
+        """
+        if self._http_server:
+            log.info("%r: HTTP SERVER: stopping http server: url=%r",
+                     self._platform_id, self._url)
+            self._http_server.stop()
+
+        self._http_server = None
+        self._url = None
+
+        return self._notifications
 
 
 DEFAULT_RSN_OMS_URI = "http://alice:1234@10.180.80.10:9021/"
@@ -49,6 +214,8 @@ max_wait = 0
 launch_breakpoint = False
 
 tried = {}
+
+INCLUDE_WRITE_OPERS = False
 
 
 def launch_listener():  # pragma: no cover
@@ -228,33 +395,7 @@ def main(uri):  # pragma: no cover
         tried[full_method_name] = error
         format_err(error)
 
-    #----------------------------------------------------------------------
-    full_method_name = "config.get_platform_types"
-    retval, reterr = run(full_method_name)
-    if retval and not isinstance(retval, dict):
-        error = "expecting a dict"
-        tried[full_method_name] = error
-        format_err(error)
-
     platform_id = "dummy_platform_id"
-
-    #----------------------------------------------------------------------
-    full_method_name = "config.get_platform_map"
-    retval, reterr = run(full_method_name)
-    if retval is not None:
-        if isinstance(retval, list):
-            if len(retval):
-                if isinstance(retval[0], (tuple, list)):
-                    platform_id = retval[0][0]
-                else:
-                    reterr = "expecting a list of tuples or lists"
-            else:
-                reterr = "expecting a non-empty list"
-        else:
-            reterr = "expecting a list"
-        if reterr:
-            tried[full_method_name] = reterr
-            format_err(reterr)
 
     #----------------------------------------------------------------------
     full_method_name = "config.get_platform_metadata"
@@ -262,18 +403,8 @@ def main(uri):  # pragma: no cover
     retval, reterr = verify_entry_in_dict(retval, reterr, platform_id)
 
     #----------------------------------------------------------------------
-    full_method_name = "attr.get_platform_attributes"
-    retval, reterr = run(full_method_name, platform_id)
-    retval, reterr = verify_entry_in_dict(retval, reterr, platform_id)
-
-    #----------------------------------------------------------------------
     full_method_name = "attr.get_platform_attribute_values"
     retval, reterr = run(full_method_name, platform_id, [])
-    retval, reterr = verify_entry_in_dict(retval, reterr, platform_id)
-
-    #----------------------------------------------------------------------
-    full_method_name = "attr.set_platform_attribute_values"
-    retval, reterr = run(full_method_name, platform_id, {})
     retval, reterr = verify_entry_in_dict(retval, reterr, platform_id)
 
     port_id = "dummy_port_id"
@@ -309,39 +440,21 @@ def main(uri):  # pragma: no cover
 
     instrument_id = "dummy_instrument_id"
 
-    #----------------------------------------------------------------------
-    full_method_name = "instr.connect_instrument"
-    retval, reterr = run(full_method_name, platform_id, port_id, instrument_id, {})
-    retval, reterr = verify_entry_in_dict(retval, reterr, platform_id)
-    retval, reterr = verify_entry_in_dict(retval, reterr, port_id)
-    retval, reterr = verify_entry_in_dict(retval, reterr, instrument_id)
+    src = "oms_simple"
 
-    connect_instrument_error = reterr
+    if INCLUDE_WRITE_OPERS:
+        #----------------------------------------------------------------------
+        full_method_name = "port.turn_on_platform_port"
+        retval, reterr = run(full_method_name, platform_id, port_id, src)
 
-    #----------------------------------------------------------------------
-    full_method_name = "instr.get_connected_instruments"
-    retval, reterr = run(full_method_name, platform_id, port_id)
-    retval, reterr = verify_entry_in_dict(retval, reterr, platform_id)
-    retval, reterr = verify_entry_in_dict(retval, reterr, port_id)
-    # note, in case of error in instr.connect_instrument, don't expect the
-    # instrument_id to be reported:
-    if connect_instrument_error is None:
-        retval, reterr = verify_entry_in_dict(retval, reterr, instrument_id)
+        #----------------------------------------------------------------------
+        full_method_name = "port.turn_off_platform_port"
+        retval, reterr = run(full_method_name, platform_id, port_id, src)
 
-    #----------------------------------------------------------------------
-    full_method_name = "instr.disconnect_instrument"
-    retval, reterr = run(full_method_name, platform_id, port_id, instrument_id)
-    retval, reterr = verify_entry_in_dict(retval, reterr, platform_id)
-    retval, reterr = verify_entry_in_dict(retval, reterr, port_id)
-    retval, reterr = verify_entry_in_dict(retval, reterr, instrument_id)
-
-    #----------------------------------------------------------------------
-    full_method_name = "port.turn_on_platform_port"
-    retval, reterr = run(full_method_name, platform_id, port_id)
-
-    #----------------------------------------------------------------------
-    full_method_name = "port.turn_off_platform_port"
-    retval, reterr = run(full_method_name, platform_id, port_id)
+        #----------------------------------------------------------------------
+        full_method_name = "port.set_over_current"
+        ma, us = 0, 0
+        retval, reterr = run(full_method_name, platform_id, port_id, ma, us, src)
 
     #----------------------------------------------------------------------
     url = EVENT_LISTENER_URL
@@ -373,10 +486,6 @@ def main(uri):  # pragma: no cover
         retval, reterr = run(full_method_name, url)
         retval, reterr = verify_entry_in_dict(retval, reterr, url)
 
-    #----------------------------------------------------------------------
-    full_method_name = "config.get_checksum"
-    retval, reterr = run(full_method_name, platform_id)
-
     # the following to specifically verify reception of test event
     if max_wait:
         full_method_name = "event.register_event_listener"
@@ -407,6 +516,7 @@ def main(uri):  # pragma: no cover
 
     #######################################################################
     print("\nSummary of basic verification:")
+    print("\n(INCLUDE_WRITE_OPERS=%s)" % INCLUDE_WRITE_OPERS)
     okeys = 0
     for full_method_name, result in sorted(tried.iteritems()):
         print("%20s %-40s: %s" % ("", full_method_name, result))

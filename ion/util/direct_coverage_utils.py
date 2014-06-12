@@ -15,6 +15,8 @@ from StringIO import StringIO
 
 
 from pyon.public import RT, PRED
+from pyon.ion.process import ImmediateProcess
+from pyon.core.exception import BadRequest
 from coverage_model import utils
 from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 from interface.services.coi.iresource_registry_service import ResourceRegistryServiceClient
@@ -22,7 +24,9 @@ from interface.services.dm.idataset_management_service import DatasetManagementS
 from interface.services.dm.iingestion_management_service import IngestionManagementServiceClient
 from interface.services.sa.idata_product_management_service import DataProductManagementServiceClient
 from coverage_model.recovery import CoverageDoctor
+from pyon.util.log import log
 
+from interface.objects import Dataset
 
 def warn_user(msg):
     import sys
@@ -216,29 +220,40 @@ class DirectCoverageAccess(object):
                 cpth = cov.persistence_dir
         except IOError, ex:
             fs = 'Unable to open reference coverage: \''
-            io = 'unable to create file (File accessability: Unable to open file)'
+            accessibility_errors = [
+                 'unable to create file (File accessability: Unable to open file)',
+                 'unable to open file (File accessibilty: Unable to open file)',
+                 'unable to open file (File accessability: Unable to open file)']
             if fs in ex.message:  # The view coverage couldn't load it's underlying reference coverage
                 cpth = ex.message[len(fs):-1]
-            elif io in ex.message:  # The simplex coverage was inaccessible
-                cpth = self.get_coverage_path(dataset_id)
-                self.pause_ingestion(self.get_stream_id(dataset_id))
+
+            for err in accessibility_errors:
+                if err in ex.message:
+                    cpth = self.get_coverage_path(dataset_id)
+                    self.pause_ingestion(self.get_stream_id(dataset_id))
+                    break
             else:
+                log.critical("Unmatched error: %s", ex.message)
                 raise
 
         # Return the CoverageDoctor instance
         return CoverageDoctor(cpth, dprod_obj, dset_obj)
 
     def run_coverage_doctor(self, dataset_id, data_product_id=None):
+        log.error('Running coverage doctor')
         dr = self.get_coverage_doctor(dataset_id, data_product_id=data_product_id)
 
         if dr.analyze().is_corrupt:
             dr.repair()
         else:
+            log.error("Repair Not Necessary")
             return "Repair Not Necessary"
 
         if not dr.analyze(reanalyze=True).is_corrupt:
+            log.error("Repair Successful")
             return "Repair Successful"
         else:
+            log.error("Repair Failed")
             return "Repair Failed"
 
     def fill_temporal_gap(self, dataset_id, gap_coverage_path=None, gap_coverage_id=None):
@@ -397,4 +412,70 @@ class SimpleDelimitedParser(object):
 #####################################################################################
 #column_map: # Defaults to None, meaning no per-column overriding is applied
   #0: {name: a, dtype: float32, fill_val: -999}'''
+
+
+class CoverageAgent(ImmediateProcess):
+    '''
+    CoverageAgent is a convenient wrapper that provides the simplest direct coverage access 
+    support on the command line.
+
+    Arguments:
+        dataset_id: unique dataset identifier
+        data_product_id: unique data product identifier
+        data_product_preload_id: the preload identifier assigned to this data product
+        data_path: file system path to the CSV file which contains the data values to apply
+        config_path: the configuration file
+
+
+    bin/pycc -x ion.util.direct_coverage_utils.CoverageAgent \
+        dataset_id=86419dedf4dd43b7b3e137b615a9d76d \
+        data_path=test_data/vel3d_coeff.csv \
+        config_path=test_data/vel3d_coeff.yml
+    '''
+    def on_start(self):
+        self.data_product_id = self.CFG.get_safe('data_product_id')
+        self.data_product_preload_id = self.CFG.get_safe('data_product_preload_id')
+
+        try:
+            if self.data_product_id:
+                self.dataset_id = self.container.resource_registry.find_objects(self.data_product_id, PRED.hasDataset, id_only=True)[0][0]
+            elif self.data_product_preload_id:
+                data_product_ids, _ = self.container.resource_registry.find_resources_ext(alt_id=self.data_product_preload_id, alt_id_ns='PRE')
+                data_product_id = data_product_ids[0]
+                self.dataset_id = self.container.resource_registry.find_objects(data_product_id, PRED.hasDataset, id_only=True)[0][0]
+            else:
+                self.dataset_id  = self.CFG.get_safe('dataset_id')
+        except IndexError:
+            raise BadRequest('No Data Product identified')
+        self.data_path   = self.CFG.get_safe('data_path')
+        self.config_path = self.CFG.get_safe('config_path')
+        
+        if not self.dataset_id:
+            raise BadRequest('Dataset ID must be specified')
+
+        if not self.data_path:
+            raise BadRequest("Data Path to coefficient table must be specified with 'data_path'")
+        if not os.path.exists(self.data_path):
+            raise BadRequest("Data table does not exist: %s" % self.data_path)
+
+        if not self.config_path:
+            raise BadRequest("Config path must be specified with 'config_path'")
+
+        if not os.path.exists(self.config_path):
+            raise BadRequest("Config does not exist: %s" % self.config_path)
+
+        dataset = self.container.resource_registry.read(self.dataset_id)
+        if not isinstance(dataset, Dataset):
+            raise BadRequest('Resource ID must be a Dataset not a %s' % type(dataset))
+
+        self.insert()
+
+
+    def insert(self):
+        print 'Updating dataset',self.dataset_id
+        print 'Using',self.data_path
+        print 'Configured by',self.config_path
+        with DirectCoverageAccess() as dca:
+            dca.upload_calibration_coefficients(self.dataset_id, self.data_path, self.config_path)
+        print 'Successfully updated coverage'
 

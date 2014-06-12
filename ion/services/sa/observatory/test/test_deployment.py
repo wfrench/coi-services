@@ -1,31 +1,26 @@
-#from interface.services.icontainer_agent import ContainerAgentClient
-#from pyon.ion.endpoint import ProcessRPCClient
-from interface.services.sa.idata_process_management_service import DataProcessManagementServiceClient
+#!/usr/bin/env python
 
-from ion.services.sa.test.helpers import any_old
-from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
-from pyon.public import log, IonObject
-from pyon.util.containers import DotDict
+import time
+import datetime
+from nose.plugins.attrib import attr
+
 from pyon.util.int_test import IonIntegrationTestCase
+from pyon.public import log, IonObject, LCS, DotDict, RT, OT, LCS, PRED, NotFound, BadRequest
+from pyon.util.context import LocalContextMixin
+from ion.services.sa.test.helpers import any_old
+from ion.services.sa.observatory.deployment_util import DeploymentUtil
+from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
 
 from interface.services.coi.iresource_registry_service import ResourceRegistryServiceClient
+from interface.services.sa.idata_process_management_service import DataProcessManagementServiceClient
 from interface.services.sa.iobservatory_management_service import ObservatoryManagementServiceClient
 from interface.services.sa.iinstrument_management_service import InstrumentManagementServiceClient
 from interface.services.sa.idata_product_management_service import DataProductManagementServiceClient
 from interface.services.sa.idata_acquisition_management_service import DataAcquisitionManagementServiceClient
 from interface.services.dm.ipubsub_management_service import PubsubManagementServiceClient
 from interface.services.dm.idataset_management_service import DatasetManagementServiceClient
-from interface.objects import PortTypeEnum
+from interface.objects import PortTypeEnum, GeospatialBounds
 
-from pyon.util.context import LocalContextMixin
-from pyon.core.exception import NotFound, BadRequest
-from pyon.public import RT, OT, PRED
-#from mock import Mock, patch
-from pyon.util.ion_time import IonTime
-from nose.plugins.attrib import attr
-
-
-import datetime
 
 class FakeProcess(LocalContextMixin):
     name = ''
@@ -76,16 +71,16 @@ class TestDeployment(IonIntegrationTestCase):
                                         description='test platform device')
         device_id = self.imsclient.create_platform_device(platform_device__obj)
 
-        start = IonTime(datetime.datetime(2013,1,1))
-        end = IonTime(datetime.datetime(2014,1,1))
-        temporal_bounds = IonObject(OT.TemporalBounds, name='planned', start_datetime=start.to_string(), end_datetime=end.to_string())
+        start = str(int(time.mktime(datetime.datetime(2013, 1, 1).timetuple())))
+        end = str(int(time.mktime(datetime.datetime(2014, 1, 1).timetuple())))
+        temporal_bounds = IonObject(OT.TemporalBounds, name='planned', start_datetime=start, end_datetime=end)
         deployment_obj = IonObject(RT.Deployment,
                                         name='TestDeployment',
                                         description='some new deployment',
                                         constraint_list=[temporal_bounds])
         deployment_id = self.omsclient.create_deployment(deployment_obj)
-        self.omsclient.deploy_platform_site(site_id, deployment_id)
-        self.imsclient.deploy_platform_device(device_id, deployment_id)
+        self.omsclient.assign_site_to_deployment(site_id, deployment_id)
+        self.omsclient.assign_device_to_deployment(device_id, deployment_id)
 
         log.debug("test_create_deployment: created deployment id: %s ", str(deployment_id) )
 
@@ -100,7 +95,6 @@ class TestDeployment(IonIntegrationTestCase):
         self.assertEqual(len(device_ids), 1)
 
         #delete the deployment
-        self.RR2.pluck(deployment_id)
         self.omsclient.force_delete_deployment(deployment_id)
         # now try to get the deleted dp object
         try:
@@ -139,9 +133,9 @@ class TestDeployment(IonIntegrationTestCase):
                                         description='test platform device')
         device_id = self.imsclient.create_platform_device(platform_device__obj)
 
-        start = IonTime(datetime.datetime(2013,1,1))
-        end = IonTime(datetime.datetime(2014,1,1))
-        temporal_bounds = IonObject(OT.TemporalBounds, name='planned', start_datetime=start.to_string(), end_datetime=end.to_string())
+        start = str(int(time.mktime(datetime.datetime(2013, 1, 1).timetuple())))
+        end = str(int(time.mktime(datetime.datetime(2014, 1, 1).timetuple())))
+        temporal_bounds = IonObject(OT.TemporalBounds, name='planned', start_datetime=start, end_datetime=end)
         deployment_obj = IonObject(RT.Deployment,
                                         name='TestDeployment',
                                         description='some new deployment',
@@ -174,7 +168,6 @@ class TestDeployment(IonIntegrationTestCase):
         self.assertEquals(len(deploy_sup.associations['DeploymentHasPlatformSite'].associated_resources), 1)
 
         #delete the deployment
-        self.RR2.pluck(deployment_id)
         self.omsclient.force_delete_deployment(deployment_id)
         # now try to get the deleted dp object
         try:
@@ -186,15 +179,20 @@ class TestDeployment(IonIntegrationTestCase):
 
 
     #@unittest.skip("targeting")
-    def base_activate_deployment(self):
-
-        #-------------------------------------------------------------------------------------
+    def base_activate_deployment(self, make_assigns=False):
         # Create platform site, platform device, platform model
-        #-------------------------------------------------------------------------------------
+
+        bounds = GeospatialBounds(geospatial_latitude_limit_north=float(5),
+                                  geospatial_latitude_limit_south=float(5),
+                                  geospatial_longitude_limit_west=float(15),
+                                  geospatial_longitude_limit_east=float(15),
+                                  geospatial_vertical_min=float(0),
+                                  geospatial_vertical_max=float(1000))
 
         platform_site__obj = IonObject(RT.PlatformSite,
                                         name='PlatformSite1',
-                                        description='test platform site')
+                                        description='test platform site',
+                                        constraint_list=[bounds])
         platform_site_id = self.omsclient.create_platform_site(platform_site__obj)
 
         platform_device_obj = IonObject(RT.PlatformDevice,
@@ -207,59 +205,68 @@ class TestDeployment(IonIntegrationTestCase):
                                         description='test platform model')
         platform_model_id = self.imsclient.create_platform_model(platform_model__obj)
 
-
-
-        #-------------------------------------------------------------------------------------
         # Create instrument site
         #-------------------------------------------------------------------------------------
 
+        bounds = GeospatialBounds(geospatial_latitude_limit_north=float(45),
+                                  geospatial_latitude_limit_south=float(40),
+                                  geospatial_longitude_limit_west=float(-75),
+                                  geospatial_longitude_limit_east=float(-70),
+                                  geospatial_vertical_min=float(0),
+                                  geospatial_vertical_max=float(500))
+
         instrument_site_obj = IonObject(RT.InstrumentSite,
                                         name='InstrumentSite1',
-                                        description='test instrument site')
+                                        description='test instrument site',
+                                        reference_designator='GA01SUMO-FI003-01-CTDMO0999',
+                                        constraint_list=[bounds])
         instrument_site_id = self.omsclient.create_instrument_site(instrument_site_obj, platform_site_id)
 
         pdict_id = self.dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
         ctd_stream_def_id = self.psmsclient.create_stream_definition(name='SBE37_CDM', parameter_dictionary_id=pdict_id)
 
-
-        #----------------------------------------------------------------------------------------------------
         # Create an instrument device
-        #----------------------------------------------------------------------------------------------------
-
         instrument_device_obj = IonObject(RT.InstrumentDevice,
                                         name='InstrumentDevice1',
                                         description='test instrument device')
         instrument_device_id = self.imsclient.create_instrument_device(instrument_device_obj)
         self.rrclient.create_association(platform_device_id, PRED.hasDevice, instrument_device_id)
 
+        pp_obj = IonObject(OT.PlatformPort, reference_designator='GA01SUMO-FI003-01-CTDMO0999', port_type= PortTypeEnum.PAYLOAD, ip_address='1' )
+        port_assignments = {instrument_device_id : pp_obj}
 
 
         #----------------------------------------------------------------------------------------------------
         # Create an instrument model
-        #----------------------------------------------------------------------------------------------------
-
         instrument_model_obj = IonObject(RT.InstrumentModel,
                                         name='InstrumentModel1',
                                         description='test instrument model')
         instrument_model_id = self.imsclient.create_instrument_model(instrument_model_obj)
 
-
-        #----------------------------------------------------------------------------------------------------
         # Create a deployment object
         #----------------------------------------------------------------------------------------------------
 
-        start = IonTime(datetime.datetime(2013,1,1))
-        end = IonTime(datetime.datetime(2014,1,1))
-        temporal_bounds = IonObject(OT.TemporalBounds, name='planned', start_datetime=start.to_string(), end_datetime=end.to_string())
+        start = str(int(time.mktime(datetime.datetime(2013, 1, 1).timetuple())))
+        end = str(int(time.mktime(datetime.datetime(2020, 1, 1).timetuple())))
+        temporal_bounds = IonObject(OT.TemporalBounds, name='planned', start_datetime=start, end_datetime=end)
         deployment_obj = IonObject(RT.Deployment,
                                    name='TestDeployment',
                                    description='some new deployment',
                                    context=IonObject(OT.CabledNodeDeploymentContext),
+                                   port_assignments=port_assignments,
                                    constraint_list=[temporal_bounds])
         deployment_id = self.omsclient.create_deployment(deployment_obj)
 
         log.debug("test_create_deployment: created deployment id: %s ", str(deployment_id) )
 
+        if make_assigns:
+            self.imsclient.assign_platform_model_to_platform_device(platform_model_id, platform_device_id)
+            self.imsclient.assign_instrument_model_to_instrument_device(instrument_model_id, instrument_device_id)
+            self.omsclient.assign_platform_model_to_platform_site(platform_model_id, platform_site_id)
+            self.omsclient.assign_instrument_model_to_instrument_site(instrument_model_id, instrument_site_id)
+
+            self.omsclient.assign_site_to_deployment(platform_site_id, deployment_id)
+            self.omsclient.assign_device_to_deployment(platform_device_id, deployment_id)
 
         ret = DotDict(instrument_site_id=instrument_site_id,
                       instrument_device_id=instrument_device_id,
@@ -269,41 +276,123 @@ class TestDeployment(IonIntegrationTestCase):
                       platform_model_id=platform_model_id,
                       deployment_id=deployment_id)
 
+        return ret
+
+    def _create_subsequent_deployment(self, prior_dep_info):
+        platform_device_obj = IonObject(RT.PlatformDevice,
+                                        name='PlatformDevice2',
+                                        description='test platform device')
+        platform_device_id = self.imsclient.create_platform_device(platform_device_obj)
+
+        instrument_device_obj = IonObject(RT.InstrumentDevice,
+                                        name='InstrumentDevice2',
+                                        description='test instrument device')
+        instrument_device_id = self.imsclient.create_instrument_device(instrument_device_obj)
+        self.rrclient.create_association(platform_device_id, PRED.hasDevice, instrument_device_id)
+
+        self.imsclient.assign_platform_model_to_platform_device(prior_dep_info.platform_model_id, platform_device_id)
+        self.imsclient.assign_instrument_model_to_instrument_device(prior_dep_info.instrument_model_id, instrument_device_id)
+
+        start = str(int(time.mktime(datetime.datetime(2013, 6, 1).timetuple())))
+        end = str(int(time.mktime(datetime.datetime(2020, 6, 1).timetuple())))
+        temporal_bounds = IonObject(OT.TemporalBounds, name='planned', start_datetime=start, end_datetime=end)
+        deployment_obj = IonObject(RT.Deployment,
+                                   name='TestDeployment2',
+                                   description='some new deployment',
+                                   context=IonObject(OT.CabledNodeDeploymentContext),
+                                   constraint_list=[temporal_bounds])
+        deployment_id = self.omsclient.create_deployment(deployment_obj)
+
+        self.omsclient.assign_site_to_deployment(prior_dep_info.platform_site_id, deployment_id)
+        self.omsclient.assign_device_to_deployment(prior_dep_info.platform_device_id, deployment_id)
+
+        log.debug("test_create_deployment: created deployment id: %s ", str(deployment_id) )
+
+        ret = DotDict(instrument_device_id=instrument_device_id,
+                      platform_device_id=platform_device_id,
+                      deployment_id=deployment_id)
 
         return ret
 
     #@unittest.skip("targeting")
     def test_activate_deployment_normal(self):
 
-        res = self.base_activate_deployment()
+        res = self.base_activate_deployment(make_assigns=True)
 
-        log.debug("assigning platform and instrument models")
-        self.imsclient.assign_platform_model_to_platform_device(res.platform_model_id, res.platform_device_id)
-        self.imsclient.assign_instrument_model_to_instrument_device(res.instrument_model_id, res.instrument_device_id)
-        self.omsclient.assign_platform_model_to_platform_site(res.platform_model_id, res.platform_site_id)
-        self.omsclient.assign_instrument_model_to_instrument_site(res.instrument_model_id, res.instrument_site_id)
-
-        log.debug("adding instrument site and device to deployment")
-        self.omsclient.deploy_instrument_site(res.instrument_site_id, res.deployment_id)
-        self.imsclient.deploy_instrument_device(res.instrument_device_id, res.deployment_id)
-
-        log.debug("adding platform site and device to deployment")
-        self.omsclient.deploy_platform_site(res.platform_site_id, res.deployment_id)
-        self.imsclient.deploy_platform_device(res.platform_device_id, res.deployment_id)
+        before_activate_instrument_device_obj = self.rrclient.read(res.instrument_device_id)
+        self.assertNotEquals(before_activate_instrument_device_obj.lcstate, LCS.DEPLOYED)
 
         log.debug("activating deployment, expecting success")
         self.omsclient.activate_deployment(res.deployment_id)
 
+        def assertGeospatialBoundsEquals(a, b):
+            self.assertEquals(a['geospatial_latitude_limit_north'],b['geospatial_latitude_limit_north'])
+            self.assertEquals(a['geospatial_latitude_limit_south'],b['geospatial_latitude_limit_south'])
+            self.assertEquals(a['geospatial_longitude_limit_west'],b['geospatial_longitude_limit_west'])
+            self.assertEquals(a['geospatial_longitude_limit_east'],b['geospatial_longitude_limit_east'])
+
+        def assertGeospatialBoundsNotEquals(a, b):
+            self.assertNotEquals(a['geospatial_latitude_limit_north'],b['geospatial_latitude_limit_north'])
+            self.assertNotEquals(a['geospatial_latitude_limit_south'],b['geospatial_latitude_limit_south'])
+            self.assertNotEquals(a['geospatial_longitude_limit_west'],b['geospatial_longitude_limit_west'])
+            self.assertNotEquals(a['geospatial_longitude_limit_east'],b['geospatial_longitude_limit_east'])
+
+        after_activate_instrument_device_obj = self.rrclient.read(res.instrument_device_id)
+        assertGeospatialBoundsNotEquals(before_activate_instrument_device_obj.geospatial_bounds,after_activate_instrument_device_obj.geospatial_bounds)
+
+        deployment_obj = self.RR2.read(res.deployment_id)
+        self.assertEquals(deployment_obj.lcstate, LCS.DEPLOYED)
+
         log.debug("deactivatin deployment, expecting success")
         self.omsclient.deactivate_deployment(res.deployment_id)
+
+        after_deactivate_instrument_device_obj = self.rrclient.read(res.instrument_device_id)
+        assertGeospatialBoundsNotEquals(after_activate_instrument_device_obj.geospatial_bounds, after_deactivate_instrument_device_obj.geospatial_bounds)
+
+        deployment_obj = self.RR2.read(res.deployment_id)
+        self.assertEquals(deployment_obj.lcstate, LCS.INTEGRATED)
+
+    def test_activate_deployment_redeploy(self):
+        dep_util = DeploymentUtil(self.container)
+        res = self.base_activate_deployment(make_assigns=True)
+
+        log.debug("activating first deployment, expecting success")
+        self.omsclient.activate_deployment(res.deployment_id)
+
+        deployment_obj1 = self.RR2.read(res.deployment_id)
+        self.assertEquals(deployment_obj1.lcstate, LCS.DEPLOYED)
+
+        next_dep_info = self._create_subsequent_deployment(res)
+
+        deployment_obj2 = self.RR2.read(next_dep_info.deployment_id)
+        self.assertNotEquals(deployment_obj2.lcstate, LCS.DEPLOYED)
+
+        log.debug("activating subsequent deployment, expecting success")
+        self.omsclient.activate_deployment(next_dep_info.deployment_id)
+
+        deployment_obj1 = self.RR2.read(res.deployment_id)
+        self.assertEquals(deployment_obj1.lcstate, LCS.INTEGRATED)
+
+        deployment_obj2 = self.RR2.read(next_dep_info.deployment_id)
+        self.assertEquals(deployment_obj2.lcstate, LCS.DEPLOYED)
+
+        dep1_tc = dep_util.get_temporal_constraint(deployment_obj1)
+        dep2_tc = dep_util.get_temporal_constraint(deployment_obj2)
+        self.assertLessEqual(float(dep1_tc.end_datetime), float(dep2_tc.end_datetime))
+
+        log.debug("deactivating second deployment, expecting success")
+        self.omsclient.deactivate_deployment(next_dep_info.deployment_id)
+
+        deployment_obj2 = self.RR2.read(next_dep_info.deployment_id)
+        self.assertEquals(deployment_obj2.lcstate, LCS.INTEGRATED)
 
     #@unittest.skip("targeting")
     def test_activate_deployment_nomodels(self):
 
         res = self.base_activate_deployment()
 
-        self.omsclient.deploy_instrument_site(res.instrument_site_id, res.deployment_id)
-        self.imsclient.deploy_instrument_device(res.instrument_device_id, res.deployment_id)
+        self.omsclient.assign_site_to_deployment(res.platform_site_id, res.deployment_id)
+        self.omsclient.assign_device_to_deployment(res.platform_device_id, res.deployment_id)
 
         log.debug("activating deployment without site+device models, expecting fail")
         self.assert_deploy_fail(res.deployment_id, NotFound, "Expected 1")
@@ -324,10 +413,10 @@ class TestDeployment(IonIntegrationTestCase):
         self.omsclient.assign_instrument_model_to_instrument_site(res.instrument_model_id, res.instrument_site_id)
 
         log.debug("deploying instrument device only")
-        self.imsclient.deploy_instrument_device(res.instrument_device_id, res.deployment_id)
+        self.omsclient.assign_device_to_deployment(res.instrument_device_id, res.deployment_id)
 
         log.debug("activating deployment without instrument site, expecting fail")
-        self.assert_deploy_fail(res.deployment_id, BadRequest, "Devices in this deployment outnumber sites")
+        self.assert_deploy_fail(res.deployment_id, BadRequest)
 
     #@unittest.skip("targeting")
     def test_activate_deployment_nodevice(self):
@@ -339,70 +428,18 @@ class TestDeployment(IonIntegrationTestCase):
         self.omsclient.assign_instrument_model_to_instrument_site(res.instrument_model_id, res.instrument_site_id)
 
         log.debug("deploying instrument site only")
-        self.omsclient.deploy_instrument_site(res.instrument_site_id, res.deployment_id)
+        self.omsclient.assign_site_to_deployment(res.instrument_site_id, res.deployment_id)
 
         log.debug("activating deployment without device, expecting fail")
         self.assert_deploy_fail(res.deployment_id, BadRequest, "No devices were found in the deployment")
 
 
-    def test_activate_deployment_asymmetric_children(self):
-        """
-        P0
-        |  \
-        P1  P2
-        |
-        I1
-
-        Complex deployment using CSP
-
-        P1, P2, and P3 share the same platform model.  The CSP solver should be able to work this out
-        based on relationships to parents
-
-        """
-
-        log.debug("create models")
-        imodel_id = self.RR2.create(any_old(RT.InstrumentModel))
-        pmodel_id = self.RR2.create(any_old(RT.PlatformModel))
-
-        log.debug("create devices")
-        idevice_id = self.RR2.create(any_old(RT.InstrumentDevice))
-        pdevice_id = [self.RR2.create(any_old(RT.PlatformDevice)) for _ in range(3)]
-
-        log.debug("create sites")
-        isite_id = self.RR2.create(any_old(RT.InstrumentSite))
-        psite_id = [self.RR2.create(any_old(RT.PlatformSite)) for _ in range(3)]
-
-        log.debug("assign models")
-        self.RR2.assign_instrument_model_to_instrument_device_with_has_model(imodel_id, idevice_id)
-        self.RR2.assign_instrument_model_to_instrument_site_with_has_model(imodel_id, isite_id)
-        for x in range(3):
-            self.RR2.assign_platform_model_to_platform_device_with_has_model(pmodel_id, pdevice_id[x])
-            self.RR2.assign_platform_model_to_platform_site_with_has_model(pmodel_id, psite_id[x])
-
-        log.debug("assign hierarchy")
-        self.RR2.assign_instrument_device_to_platform_device_with_has_device(idevice_id, pdevice_id[1])
-        self.RR2.assign_instrument_site_to_platform_site_with_has_site(isite_id, psite_id[1])
-        for x in range(1,3):
-            self.RR2.assign_platform_device_to_platform_device_with_has_device(pdevice_id[x], pdevice_id[0])
-            self.RR2.assign_platform_site_to_platform_site_with_has_site(psite_id[x], psite_id[0])
-
-        log.debug("create and activate deployment")
-        dep_id = self.RR2.create(any_old(RT.Deployment, {"context": IonObject(OT.RemotePlatformDeploymentContext)}))
-        self.RR2.assign_deployment_to_platform_device_with_has_deployment(dep_id, pdevice_id[0])
-        self.RR2.assign_deployment_to_platform_site_with_has_deployment(dep_id, psite_id[0])
-        self.omsclient.activate_deployment(dep_id)
-
-        log.debug("verifying deployment")
-        self.assertEqual(idevice_id, self.RR2.find_instrument_device_id_of_instrument_site_using_has_device(isite_id),
-                         "The instrument device was not assigned to the instrument site")
-        for x in range(3):
-            self.assertEqual(pdevice_id[x], self.RR2.find_platform_device_id_of_platform_site_using_has_device(psite_id[x]),
-                             "Platform device %d was not assigned to platform site %d" % (x, x))
-
-    def assert_deploy_fail(self, deployment_id, err_type=BadRequest, fail_message="did not specify fail_message"):
+    def assert_deploy_fail(self, deployment_id, err_type=BadRequest, fail_message=""):
         with self.assertRaises(err_type) as cm:
             self.omsclient.activate_deployment(deployment_id)
-        self.assertIn(fail_message, cm.exception.message)
+            log.debug("assert_deploy_fail cm: %s", str(cm) )
+            if fail_message:
+                self.assertIn(fail_message, cm.exception.message)
 
     def test_3x3_matchups_remoteplatform(self):
         self.base_3x3_matchups(IonObject(OT.RemotePlatformDeploymentContext))
@@ -426,13 +463,15 @@ class TestDeployment(IonIntegrationTestCase):
         platform_device_id   = [self.RR2.create(any_old(RT.PlatformDevice)) for _ in range(4)]
 
         instrument_site_id   = [self.RR2.create(any_old(RT.InstrumentSite,
-                                                {"planned_uplink_port":
+                                                { "reference_designator" : "GA01SUMO-FI003-0%s-CTDMO0999" % (i+1),
+                                                    "planned_uplink_port":
                                                      IonObject(OT.PlatformPort,
                                                                reference_designator="GA01SUMO-FI003-0%s-CTDMO0999" % (i+1) )}))
                                 for i in range(9)]
 
         platform_site_id     = [self.RR2.create(any_old(RT.PlatformSite,
-                                                {"planned_uplink_port":
+                                                {  "reference_designator" : "GA01SUMO-FI003-0%s-CTDMO0888" % (i+1) ,
+                                                    "planned_uplink_port":
                                                     IonObject(OT.PlatformPort,
                                                               reference_designator="GA01SUMO-FI003-0%s-CTDMO0888" % (i+1))}))
                                 for i in range(4)]
@@ -558,6 +597,3 @@ class TestDeployment(IonIntegrationTestCase):
         #    msg='%d sites but %d devices' % (len(extended_deployment.instrument_sites), len(extended_deployment.instrument_devices)))
         #self.assertTrue(len(extended_deployment.instrument_devices) == len(extended_deployment.instrument_models))
         #self.assertTrue(len(extended_deployment.platform_devices) == len(extended_deployment.platform_models))
-
-
-

@@ -33,12 +33,13 @@ __license__ = 'Apache 2.0'
 # containing the corresponding agent configurations as they are constructed.
 #
 
+from pyon.util.int_test import IonIntegrationTestCase
+from pyon.public import RT, OT, PRED, CFG
 from pyon.public import log
 import logging
 from pyon.public import IonObject
 from pyon.core.exception import ServerError, Conflict
 
-from pyon.util.int_test import IonIntegrationTestCase
 
 from pyon.event.event import EventSubscriber
 
@@ -50,11 +51,11 @@ from interface.services.cei.iprocess_dispatcher_service import ProcessDispatcher
 from interface.services.dm.ipubsub_management_service import PubsubManagementServiceClient
 from interface.services.dm.idataset_management_service import DatasetManagementServiceClient
 from interface.services.sa.iobservatory_management_service import ObservatoryManagementServiceClient
+from pyon.core.governance import get_system_actor_header
 
 from pyon.ion.stream import StandaloneStreamSubscriber
 
 from pyon.util.context import LocalContextMixin
-from pyon.public import RT, PRED, CFG
 
 from nose.plugins.attrib import attr
 
@@ -65,20 +66,17 @@ from pyon.agent.agent import ResourceAgentEvent
 from interface.objects import AgentCommand, ProcessStateEnum
 from interface.objects import StreamConfiguration
 from interface.objects import StreamAlertType, AggregateStatusType
+from interface.objects import PortTypeEnum
 
 from ion.agents.port.port_agent_process import PortAgentProcessType, PortAgentType
 
 from ion.agents.platform.platform_agent import PlatformAgentEvent
-from ion.agents.platform.rsn.rsn_platform_driver import RSNPlatformDriverEvent
 
-from ion.services.dm.utility.granule_utils import time_series_domain
 
 from gevent.event import AsyncResult
 
 from ion.agents.platform.test.helper import HelperTestMixin
 
-from ion.agents.platform.rsn.oms_client_factory import CIOMSClientFactory
-from ion.agents.platform.rsn.oms_util import RsnOmsUtil
 from ion.agents.platform.util.network_util import NetworkUtil
 
 from ion.agents.platform.platform_agent import PlatformAgentState
@@ -86,6 +84,7 @@ from ion.agents.platform.platform_agent import PlatformAgentState
 
 import os
 import time
+import calendar
 import copy
 import pprint
 
@@ -103,17 +102,12 @@ DRV_URI_GOOD = CFG.device.sbe37.dvr_egg
 
 ###############################################################################
 # oms_uri: This indicates the URI to connect to the RSN OMS server endpoint.
-# By default, this value is "launchsimulator" meaning that the simulator is
-# launched as an external process for each test. This default is appropriate
-# in general and in particular for the buildbots. For local testing, the OMS
+# By default, this value is "launchsimulator" meaning that the simulator is to
+# be launched as an external process for each test. This default is appropriate
+# in general, and in particular for the buildbots. For local testing, the OMS
 # environment variable can be used to indicate a different RSN OMS server endpoint.
-# Some aliases for the "oms_uri" parameter include "embsimulator" (instantiates
-# the simulator class directly) and "localsimulator" (assumes the simulator is
-# already running as an external process, locally) and others. See oms_uri_aliases.yml.
+# TODO(OOIION-1352): This URI might eventually be gotten from PYON configuration
 oms_uri = os.getenv('OMS', "launchsimulator")
-
-
-#oms_uri = 'http://alice:1234@10.180.80.10:9021/'
 
 # initialization of the driver configuration. See setUp for possible update
 # of the 'oms_uri' entry related with the special value "launchsimulator".
@@ -160,7 +154,8 @@ instruments_dict = {
         'DEV_PORT'  : 4002,
         'DATA_PORT' : 5002,
         'CMD_PORT'  : 6002,
-        'PA_BINARY' : "port_agent"
+        'PA_BINARY' : "port_agent",
+        'alt_ids'   : ["PRE:SBE37_SIM_02"]
     },
 
     "SBE37_SIM_03": {
@@ -168,7 +163,8 @@ instruments_dict = {
         'DEV_PORT'  : 4003,
         'DATA_PORT' : 5003,
         'CMD_PORT'  : 6003,
-        'PA_BINARY' : "port_agent"
+        'PA_BINARY' : "port_agent",
+        'alt_ids'   : ["PRE:SBE37_SIM_03"]
     },
 
     "SBE37_SIM_04": {
@@ -250,6 +246,7 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
     @classmethod
     def setUpClass(cls):
         HelperTestMixin.setUpClass()
+        cls._pp = pprint.PrettyPrinter()
 
     def setUp(self):
 
@@ -274,6 +271,8 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         self.org_id = self.RR2.create(any_old(RT.Org))
         log.debug("Org created: %s", self.org_id)
 
+        self._actor_header = get_system_actor_header()
+
         # Create InstrumentModel
         # TODO create multiple models as needed; for the moment assuming all
         # used instruments are the same model here.
@@ -283,34 +282,7 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         self.instModel_id = self.IMS.create_instrument_model(instModel_obj)
         log.debug('new InstrumentModel id = %s ', self.instModel_id)
 
-        # Use the network definition provided by RSN OMS directly.
-        rsn_oms = CIOMSClientFactory.create_instance(DVR_CONFIG['oms_uri'])
-        self._network_definition = RsnOmsUtil.build_network_definition(rsn_oms)
-        CIOMSClientFactory.destroy_instance(rsn_oms)
-
-        if log.isEnabledFor(logging.TRACE):
-            # show serialized version for the network definition:
-            network_definition_ser = NetworkUtil.serialize_network_definition(self._network_definition)
-            log.trace("NetworkDefinition serialization:\n%s", network_definition_ser)
-
-        # set attributes for the platforms:
-        self._platform_attributes = {}
-        for platform_id in self._network_definition.pnodes:
-            pnode = self._network_definition.pnodes[platform_id]
-            dic = dict((attr.attr_id, attr.defn) for attr in pnode.attrs.itervalues())
-            self._platform_attributes[platform_id] = dic
-        log.trace("_platform_attributes: %s", self._platform_attributes)
-
-        # set ports for the platforms:
-        self._platform_ports = {}
-        for platform_id in self._network_definition.pnodes:
-            pnode = self._network_definition.pnodes[platform_id]
-            dic = {}
-            for port_id, port in pnode.ports.iteritems():
-                dic[port_id] = dict(port_id=port_id,
-                                    network=port.network)
-            self._platform_ports[platform_id] = dic
-        log.trace("_platform_ports: %s", self._platform_attributes)
+        self._get_network_definition()
 
         self._async_data_result = AsyncResult()
         self._data_subscribers = []
@@ -332,7 +304,39 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         # see _set_receive_timeout
         self._receive_timeout = 177
 
-        self._pp = pprint.PrettyPrinter()
+    def _get_network_definition(self):
+        """
+        Called by setUp to get the platform network definition to be used, which
+        is loaded from the file indicated by self._get_network_definition_filename().
+        """
+        yaml_filename = self._get_network_definition_filename()
+        log.debug("retrieving network definition from %s", yaml_filename)
+        self._network_definition = NetworkUtil.deserialize_network_definition(file(yaml_filename))
+
+        if log.isEnabledFor(logging.TRACE):
+            log.trace("NetworkDefinition serialization:\n%s",
+                      NetworkUtil.serialize_network_definition(self._network_definition))
+
+        # set attributes for the platforms:
+        self._platform_attributes = {}
+        for platform_id in self._network_definition.pnodes:
+            pnode = self._network_definition.pnodes[platform_id]
+            dic = dict((attr.attr_id, attr.defn) for attr in pnode.attrs.itervalues())
+            self._platform_attributes[platform_id] = dic
+        log.trace("_platform_attributes: %s", self._platform_attributes)
+
+        # set ports for the platforms:
+        self._platform_ports = {}
+        for platform_id in self._network_definition.pnodes:
+            pnode = self._network_definition.pnodes[platform_id]
+            dic = {}
+            for port_id, port in pnode.ports.iteritems():
+                dic[port_id] = dict(port_id=port_id, instrument_ids=port.instrument_ids)
+            self._platform_ports[platform_id] = dic
+        log.trace("_platform_ports: %s", self._pp.pformat(self._platform_ports))
+
+    def _get_network_definition_filename(self):
+        return 'ion/agents/platform/rsn/simulator/network.yml'
 
     def _set_receive_timeout(self):
         """
@@ -388,7 +392,7 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
                 if hasattr(sub, 'subscription_id'):
                     try:
                         self.PSC.deactivate_subscription(sub.subscription_id)
-                    except:
+                    except Exception:
                         pass
                     self.PSC.delete_subscription(sub.subscription_id)
                 sub.stop()
@@ -442,7 +446,7 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         self._event_subscribers.append(sub)
         sub._ready_event.wait(timeout=EVENT_TIMEOUT)
 
-    def _start_event_subscriber2(self, count, event_type, **kwargs):
+    def _start_event_subscriber2(self, count, event_type, cb=None, **kwargs):
         """
         Starts an event subscriber to expect the given number of events of the
         given event_type.
@@ -452,6 +456,7 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
 
         @param count       number of event that should be received
         @param event_type  desired event type
+        @param cb          mainly for logging purposes for the caller
         @param kwargs      other arguments for EventSubscriber constructor
 
         @return (async_event_result, events_received)  Use these to wait
@@ -464,6 +469,8 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
             # A callback for consuming events.
             if evt.type_ != event_type:
                 return
+            if cb:
+                cb(evt, args, kwargs)
             log.info('Event subscriber received evt: %s.', str(evt))
             events_received.append(evt)
             if count == 0:
@@ -494,7 +501,7 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
                 if hasattr(sub, 'subscription_id'):
                     try:
                         self.PSC.deactivate_subscription(sub.subscription_id)
-                    except:
+                    except Exception:
                         pass
                     self.PSC.delete_subscription(sub.subscription_id)
                 try:
@@ -597,9 +604,6 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
                 to the platform.
         """
 
-        tdom, sdom = time_series_domain()
-        sdom = sdom.dump()
-        tdom = tdom.dump()
 
         #
         # TODO will each platform have its own param dictionary?
@@ -645,8 +649,9 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
             platform_device_id = self.IMS.create_platform_device(any_old(RT.PlatformDevice))
 
             # data product creation
-            dp_obj = any_old(RT.DataProduct, {"temporal_domain":tdom, "spatial_domain": sdom})
-            dp_id = self.DP.create_data_product(data_product=dp_obj, stream_definition_id=self.parsed_stream_def_id)
+            dp_obj = any_old(RT.DataProduct)
+            parsed_config = StreamConfiguration(stream_name='parsed', parameter_dictionary_name='ctd_parsed_param_dict')
+            dp_id = self.DP.create_data_product(data_product=dp_obj, stream_definition_id=self.parsed_stream_def_id, default_stream_configuration=parsed_config)
             self.DAMS.assign_data_product(input_resource_id=platform_device_id, data_product_id=dp_id)
             self.DP.activate_data_product_persistence(data_product_id=dp_id)
             self.addCleanup(self.DP.delete_data_product, dp_id)
@@ -701,6 +706,79 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         p_obj.stream_id = stream_id
         p_obj.pid = None  # known when process launched
         return p_obj
+
+    def _create_platform_site_and_deployment(self, platform_device_id=None, ):
+
+
+        log.debug('_create_platform_site_and_deployment  platform_device_id: %s', platform_device_id)
+
+        site_object = IonObject(RT.PlatformSite, name='PlatformSite1')
+        platform_site_id = self.OMS.create_platform_site(platform_site=site_object, parent_id='')
+        log.debug('_create_platform_site_and_deployment  site id: %s', platform_site_id)
+
+        #create supporting objects for the Deployment resource
+        # 1. temporal constraint
+        # find current deployment using time constraints
+        current_time =  int( calendar.timegm(time.gmtime()) )
+        # two years on either side of current time
+        start = current_time - 63115200
+        end = current_time + 63115200
+        temporal_bounds = IonObject(OT.TemporalBounds, name='planned', start_datetime=str(start), end_datetime=str(end))
+        # 2. PlatformPort object which defines device to port map
+        platform_port_obj= IonObject(OT.PlatformPort, reference_designator = 'GA01SUMO-FI003-01-CTDMO0999',
+                                                        port_type=PortTypeEnum.UPLINK,
+                                                        ip_address='0')
+
+        # now create the Deployment
+        deployment_obj = IonObject(RT.Deployment,
+                                   name='TestPlatformDeployment',
+                                   description='some new deployment',
+                                   context=IonObject(OT.CabledNodeDeploymentContext),
+                                   constraint_list=[temporal_bounds],
+                                   port_assignments={platform_device_id:platform_port_obj})
+
+        platform_deployment_id = self.OMS.create_deployment(deployment=deployment_obj, site_id=platform_site_id, device_id=platform_device_id)
+        log.debug('_create_platform_site_and_deployment  deployment_id: %s', platform_deployment_id)
+
+        deploy_obj2 = self.OMS.read_deployment(platform_deployment_id)
+        log.debug('_create_platform_site_and_deployment  deploy_obj2 : %s', deploy_obj2)
+        return platform_site_id, platform_deployment_id
+
+
+    def _create_instrument_site_and_deployment(self, platform_site_id=None, instrument_device_id=None):
+
+        site_object = IonObject(RT.InstrumentSite, name='InstrumentSite1')
+        instrument_site_id = self.OMS.create_instrument_site(instrument_site=site_object, parent_id=platform_site_id)
+        log.debug('_create_instrument_site_and_deployment  site id: %s', instrument_site_id)
+
+
+        #create supporting objects for the Deployment resource
+        # 1. temporal constraint
+        # find current deployment using time constraints
+        current_time =  int( calendar.timegm(time.gmtime()) )
+        # two years on either side of current time
+        start = current_time - 63115200
+        end = current_time + 63115200
+        temporal_bounds = IonObject(OT.TemporalBounds, name='planned', start_datetime=str(start), end_datetime=str(end))
+        # 2. PlatformPort object which defines device to port map
+        platform_port_obj= IonObject(OT.PlatformPort, reference_designator = 'GA01SUMO-FI003-01-CTDMO0999',
+                                                        port_type=PortTypeEnum.PAYLOAD,
+                                                        ip_address='0')
+
+        # now create the Deployment
+        deployment_obj = IonObject(RT.Deployment,
+                                   name='TestInstrumentDeployment',
+                                   description='some new deployment',
+                                   context=IonObject(OT.CabledInstrumentDeploymentContext),
+                                   constraint_list=[temporal_bounds],
+                                   port_assignments={instrument_device_id:platform_port_obj})
+
+        instrument_deployment_id = self.OMS.create_deployment(deployment=deployment_obj, site_id=instrument_site_id, device_id=instrument_device_id)
+        log.debug('_create_instrument_site_and_deployment  deployment_id: %s', instrument_deployment_id)
+
+        deploy_obj2 = self.OMS.read_deployment(instrument_deployment_id)
+        log.debug('_create_instrument_site_and_deployment  deploy_obj2 : %s', deploy_obj2)
+        return instrument_site_id, instrument_deployment_id
 
     def _create_platform(self, platform_id, parent_platform_id=None):
         """
@@ -893,14 +971,11 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
                                                   alerts=[temp_alert_def, late_data_alert_def])
 
         instrument_agent_instance_obj.agent_config = agent_config
+        instrument_agent_instance_obj.alt_ids = instr_info.get('alt_ids', [])
 
         instrument_agent_instance_id = self.IMS.create_instrument_agent_instance(instrument_agent_instance_obj)
 
         # data products
-
-        tdom, sdom = time_series_domain()
-        sdom = sdom.dump()
-        tdom = tdom.dump()
 
         org_id = self.RR2.create(org_obj)
 
@@ -913,12 +988,12 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
 
         dp_obj = IonObject(RT.DataProduct,
                            name='the parsed data for %s' % instr_key,
-                           description='ctd stream test',
-                           temporal_domain=tdom,
-                           spatial_domain=sdom)
+                           description='ctd stream test')
 
+        parsed_config = StreamConfiguration(stream_name='parsed', parameter_dictionary_name='ctd_parsed_param_dict')
         data_product_id1 = self.DP.create_data_product(data_product=dp_obj,
-                                                       stream_definition_id=parsed_stream_def_id)
+                                                       stream_definition_id=parsed_stream_def_id,
+                                                       default_stream_configuration=parsed_config)
         self.DP.activate_data_product_persistence(data_product_id=data_product_id1)
         self.addCleanup(self.DP.delete_data_product, data_product_id1)
 
@@ -934,12 +1009,12 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
 
         dp_obj = IonObject(RT.DataProduct,
                            name='the raw data for %s' % instr_key,
-                           description='raw stream test',
-                           temporal_domain=tdom,
-                           spatial_domain=sdom)
+                           description='raw stream test')
 
+        raw_config = StreamConfiguration(stream_name='raw', parameter_dictionary_name='ctd_raw_param_dict')
         data_product_id2 = self.DP.create_data_product(data_product=dp_obj,
-                                                       stream_definition_id=raw_stream_def_id)
+                                                       stream_definition_id=raw_stream_def_id,
+                                                       default_stream_configuration=raw_config)
 
         self.DP.activate_data_product_persistence(data_product_id=data_product_id2)
         self.addCleanup(self.DP.delete_data_product, data_product_id2)
@@ -1234,6 +1309,7 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
             # create only if not already created:
             if instr_key in self._setup_instruments:
                 i_obj = self._setup_instruments[instr_key]
+                i_objs.append(i_obj)
                 log.debug("instrument was already created = %r (%s)",
                           i_obj.instrument_agent_instance_id, instr_key)
             else:
@@ -1314,7 +1390,8 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         # now start the platform:
         agent_instance_id = p_obj.platform_agent_instance_id
         log.debug("about to call start_platform_agent_instance with id=%s", agent_instance_id)
-        p_obj.pid = self.IMS.start_platform_agent_instance(platform_agent_instance_id=agent_instance_id)
+        p_obj.pid = self.IMS.start_platform_agent_instance(platform_agent_instance_id=agent_instance_id,
+                                                           headers=self._actor_header)
         log.debug("start_platform_agent_instance returned pid=%s", p_obj.pid)
 
         #wait for start
@@ -1336,7 +1413,7 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
     def _stop_platform(self, p_obj):
         try:
             self.IMS.stop_platform_agent_instance(p_obj.platform_agent_instance_id)
-        except:
+        except Exception:
             if log.isEnabledFor(logging.TRACE):
                 log.exception(
                     "platform_id=%r: Exception in IMS.stop_platform_agent_instance with "
@@ -1371,7 +1448,7 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         try:
             config_builder.set_agent_instance_object(instrument_agent_instance_obj)
             config = config_builder.prepare()
-        except:
+        except Exception:
             log.error('failed to launch', exc_info=True)
             raise ServerError('failed to launch')
 
@@ -1429,7 +1506,8 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         agent_instance_id = i_obj.instrument_agent_instance_id
         if use_ims:
             log.debug("calling IMS.start_instrument_agent_instance with id=%s", agent_instance_id)
-            i_obj.pid = self.IMS.start_instrument_agent_instance(instrument_agent_instance_id=agent_instance_id)
+            i_obj.pid = self.IMS.start_instrument_agent_instance(instrument_agent_instance_id=agent_instance_id,
+                                                                 headers=self._actor_header)
 
         else:
             log.debug("calling IMS_start_instrument_agent_instance with id=%s", agent_instance_id)
@@ -1570,20 +1648,8 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         self.assertIsInstance(ports, dict)
         for port_id, info in ports.iteritems():
             self.assertIsInstance(info, dict)
-            self.assertIn('network', info)
             self.assertIn('state', info)
         return ports
-
-    def _get_connected_instruments(self, port_id):
-        kwargs = dict(connected_instruments=port_id)
-        cmd = AgentCommand(command=PlatformAgentEvent.GET_RESOURCE, kwargs=kwargs)
-        retval = self._execute_agent(cmd)
-        connected_instruments = retval.result
-        log.info("_get_connected_instruments = %s", connected_instruments)
-        self.assertIsInstance(connected_instruments, dict)
-        self.assertIn(port_id, connected_instruments)
-        self.assertIsInstance(connected_instruments[port_id], dict)
-        return connected_instruments
 
     def _initialize(self, recursion=True):
         kwargs = dict(recursion=recursion)
@@ -1665,13 +1731,6 @@ class BaseIntTestPlatform(IonIntegrationTestCase, HelperTestMixin):
         cmd = AgentCommand(command=PlatformAgentEvent.SHUTDOWN, kwargs=kwargs)
         retval = self._execute_agent(cmd)
         self._assert_state(PlatformAgentState.UNINITIALIZED)
-
-    def _check_sync(self):
-        result = self._execute_resource(RSNPlatformDriverEvent.CHECK_SYNC)
-        log.info("CHECK_SYNC result: %s", result)
-        self.assertTrue(result is not None)
-        self.assertEquals(result[0:3], "OK:")
-        return result
 
     def _stream_instruments(self):
         from mi.instrument.seabird.sbe37smb.ooicore.driver import SBE37ProtocolEvent

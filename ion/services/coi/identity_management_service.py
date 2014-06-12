@@ -278,9 +278,12 @@ class IdentityManagementService(BaseIdentityManagementService):
                 #remove all the Notifications
                 if rsrc.type_ != OT.NotificationRequest:
                     nr_removed.append(rsrc)
-            extended_user.owned_resources = [rsrc for rsrc in nr_removed if rsrc.lcstate != 'RETIRED' ]
+            extended_user.owned_resources = [rsrc for rsrc in nr_removed if rsrc.lcstate != 'DELETED']
             #now append the active NotificationRequests
             extended_user.owned_resources.extend(extended_user.subscriptions)
+
+        from ion.util.extresource import strip_resource_extension
+        strip_resource_extension(extended_user)
 
         return extended_user
 

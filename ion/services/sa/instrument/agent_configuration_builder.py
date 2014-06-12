@@ -66,6 +66,7 @@ class AgentConfigurationBuilder(object):
         self.last_id            = None
         self.will_launch        = False
         self.generated_config   = False
+        self.actor_id           = ''
 
     def _predicates_to_cache(self):
         return [PRED.hasOutputProduct,
@@ -122,7 +123,6 @@ class AgentConfigurationBuilder(object):
 
         for p in self._predicates_to_cache():
             self.RR2.clear_cached_predicate(p)
-            
 
     def _lookup_means(self):
         """
@@ -164,7 +164,6 @@ class AgentConfigurationBuilder(object):
         #check_keys([PRED.hasAgentInstance, PRED.hasModel, PRED.hasAgentDefinition])
         check_keys([PRED.hasAgentInstance, PRED.hasAgentDefinition])
         assert RT.ProcessDefinition in self.associated_objects
-
 
     def set_agent_instance_object(self, agent_instance_obj):
         """
@@ -210,17 +209,23 @@ class AgentConfigurationBuilder(object):
         config = self.generate_config()
         return config
 
-
-    def _generate_org_governance_name(self):
-        log.debug("_generate_org_governance_name for %s", self.agent_instance_obj.name)
+    def _generate_org(self):
+        """
+        @return Org object to which this agent instance belongs
+        """
+        log.debug("_generate_org for %s", self.agent_instance_obj.name)
         log.debug("retrieve the Org governance name to which this agent instance belongs")
         try:
             org_obj = self.RR2.find_subject(RT.Org, PRED.hasResource, self.agent_instance_obj._id, id_only=False)
-            return org_obj.org_governance_name
+            log.debug("[xa] org_obj=%s", org_obj)
+            return org_obj
         except NotFound:
-            return ''
+            return None
         except:
             raise
+
+    def set_actor_id(self, actor_id):
+        self.actor_id = actor_id or ''
 
     def _generate_device_type(self):
         log.debug("_generate_device_type for %s", self.agent_instance_obj.name)
@@ -255,8 +260,8 @@ class AgentConfigurationBuilder(object):
         pdict_stream_defs = self.RR2.find_stream_definition_ids_by_parameter_dictionary_using_has_parameter_dictionary(pdict_id)
         stream_def_id = self.RR2.find_stream_definition_id_of_data_product_using_has_stream_definition(dp_id)
         result = stream_def_id if stream_def_id in pdict_stream_defs else None
-        return result
 
+        return result
 
     def _generate_stream_config(self):
         log.debug("_generate_stream_config for %s", self.agent_instance_obj.name)
@@ -277,38 +282,57 @@ class AgentConfigurationBuilder(object):
         data_product_objs = self.RR2.find_data_products_of_instrument_device_using_has_output_product(device_id)
 
         stream_config = {}
-        for d in data_product_objs:
-            stream_def_id = self.RR2.find_stream_definition_id_of_data_product_using_has_stream_definition(d._id)
-            for stream_name, stream_info_dict in streams_dict.items():
-                # read objects from cache to be compared
-                pdict = self.RR2.find_resource_by_name(RT.ParameterDictionary, stream_info_dict.get('param_dict_name'))
-                stream_def_id = self._find_streamdef_for_dp_and_pdict(d._id, pdict._id)
-
-                if stream_def_id:
-                    #model_param_dict = self.RR2.find_resources_by_name(RT.ParameterDictionary,
-                    #                                         stream_info_dict.get('param_dict_name'))[0]
-                    #model_param_dict = self._get_param_dict_by_name(stream_info_dict.get('param_dict_name'))
-                    #stream_route = self.RR2.read(product_stream_id).stream_route
-                    product_stream_id = self.RR2.find_stream_id_of_data_product_using_has_stream(d._id)
+        for dp in data_product_objs:
+            stream_def_id = self.RR2.find_stream_definition_id_of_data_product_using_has_stream_definition(dp._id)
+            for stream in self.RR2.find_streams_of_data_product_using_has_stream(dp._id):
+                if stream.stream_name and stream.stream_name in streams_dict:
                     stream_def = psm.read_stream_definition(stream_def_id)
-                    stream_route = psm.read_stream_route(stream_id=product_stream_id)
-
-                    from pyon.core.object import IonObjectSerializer
+                    #from pyon.core.object import IonObjectSerializer
                     stream_def_dict = IonObjectSerializer().serialize(stream_def)
                     stream_def_dict.pop('type_')
 
-                    if stream_name in stream_config:
-                        log.warn("Overwriting stream_config[%s]", stream_name)
+                    stream_config[stream.stream_name] = { 
+                        'routing_key'           : stream.stream_route.routing_key,
+                        'stream_id'             : stream._id,
+                        'stream_definition_ref' : stream_def_id,
+                        'stream_def_dict'       : stream_def_dict,
+                        'exchange_point'        : stream.stream_route.exchange_point
+                   }
 
-                    stream_config[stream_name] = {  'routing_key'           : stream_route.routing_key,  # TODO: Serialize stream_route together
-                                                    'stream_id'             : product_stream_id,
-                                                    'stream_definition_ref' : stream_def_id,
-                                                    'stream_def_dict'       : stream_def_dict,
-                                                    'exchange_point'        : stream_route.exchange_point,
-                                                    # TODO: This is redundant and very large - the param dict is in the stream_def_dict ???
-                                                    'parameter_dictionary'  : stream_def.parameter_dictionary,
-
-                    }
+#            stream_def_id = self.RR2.find_stream_definition_id_of_data_product_using_has_stream_definition(dp._id)
+#            for stream_name, stream_info_dict in streams_dict.items():
+#                # read objects from cache to be compared
+#                pdict = self.RR2.find_resource_by_name(RT.ParameterDictionary, stream_info_dict.get('param_dict_name'))
+#                stream_def_id = self._find_streamdef_for_dp_and_pdict(dp._id, pdict._id)
+#
+#                if stream_def_id:
+#                    #model_param_dict = self.RR2.find_resources_by_name(RT.ParameterDictionary,
+#                    #                                         stream_info_dict.get('param_dict_name'))[0]
+#                    #model_param_dict = self._get_param_dict_by_name(stream_info_dict.get('param_dict_name'))
+#                    #stream_route = self.RR2.read(product_stream_id).stream_route
+#                    product_stream_id = self.RR2.find_stream_id_of_data_product_using_has_stream(dp._id)
+#                    stream_def = psm.read_stream_definition(stream_def_id)
+#                    stream_route = psm.read_stream_route(stream_id=product_stream_id)
+#
+#                    from pyon.core.object import IonObjectSerializer
+#                    stream_def_dict = IonObjectSerializer().serialize(stream_def)
+#                    stream_def_dict.pop('type_')
+#
+#                    if stream_name in stream_config:
+#                        log.warn("Overwriting stream_config[%s]", stream_name)
+#
+#                    stream_config[stream_name] = {  'routing_key'           : stream_route.routing_key,  # TODO: Serialize stream_route together
+#                                                    'stream_id'             : product_stream_id,
+#                                                    'stream_definition_ref' : stream_def_id,
+#                                                    'stream_def_dict'       : stream_def_dict,  # This is very large
+#                                                    'exchange_point'        : stream_route.exchange_point,
+#                                                    # This is redundant and very large - the param dict is in the stream_def_dict
+#                                                    #'parameter_dictionary'  : stream_def.parameter_dictionary,
+#
+#                    }
+        if len(stream_config) < len(streams_dict):
+            log.warn("Found only %s matching streams by stream definition (%s) than %s defined in the agent (%s).",
+                     len(stream_config), stream_config.keys(), len(streams_dict), streams_dict.keys())
 
         log.debug("Stream config generated")
         log.trace("generate_stream_config: %s", stream_config)
@@ -321,6 +345,8 @@ class AgentConfigurationBuilder(object):
         # Set the agent state vector from the prior agent run
         if self.agent_instance_obj.saved_agent_state:
             agent_config["prior_state"] = self.agent_instance_obj.saved_agent_state
+
+        agent_config['alt_ids'] = self.agent_instance_obj.alt_ids
 
         return agent_config
 
@@ -345,10 +371,14 @@ class AgentConfigurationBuilder(object):
         # merge the agent config into the default config
         agent_config = dict_merge(self._get_agent().agent_default_config, self.agent_instance_obj.agent_config, True)
 
+        org_obj = self._generate_org()
+
         # Create agent_config.
         agent_config['instance_id']        = self.agent_instance_obj._id
         agent_config['instance_name']        = self.agent_instance_obj.name
-        agent_config['org_governance_name']  = self._generate_org_governance_name()
+        agent_config['org_governance_name']  = org_obj.org_governance_name if org_obj else ''
+        agent_config['provider_id']          = org_obj._id if org_obj else ''
+        agent_config['actor_id']             = self.actor_id
         agent_config['device_type']          = self._generate_device_type()
         agent_config['driver_config']        = self._generate_driver_config()
         agent_config['stream_config']        = self._generate_stream_config()
@@ -360,7 +390,6 @@ class AgentConfigurationBuilder(object):
         log.info("DONE generating skeleton config block for %s", self.agent_instance_obj.name)
 
         return agent_config
-
 
     def _summarize_children(self, config_dict):
         ret = dict([(v['instance_name'], self._summarize_children(v))
@@ -404,7 +433,6 @@ class AgentConfigurationBuilder(object):
         self.generated_config = True
 
         return agent_config
-
 
     def record_launch_parameters(self, agent_config):
         """
@@ -584,7 +612,6 @@ class AgentConfigurationBuilder(object):
 
         self.associated_objects = ret
 
-
     def _get_device(self):
         self._check_associations()
         return self.associated_objects[self._lookup_means()[PRED.hasAgentInstance]]
@@ -712,6 +739,15 @@ class PlatformAgentConfigurationBuilder(AgentConfigurationBuilder):
 
         return False
 
+    # TODO(OOIION-1495) review the following, which was overwriting the 'ports'
+    # entry with and empty dict {}, then causing failures downstream,
+    # for example, with test:
+    #   test_platform_launch.py:TestPlatformLaunch.test_single_deployed_platform
+    #
+    #   File "/Users/carueda/workspace/coi-services-carueda/ion/agents/platform/platform_agent.py", line 421, in _validate_configuration
+    #     if not self._platform_id in self._network_definition.pnodes:
+    # AttributeError: 'NoneType' object has no attribute 'pnodes'
+    """
     def _generate_driver_config(self):
         # get default config
         driver_config = super(PlatformAgentConfigurationBuilder, self)._generate_driver_config()
@@ -738,12 +774,16 @@ class PlatformAgentConfigurationBuilder(AgentConfigurationBuilder):
         log.debug(' port assignments for platform  %s', port_assignments)
 
         # Create driver config.
-        add_driver_config = {
-            'ports' : port_assignments,
-        }
+        if 'attributes' in driver_config and driver_config['attributes']:
+            add_driver_config = { 'ports' : port_assignments, }
+        else:
+            #attributes should be an empty dict if none are provided
+            add_driver_config = { 'ports' : port_assignments, 'attributes' : {}, }
+
         self._augment_dict("Platform Agent driver_config", driver_config, add_driver_config)
 
         return driver_config
+    """
 
     def _generate_children(self):
         """

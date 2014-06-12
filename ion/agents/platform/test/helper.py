@@ -35,13 +35,18 @@ class HelperTestMixin:
     """
 
     @classmethod
-    def setUpClass(cls):
-        # Use the "OMS" environment variable to initially determine whether
-        # we are testing against the actual RSN OMS endpoint. If so,
-        # the value of this variable would be the alias "rsn".
-        # Otherwise, assume we are testing against our simulator.
+    def using_actual_rsn_oms_endpoint(cls):
+        """
+        Determines whether we are testing against the actual RSN OMS endpoint.
+        This is based on looking up the "USING_ACTUAL_RSN_OMS_ENDPOINT"
+        environment variable, which normally will only be defined as
+        convenient while doing local tests. See OOIION-1352.
+        """
+        return "yes" == os.getenv('USING_ACTUAL_RSN_OMS_ENDPOINT')
 
-        if "rsn" == os.getenv('OMS', None):
+    @classmethod
+    def setUpClass(cls):
+        if cls.using_actual_rsn_oms_endpoint():
             print("HelperTestMixin: setUpClassBasedOnRealEndpoint")
             cls._setUpClassBasedOnRealEndpoint()
 
@@ -99,8 +104,8 @@ class HelperTestMixin:
 
         cls.PLATFORM_ID           = 'Node1D'
         cls.SUBPLATFORM_IDS       = ['MJ01C']
-        cls.ATTR_NAMES            = ['input_voltage', 'input_bus_current']
-        cls.WRITABLE_ATTR_NAMES   = ['input_bus_current']
+        cls.ATTR_NAMES            = ['input_voltage|0', 'input_bus_current|0']
+        cls.WRITABLE_ATTR_NAMES   = ['input_bus_current|0']
         cls.VALID_ATTR_VALUE      = "7"     # within the range
         cls.INVALID_ATTR_VALUE    = "9876"  # out of range
 
@@ -124,10 +129,10 @@ class HelperTestMixin:
             cls.PLATFORM_ID = 'LJ01D'
             print("PLAT_NETWORK=single -> using base platform: %r" % cls.PLATFORM_ID)
             cls.SUBPLATFORM_IDS = []
-            cls.ATTR_NAMES = ['input_voltage', 'input_bus_current']
-            cls.WRITABLE_ATTR_NAMES = ['input_bus_current']
+            cls.ATTR_NAMES = ['input_voltage|0', 'input_bus_current|0']
+            cls.WRITABLE_ATTR_NAMES = ['input_bus_current|0']
 
-            cls.PORT_ID = 'LJ01D_port_1'
+            cls.PORT_ID = '1'
             cls.INSTRUMENT_ID = 'LJ01D_port_1_instrument_1'
         else:
             print("PLAT_NETWORK undefined -> using base platform: %r" % cls.PLATFORM_ID)
@@ -219,38 +224,6 @@ class HelperTestMixin:
         self.assertIn(port_id, dic)
         val = dic[port_id]
         self.assertEquals(InvalidResponse.PORT_ID, val)
-
-    def _verify_valid_instrument_id(self, instrument_id, dic):
-        """
-        verifies the instrument_id is an entry in the dict with a valid value,
-        either a dict or InvalidResponse.INSTRUMENT_ALREADY_CONNECTED.
-        Returns dic[instrument_id].
-        """
-        self.assertIn(instrument_id, dic)
-        val = dic[instrument_id]
-        self.assertTrue(
-            isinstance(val, dict) or
-            val == InvalidResponse.INSTRUMENT_ALREADY_CONNECTED,
-            "%r: val should be a dict but is: %s" % (
-                instrument_id, str(val)))
-        return val
-
-    def _verify_invalid_instrument_id(self, instrument_id, dic):
-        """
-        verifies the instrument_id is an entry in the dict with a
-        value that is not a dict.
-        """
-        self.assertIn(instrument_id, dic)
-        val = dic[instrument_id]
-        self.assertEquals(val, InvalidResponse.MISSING_INSTRUMENT_ATTRIBUTE)
-
-    def _verify_instrument_disconnected(self, instrument_id, result):
-        """
-        verifies the result is equal to NormalResponse.INSTRUMENT_DISCONNECTED.
-        """
-        expected = NormalResponse.INSTRUMENT_DISCONNECTED
-        self.assertEquals(expected, result, "instrument_id=%r: expecting %r but "
-                    "got result=%r" % (instrument_id, expected, result))
 
     def _dispatch_simulator(self, oms_uri, inactivity_period=180):
         """

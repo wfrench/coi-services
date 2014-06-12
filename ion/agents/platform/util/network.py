@@ -4,18 +4,11 @@
 @package ion.agents.platform.util.network
 @file    ion/agents/platform/util/network.py
 @author  Carlos Rueda
-@brief   Supporting elements for representation of a platform network
+@brief   Supporting elements for convenient representation of a platform network
 """
 
 __author__ = 'Carlos Rueda'
 __license__ = 'Apache 2.0'
-
-
-# NOTE: No use of any pyon stuff in this module mainly to also facilitate use by
-# simulator, which uses a regular threading.Thread when run as a separate
-# process, so we avoid gevent monkey-patching issues.
-
-import hashlib
 
 
 class BaseNode(object):
@@ -23,55 +16,12 @@ class BaseNode(object):
     A convenient base class for the components of a platform network.
     """
     def __init__(self):
-        # cached value for the checksum property.
-        self._checksum = None
+        pass
 
     def diff(self, other):
         """
         Returns None if this and the other object are the same.
         Otherwise, returns a message describing the first difference.
-        """
-        raise NotImplementedError()  # pragma: no cover
-
-    @property
-    def checksum(self):
-        """
-        Gets the last value computed by compute_checksum, if any.
-        If no such value is available (for example, compute_checksum hasn't
-        been called yet, or the cached checksum has been invalidated), then
-        this method calls compute_checksum to obtain the checksum.
-
-        @note Unless client code has good control about the changes done on
-        instances of this class (including changes in children nodes), that is,
-        by making sure to invalidate the corresponding cached values upon any
-        changes, the use of this property is *not* recommended; instead call
-        compute_checksum, which always compute the checksum based on the
-        current state of the node and its children.
-
-        @return SHA1 hash value as string of hexadecimal digits.
-        """
-        if not self._checksum:
-            self._checksum = self.compute_checksum()
-        return self._checksum
-
-    def compute_checksum(self):
-        """
-        Computes the checksum for this object, updating the cached value for
-        future calls to the checksum property. Subclasses do not need
-        overwrite this method.
-
-        @return SHA1 hash value as string of hexadecimal digits
-        """
-        self._checksum = self._compute_checksum()
-        return self._checksum
-        
-    def _compute_checksum(self):
-        """
-        Subclasses implement this method to compute the checksum for
-        this object. For any checksum computation of subcomponents,
-        the implementation should call compute_checksum on the subcomponent.
-
-        @return SHA1 hash value as string of hexadecimal digits
         """
         raise NotImplementedError()  # pragma: no cover
 
@@ -81,12 +31,38 @@ class AttrNode(BaseNode):
     Represents a platform attribute.
     """
     def __init__(self, attr_id, defn):
+        """
+        OOIION-1551:
+        First, get attr_name and attr_instance from the given attr_id (this is
+        the preferred mechanism as it's expected to be of the form
+        "<name>|<instance>") or from properties in defn, and resorting to
+        the given attr_id for the name, and "0" for the instance.
+        Finally, the store attr_id is composed from the name and instance as
+        captured above.
+        """
         BaseNode.__init__(self)
-        self._attr_id = attr_id
+        idx = attr_id.rfind('|')
+        if idx >= 0:
+            self._attr_name     = attr_id[:idx]
+            self._attr_instance = attr_id[idx + 1:]
+        else:
+            self._attr_name     = defn.get('attr_name', attr_id)
+            self._attr_instance = defn.get('attr_instance', "0")
+
+        self._attr_id = "%s|%s" % (self._attr_name, self._attr_instance)
+        defn['attr_id'] = self._attr_id
         self._defn = defn
 
     def __repr__(self):
         return "AttrNode{id=%s, defn=%s}" % (self.attr_id, self.defn)
+
+    @property
+    def attr_name(self):
+        return self._attr_name
+
+    @property
+    def attr_instance(self):
+        return self._attr_instance
 
     @property
     def attr_id(self):
@@ -111,71 +87,46 @@ class AttrNode(BaseNode):
 
         return None
 
-    def _compute_checksum(self):
-        hash_obj = hashlib.sha1()
-    
-        hash_obj.update("attribute_id=%s" % self.attr_id)
-    
-        # properties:
-        hash_obj.update("attribute_properties:")
-        for key in sorted(self.defn.keys()):
-            val = self.defn[key]
-            hash_obj.update("%s=%s;" % (key, val))
-    
-        return hash_obj.hexdigest()
-        
 
 class PortNode(BaseNode):
     """
     Represents a platform port.
 
     self._port_id
-    self._network = value of the network associated to the port, eg., "10.30.78.x"
-    self._instruments = { instrument_id: InstrumentNode, ... }
+    self._instrument_ids = [ instrument_id, ... ]
 
     """
-    def __init__(self, port_id, network):
+    def __init__(self, port_id):
         BaseNode.__init__(self)
-        self._port_id = port_id
-        self._network = network
-        self._instruments = {}
-        self._state = None
+        self._port_id = str(port_id)
+        self._instrument_ids = []
 
     def __repr__(self):
-        return "PortNode{id=%s, network=%s}" % (
-            self._port_id, self._network)
+        return "PortNode{port_id=%r, instrument_ids=%r}" % (
+            self.port_id, self.instrument_ids)
 
     @property
     def port_id(self):
         return self._port_id
 
     @property
-    def network(self):
-        return self._network
-
-    @property
-    def state(self):
-        return self._state
-
-    def set_state(self, state):
-        self._state = state
-
-    @property
-    def instruments(self):
+    def instrument_ids(self):
         """
-        Instruments of this port.
+        IDs of instruments associated to this port.
         """
-        return self._instruments
+        return self._instrument_ids
 
-    def add_instrument(self, instrument):
-        if instrument.instrument_id in self._instruments:
-            raise Exception('%s: duplicate instrument ID' % instrument.instrument_id)
-        self._instruments[instrument.instrument_id] = instrument
+    def add_instrument_id(self, instrument_id):
+        if instrument_id in self._instrument_ids:
+            raise Exception('duplicate instrument_id=%r for port_id=%r' % (
+                            instrument_id, self.port_id))
+        self._instrument_ids.append(instrument_id)
 
-    def remove_instrument(self, instrument_id):
-        if instrument_id not in self._instruments:
-            raise Exception('%s: Not such instrument ID' % instrument_id)
-        del self._instruments[instrument_id]
+    def remove_instrument_id(self, instrument_id):
+        if instrument_id not in self._instrument_ids:
+            raise Exception('no such instrument_id=%r in port_id=%r' % (
+                            instrument_id, self.port_id))
+        self._instrument_ids.remove(instrument_id)
 
     def diff(self, other):
         """
@@ -186,53 +137,19 @@ class PortNode(BaseNode):
             return "Port IDs are different: %r != %r" % (
                 self.port_id, other.port_id)
 
-        if self.network != other.network:
-            return "Port network values are different: %r != %r" % (
-                self.network, other.network)
-
-        if self.state != other.state:
-            return "Port state values are different: %r != %r" % (
-                self.state, other.state)
-
         # compare instruments:
-        instrument_ids = set(self.instruments.iterkeys())
-        other_instrument_ids = set(other.instruments.iterkeys())
+        instrument_ids = set(self.instrument_ids)
+        other_instrument_ids = set(other.instrument_ids)
         if instrument_ids != other_instrument_ids:
-            return "port_id=%r: instrument IDs are different: %r != %r" % (
+            return "port_id=%r: instrument_ids are different: %r != %r" % (
                 self.port_id, instrument_ids, other_instrument_ids)
-        for instrument_id, instrument in self.instruments.iteritems():
-            other_instrument = other.instruments[instrument_id]
-            diff = instrument.diff(other_instrument)
-            if diff:
-                return diff
 
         return None
-
-    def _compute_checksum(self):
-        hash_obj = hashlib.sha1()
-
-        # id:
-        hash_obj.update("port_id=%s;" % self.port_id)
-
-        # network:
-        hash_obj.update("port_network=%s;" % self.network)
-
-        # state:
-        hash_obj.update("port_state=%s;" % self.state)
-
-        # instruments:
-        hash_obj.update("port_instruments:")
-        for key in sorted(self.instruments.keys()):
-            instrument = self.instruments[key]
-            hash_obj.update(instrument.compute_checksum())
-
-        return hash_obj.hexdigest()
 
 
 class InstrumentNode(BaseNode):
     """
-    Represents an instrument in a port.
-    Note, also used directly in PlatformNode to capture the configuration for
+    Represents an instrument in a PlatformNode to capture the configuration for
     instruments.
 
     self._instrument_id
@@ -282,24 +199,12 @@ class InstrumentNode(BaseNode):
 
         return None
 
-    def _compute_checksum(self):
-        hash_obj = hashlib.sha1()
-
-        hash_obj.update("instrument_id=%s;" % self.instrument_id)
-        hash_obj.update("instrument_attributes:")
-        for key in sorted(self.attrs.keys()):
-            val = self.attrs[key]
-            hash_obj.update("%s=%s;" % (key, val))
-
-        return hash_obj.hexdigest()
-
 
 class PlatformNode(BaseNode):
     """
     Platform node for purposes of representing the network.
 
     self._platform_id
-    self._platform_types = [type, ...]
     self._attrs = { attr_id: AttrNode, ... }
     self._ports = { port_id: PortNode, ... }
     self._subplatforms = { platform_id: PlatformNode, ...}
@@ -310,20 +215,12 @@ class PlatformNode(BaseNode):
     The _CFG element included for convenience to capture the provided
     configuration dict in PlatformAgent. See
     create_network_definition_from_ci_config()
-
-    NOTE: because _instruments is only to capture provided instrument
-    configuration, this property is NOT taken into account for the
-    _compute_checksum operation, which is intended for the current state of
-    the attributes and ports (which also include instruments but in the sense
-     of being connected to the port).
-
     """
     #TODO: some separation of configuration vs. state would be convenient.
 
-    def __init__(self, platform_id, platform_types=None, CFG=None):
+    def __init__(self, platform_id, CFG=None):
         BaseNode.__init__(self)
         self._platform_id = platform_id
-        self._platform_types = platform_types or []
         self._name = None
         self._ports = {}
         self._attrs = {}
@@ -348,10 +245,6 @@ class PlatformNode(BaseNode):
     @property
     def platform_id(self):
         return self._platform_id
-
-    @property
-    def platform_types(self):
-        return self._platform_types
 
     @property
     def name(self):
@@ -402,7 +295,6 @@ class PlatformNode(BaseNode):
         s = "<%s" % self.platform_id
         if self.name:
             s += "/name=%s" % self.name
-        s += "/types=%s" % self.platform_types
         s += ">\n"
         s += "ports=%s\n"         % list(self.ports.itervalues())
         s += "attrs=%s\n"         % list(self.attrs.itervalues())
@@ -433,10 +325,6 @@ class PlatformNode(BaseNode):
         if self.name != other.name:
             return "platform names are different: %r != %r" % (
                 self.name, other.name)
-
-        if self.platform_types != other.platform_types:
-            return "platform types are different: %r != %r" % (
-                self.platform_types, other.platform_types)
 
         # compare parents:
         if (self.parent is None) != (other.parent is None):
@@ -486,39 +374,6 @@ class PlatformNode(BaseNode):
 
         return None
 
-    def _compute_checksum(self):
-        hash_obj = hashlib.sha1()
-
-        # update with checksum of sub-platforms:
-        hash_obj.update("subplatforms:")
-        for key in sorted(self.subplatforms.keys()):
-            subplatform = self.subplatforms[key]
-            hash_obj.update(subplatform.compute_checksum())
-
-        # now, with info about the platform itself.
-
-        # id:
-        hash_obj.update("platform_id=%s;" % self.platform_id)
-
-        # platform_types:
-        hash_obj.update("platform_types:")
-        for platform_type in sorted(self.platform_types):
-            hash_obj.update("%s;" % platform_type)
-
-        # attributes:
-        hash_obj.update("platform_attributes:")
-        for key in sorted(self.attrs.keys()):
-            attr = self.attrs[key]
-            hash_obj.update(attr.compute_checksum())
-
-        # ports:
-        hash_obj.update("platform_ports:")
-        for key in sorted(self.ports.keys()):
-            port = self.ports[key]
-            hash_obj.update(port.compute_checksum())
-
-        return hash_obj.hexdigest()
-
 
 class NetworkDefinition(BaseNode):
     """
@@ -531,21 +386,11 @@ class NetworkDefinition(BaseNode):
 
     def __init__(self):
         BaseNode.__init__(self)
-        self._platform_types = {}
         self._pnodes = {}
 
         # _dummy_root is a dummy PlatformNode having as children the actual roots in
         # the network.
         self._dummy_root = None
-
-    @property
-    def platform_types(self):
-        """
-        Returns the platform types in the network.
-
-        @return {platform_type : description} dict
-        """
-        return self._platform_types
 
     @property
     def pnodes(self):
@@ -582,11 +427,6 @@ class NetworkDefinition(BaseNode):
         Otherwise, returns a message describing the first difference.
         """
 
-        # compare platform_type definitions:
-        if set(self.platform_types.items()) != set(other.platform_types.items()):
-            return "platform types are different: %r != %r" % (
-                self.platform_types, other.platform_types)
-
         # compare topology
         if (self.root is None) != (other.root is None):
             return "roots are different: %r != %r" % (
@@ -595,17 +435,3 @@ class NetworkDefinition(BaseNode):
             return self.root.diff(other.root)
         else:
             return None
-
-    def _compute_checksum(self):
-        hash_obj = hashlib.sha1()
-
-        # platform_types:
-        hash_obj.update("platform_types:")
-        for key in sorted(self.platform_types.keys()):
-            platform_type = self.platform_types[key]
-            hash_obj.update("%s=%s;" % (key, platform_type))
-
-        # root PlatformNode:
-        hash_obj.update("root_platform=%s;" % self.root.compute_checksum())
-
-        return hash_obj.hexdigest()

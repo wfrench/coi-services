@@ -11,9 +11,11 @@ from coverage_model.coverage import AbstractCoverage
 from coverage_model.parameter_types import QuantityType,ConstantRangeType,ArrayType, ConstantType, RecordType 
 from coverage_model.parameter_types import CategoryType, BooleanType, ParameterFunctionType, SparseConstantType
 from coverage_model.parameter_functions import ParameterFunctionException
+from pyon.container.cc import Container
+from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 from pydap.model import DatasetType,BaseType, GridType, SequenceType
 from pydap.handlers.lib import BaseHandler
-from pyon.public import CFG
+from pyon.public import CFG, PRED
 import time
 import simplejson as json
 import collections
@@ -96,21 +98,25 @@ class Handler(BaseHandler):
             raise TypeNotSupportedError(e)
     
     @classmethod
-    def get_coverage(cls, root_path, dataset_id):
+    def get_coverage(cls, data_product_id):
         '''
         Memoization (LRU) of _get_coverage
         '''
-        if root_path is None or dataset_id is None:
-            return None
+        if not data_product_id:
+            return
         try:
-            result, ts = cls._coverages.pop(dataset_id)
+            result, ts = cls._coverages.pop(data_product_id)
             if (time.time() - ts) > cls.CACHE_EXPIRATION:
                 result.close()
-                raise KeyError(dataset_id)
+                raise KeyError(data_product_id)
         except KeyError:
-            if dataset_id is None:
+            if data_product_id is None:
                 return None
-            result = AbstractCoverage.load(root_path, dataset_id,mode='r')
+            resource_registry = Container.instance.resource_registry
+            dataset_ids, _ = resource_registry.find_objects(data_product_id, PRED.hasDataset, id_only=True)
+            if not dataset_ids: return None
+            dataset_id = dataset_ids[0]
+            result = DatasetManagementService._get_coverage(dataset_id, mode='r')
             result.value_caching = False
             ts = time.time()
             if result is None:
@@ -134,10 +140,18 @@ class Handler(BaseHandler):
 
     def get_data(self,cov, name, bitmask):
         #pc = cov.get_parameter_context(name)
-        try:
-            data = cov._range_value[name][:][bitmask]
-        except ParameterFunctionException:
-            data = np.empty(cov.num_timesteps, dtype='object')
+        if isinstance(cov._range_dictionary[name].param_type, ArrayType):
+            try:
+                vdict = cov.get_value_dictionary([name])
+                idxs = np.where(bitmask)[0]
+                data = vdict[name][idxs]
+            except ParameterFunctionException:
+                data = np.empty(cov.num_timesteps, dtype='object')
+        else:
+            try:
+                data = cov._range_value[name][:][bitmask]
+            except ParameterFunctionException:
+                data = np.empty(cov.num_timesteps, dtype='object')
         data = np.asanyarray(data) 
         if not data.shape:
             data.shape = (1,)
@@ -270,6 +284,7 @@ class Handler(BaseHandler):
 
                 elif isinstance(pc.param_type, SparseConstantType):
                     data, dtype = self.filter_data(data)
+                    seq[name] = self.make_series(response, name, data, attrs, dtype)
                 #dataset[name] = self.make_series(response, name, data, attrs, dtype)
 #                elif param.is_coordinate and cov.temporal_parameter_name == name:
 #                        dataset[name] = BaseType(name=name, data=data, type=data.dtype.char, attributes=attrs, shape=data.shape)
@@ -380,8 +395,8 @@ class Handler(BaseHandler):
     @request_profile(CFG.get_safe('server.pydap.profile_enabled', True))
     @exception_wrapper
     def parse_constraints(self, environ):
-        base = os.path.split(self.filepath)
-        coverage = self.get_coverage(base[0], base[1])
+        base, data_product_id = os.path.split(self.filepath)
+        coverage = self.get_coverage(data_product_id)
 
         last_modified = formatdate(time.mktime(time.localtime(os.stat(self.filepath)[ST_MTIME])))
         environ['pydap.headers'].append(('Last-modified', last_modified))

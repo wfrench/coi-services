@@ -4,7 +4,7 @@
 @brief Data Product Management Service Integration Tests
 '''
 
-import unittest, gevent, simplejson
+import unittest, gevent, simplejson, time
 import numpy as np
 from mock import patch
 from nose.plugins.attrib import attr
@@ -38,8 +38,8 @@ from interface.services.dm.ipubsub_management_service import PubsubManagementSer
 from interface.services.sa.idata_acquisition_management_service import DataAcquisitionManagementServiceClient
 from interface.services.sa.idata_product_management_service import  DataProductManagementServiceClient
 from interface.services.dm.idata_retriever_service import DataRetrieverServiceClient
-from interface.objects import LastUpdate, ComputedValueAvailability, Granule, DataProduct
-from interface.objects import ProcessDefinition, DataProducer, DataProcessProducerContext
+from interface.objects import LastUpdate, ComputedValueAvailability, Granule, DataProduct, DataProductTypeEnum
+from interface.objects import ProcessDefinition, DataProducer, DataProcessProducerContext 
 
 
 class FakeProcess(LocalContextMixin):
@@ -146,16 +146,12 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         # test creating a new data product w/o a stream definition
         #------------------------------------------------------------------------------------------------
 
-        # Generic time-series data domain creation
-        tdom, sdom = time_series_domain()
 
 
 
         dp_obj = IonObject(RT.DataProduct,
             name='DP1',
-            description='some new dp',
-            temporal_domain = tdom.dump(), 
-            spatial_domain = sdom.dump())
+            description='some new dp')
 
         dp_obj.geospatial_bounds.geospatial_latitude_limit_north = 10.0
         dp_obj.geospatial_bounds.geospatial_latitude_limit_south = -10.0
@@ -189,9 +185,7 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         log.debug('Creating new data product with a stream definition')
         dp_obj = IonObject(RT.DataProduct,
             name='DP2',
-            description='some new dp',
-            temporal_domain = tdom.dump(),
-            spatial_domain = sdom.dump())
+            description='some new dp')
 
         dp_id2 = self.dpsc_cli.create_data_product(dp_obj, ctd_stream_def_id)
         self.dpsc_cli.activate_data_product_persistence(dp_id2)
@@ -314,16 +308,10 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         pdict_id = self.dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
         ctd_stream_def_id = self.pubsubcli.create_stream_definition(name='Simulated CTD data', parameter_dictionary_id=pdict_id)
 
-        tdom, sdom = time_series_domain()
-
-        sdom = sdom.dump()
-        tdom = tdom.dump()
 
         dp_obj = IonObject(RT.DataProduct,
             name='DP1',
-            description='some new dp',
-            temporal_domain = tdom,
-            spatial_domain = sdom)
+            description='some new dp')
         dp_id = self.dpsc_cli.create_data_product(data_product= dp_obj,
             stream_definition_id=ctd_stream_def_id)
 
@@ -336,9 +324,8 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         ctd_stream_def_id = self.pubsubcli.create_stream_definition(name='ctd parsed', parameter_dictionary_id=pdict_id)
         self.addCleanup(self.pubsubcli.delete_stream_definition, ctd_stream_def_id)
 
-        tdom, sdom = time_series_domain()
 
-        dp = DataProduct(name='Instrument DP', temporal_domain=tdom.dump(), spatial_domain=sdom.dump())
+        dp = DataProduct(name='Instrument DP')
         dp_id = self.dpsc_cli.create_data_product(dp, stream_definition_id=ctd_stream_def_id)
         self.addCleanup(self.dpsc_cli.force_delete_data_product, dp_id)
 
@@ -353,7 +340,7 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         
         # Make the derived data product
         simple_stream_def_id = self.pubsubcli.create_stream_definition(name='TEMPWAT stream def', parameter_dictionary_id=pdict_id, available_fields=['time','temp'])
-        tempwat_dp = DataProduct(name='TEMPWAT')
+        tempwat_dp = DataProduct(name='TEMPWAT', category=DataProductTypeEnum.DERIVED)
         tempwat_dp_id = self.dpsc_cli.create_data_product(tempwat_dp, stream_definition_id=simple_stream_def_id, parent_data_product_id=dp_id)
         self.addCleanup(self.dpsc_cli.delete_data_product, tempwat_dp_id)
         # Check that the streams associated with the data product are persisted with
@@ -403,16 +390,10 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         # test creating a new data product w/o a stream definition
         #------------------------------------------------------------------------------------------------
         # Construct temporal and spatial Coordinate Reference System objects
-        tdom, sdom = time_series_domain()
-
-        sdom = sdom.dump()
-        tdom = tdom.dump()
 
         dp_obj = IonObject(RT.DataProduct,
             name='DP1',
-            description='some new dp',
-            temporal_domain = tdom,
-            spatial_domain = sdom)
+            description='some new dp')
 
         log.debug("Created an IonObject for a data product: %s" % dp_obj)
 
@@ -422,6 +403,19 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
 
         dp_id = self.dpsc_cli.create_data_product(data_product= dp_obj,
             stream_definition_id=ctd_stream_def_id)
+
+        #------------------------------------------------------------------------------------------------
+        # Subscribe to persist events
+        #------------------------------------------------------------------------------------------------
+        queue = gevent.queue.Queue()
+
+        def info_event_received(message, headers):
+            queue.put(message)
+
+        es = EventSubscriber(event_type=OT.InformationContentStatusEvent, callback=info_event_received, origin=dp_id, auto_delete=True)
+        es.start()
+        self.addCleanup(es.stop)
+
 
         #------------------------------------------------------------------------------------------------
         # test activate and suspend data product persistence
@@ -517,6 +511,22 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         with self.assertRaises(NotFound):
             dp_obj = self.rrclient.read(dp_id)
 
+
+        info_event_counter = 0
+        runtime = 0
+        starttime = time.time()
+        caught_events = []
+
+        #check that the four InfoStatusEvents were received
+        while info_event_counter < 4 and runtime < 60 :
+            a = queue.get(timeout=60)
+            caught_events.append(a)
+            info_event_counter += 1
+            runtime = time.time() - starttime
+
+        self.assertEquals(info_event_counter, 4)
+
+
     def test_lookup_values(self):
         ph = ParameterHelper(self.dataset_management, self.addCleanup)
         pdict_id = ph.create_lookups()
@@ -524,9 +534,6 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         self.addCleanup(self.pubsubcli.delete_stream_definition, stream_def_id)
 
         data_product = DataProduct(name='lookup data product')
-        tdom, sdom = time_series_domain()
-        data_product.temporal_domain = tdom.dump()
-        data_product.spatial_domain = sdom.dump()
 
         data_product_id = self.dpsc_cli.create_data_product(data_product, stream_definition_id=stream_def_id)
         self.addCleanup(self.dpsc_cli.delete_data_product, data_product_id)
@@ -562,7 +569,7 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         publisher = StandaloneStreamPublisher(stream_id, route)
         publisher.publish(granule)
 
-        self.assertTrue(dataset_monitor.event.wait(10))
+        self.assertTrue(dataset_monitor.wait())
 
         granule = self.data_retriever.retrieve(dataset_id)
         rdt2 = RecordDictionaryTool.load_from_granule(granule)
@@ -582,7 +589,7 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         granule = rdt.to_granule()
         gevent.sleep(2) # Yield so that the event goes through
         publisher.publish(granule)
-        self.assertTrue(dataset_monitor.event.wait(10))
+        self.assertTrue(dataset_monitor.wait())
 
         granule = self.data_retriever.retrieve(dataset_id)
         rdt2 = RecordDictionaryTool.load_from_granule(granule)

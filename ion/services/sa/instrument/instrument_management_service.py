@@ -15,7 +15,8 @@ from ooi.timer import Timer, Accumulator
 from pyon.agent.agent import ResourceAgentState, ResourceAgentClient
 from pyon.core.bootstrap import IonObject
 from pyon.core.exception import Inconsistent, BadRequest, NotFound, ServerError, Unauthorized
-from pyon.core.governance import GovernanceHeaderValues, has_org_role
+from pyon.core.governance import GovernanceHeaderValues, has_org_role, INSTRUMENT_OPERATOR, OBSERVATORY_OPERATOR,\
+    ORG_MANAGER_ROLE
 from pyon.core.governance import has_valid_shared_resource_commitment, is_resource_owner
 from pyon.ion.resource import ExtendedResourceContainer
 from pyon.public import LCE, RT, PRED, OT
@@ -25,15 +26,16 @@ from coverage_model.parameter import ParameterDictionary
 
 from ion.agents.port.port_agent_process import PortAgentProcess
 from ion.agents.platform.platform_agent import PlatformAgentState
+from ion.processes.event.device_state import DeviceStateManager
 from ion.services.sa.instrument.rollx_builder import RollXBuilder
 from ion.services.sa.instrument.status_builder import AgentStatusBuilder
 from ion.services.sa.instrument.agent_configuration_builder import InstrumentAgentConfigurationBuilder, \
     PlatformAgentConfigurationBuilder
 from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 from ion.services.sa.instrument.flag import KeywordFlag
-from ion.services.sa.observatory.observatory_management_service import INSTRUMENT_OPERATOR_ROLE
+
+from ion.services.sa.observatory.deployment_util import DeploymentUtil
 from ion.services.sa.observatory.observatory_util import ObservatoryUtil
-from ion.services.sa.observatory.deployment_util import describe_deployments
 from ion.util.agent_launcher import AgentLauncher
 from ion.util.module_uploader import RegisterModulePreparerEgg
 from ion.util.qa_doc_parser import QADocParser
@@ -41,7 +43,9 @@ from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryC
 from ion.util.resource_lcs_policy import AgentPolicy, ResourceLCSPolicy, ModelPolicy, DevicePolicy
 
 from interface.objects import AttachmentType, ComputedValueAvailability, ProcessDefinition, ComputedDictValue
-from interface.objects import AggregateStatusType, DeviceStatusType
+from interface.objects import ComputedIntValue, ComputedListValue
+
+from interface.objects import DeviceStatusType, AggregateStatusType
 from interface.services.sa.iinstrument_management_service import BaseInstrumentManagementService
 
 
@@ -313,12 +317,12 @@ class InstrumentManagementService(BaseInstrumentManagementService):
 
         """
 
-        self.RR2.retire(instrument_agent_instance_id, RT.InstrumentAgentInstance)
+        self.RR2.lcs_delete(instrument_agent_instance_id, RT.InstrumentAgentInstance)
 
 
     def force_delete_instrument_agent_instance(self, instrument_agent_instance_id=''):
 
-        self.RR2.pluck_delete(instrument_agent_instance_id, RT.InstrumentAgentInstance)
+        self.RR2.force_delete(instrument_agent_instance_id, RT.InstrumentAgentInstance)
 
 
 
@@ -347,16 +351,22 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         if not config_builder or RT.DataProduct not in config_builder.associated_objects:
            return
         data_products = config_builder.associated_objects[RT.DataProduct]
-        parsed_dp_id = None
-        for dp in data_products:
-            if dp.processing_level_code == "Parsed":
-                parsed_dp_id = dp._id
-                break
-        if parsed_dp_id:
-            if not self.DPMS.is_persisted(parsed_dp_id):
-                raise BadRequest("Cannot start agent - data product persistence is not activated!")
+        if config_builder._get_device().type_ == RT.PlatformDevice:
+            for dp in data_products:
+                if self.DPMS.is_persisted(dp._id):
+                    return
+            raise BadRequest("Cannot start agent - data product persistence is not activated!")
         else:
-            log.warn("Cannot determine if persistence is activated for agent instance=%s", config_builder.agent_instance_obj._id)
+            parsed_dp_id = None
+            for dp in data_products:
+                if dp.processing_level_code == "Parsed":
+                    parsed_dp_id = dp._id
+                    break
+            if parsed_dp_id:
+                if not self.DPMS.is_persisted(parsed_dp_id):
+                    raise BadRequest("Cannot start agent - data product persistence is not activated!")
+            else:
+                log.warn("Cannot determine if persistence is activated for agent instance=%s", config_builder.agent_instance_obj._id)
 
     def start_instrument_agent_instance(self, instrument_agent_instance_id=''):
         """
@@ -539,30 +549,49 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             raise BadRequest("Expected a InstrumentAgentInstance for the resource %s, but received type %s" %
                             (instrument_agent_instance_id, instrument_agent_instance_obj.type_))
 
+        agent_process_id = None
         try:
-            instance_obj, device_id = self._stop_agent_instance(instrument_agent_instance_id,
-                                                                RT.InstrumentDevice, instrument_agent_instance_obj)
+            try:
+                instance_obj, device_id, agent_process_id = self._stop_agent_instance(
+                    instrument_agent_instance_id, RT.InstrumentDevice, instrument_agent_instance_obj)
 
-        except BadRequest as e:
-            #
-            # stopping the instrument agent instance failed, but try at least
-            # to stop the port agent:
-            #
-            log.error("Exception in _stop_agent_instance: %s", e)
-            log.debug("Trying to stop the port agent anyway ...")
-            instance_obj = self.RR2.read(instrument_agent_instance_id)
+            except BadRequest as e:
+                # Note: Stopping the instrument agent instance failed, but try at least
+                # to stop the port agent:
+                log.error("Exception in _stop_agent_instance: %s", e)
+                log.debug("Trying to stop the port agent anyway ...")
+                instance_obj = self.RR2.read(instrument_agent_instance_id)
+                self._stop_port_agent(instance_obj.port_agent_config)
+
+                # raise the exception anyway:
+                raise e
+
             self._stop_port_agent(instance_obj.port_agent_config)
 
-            # raise the exception anyway:
-            raise e
+            #update the producer context for provenance
+            producer_obj = self._get_instrument_producer(device_id)
+            if producer_obj.producer_context.type_ == OT.InstrumentProducerContext :
+                producer_obj.producer_context.deactivation_time =  IonTime().to_string()
+                self.RR2.update(producer_obj)
 
-        self._stop_port_agent(instance_obj.port_agent_config)
+        finally:
+            if agent_process_id:
+                # Save the process state
+                agent_instance_res = self.clients.resource_registry.read(instrument_agent_instance_id)
+                old_state = None
+                try:
+                    old_state,_ = self.container.state_repository.get_state(agent_process_id)
+                    old_state["_prior_agent_process_id"] = agent_process_id
+                except NotFound:
+                    log.warn("Could not find process state for agent instance %s", instrument_agent_instance_id)
 
-        #update the producer context for provenance
-        producer_obj = self._get_instrument_producer(device_id)
-        if producer_obj.producer_context.type_ == OT.InstrumentProducerContext :
-            producer_obj.producer_context.deactivation_time =  IonTime().to_string()
-            self.RR2.update(producer_obj)
+                if old_state and isinstance(old_state, dict):
+                    agent_instance_res.saved_agent_state = old_state
+                else:
+                    agent_instance_res.saved_agent_state = {}
+
+                agent_instance_res.saved_agent_state = old_state
+                self.clients.resource_registry.update(agent_instance_res)
 
 
     def _stop_agent_instance(self, agent_instance_id, device_type, agent_instance_obj=None):
@@ -593,19 +622,11 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         else:
             log.debug("Success cancelling agent process")
 
-
         if "pagent_pid" in agent_instance_obj.driver_config:
             agent_instance_obj.driver_config['pagent_pid'] = None
         self.RR2.update(agent_instance_obj)
 
-        try:
-            obj_id = "agent_spawncfg_%s" % agent_instance_id
-            self.container.object_store.delete_doc(obj_id)
-        except Exception as ex:
-            log.warn("Cannot delete agent spawn config for instance %s: %s", agent_instance_id, ex)
-
-
-        return agent_instance_obj, device_id
+        return agent_instance_obj, device_id, agent_process_id
 
 
 
@@ -677,7 +698,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         """
         #retrieve the associated process definition
 
-        self.RR2.retire(instrument_agent_id, RT.InstrumentAgent)
+        self.RR2.lcs_delete(instrument_agent_id, RT.InstrumentAgent)
 
 
     def force_delete_instrument_agent(self, instrument_agent_id=''):
@@ -689,7 +710,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             self.RR2.unassign_process_definition_from_instrument_agent_with_has_process_definition(pd_obj._id, instrument_agent_id)
             self.clients.process_dispatcher.delete_process_definition(pd_obj._id)
 
-        self.RR2.pluck_delete(instrument_agent_id, RT.InstrumentAgent)
+        self.RR2.force_delete(instrument_agent_id, RT.InstrumentAgent)
 
 
     def register_instrument_agent(self, instrument_agent_id='', agent_egg='', qa_documents=''):
@@ -707,50 +728,8 @@ class InstrumentManagementService(BaseInstrumentManagementService):
          - keywords
         """
 
-        # retrieve the resource
-        self.read_instrument_agent(instrument_agent_id)
-
-        qa_doc_parser = QADocParser()
-
-        #process the input files (base64-encoded qa documents)
-        qa_parse_result, err  = qa_doc_parser.prepare(qa_documents)
-        if not qa_parse_result:
-            raise BadRequest("Processing qa_documents file failed: %s" % err)
-
-
-        #process the input files (base64-encoded egg)
-        uploader_obj, err = self.module_uploader.prepare(agent_egg)
-        if None is uploader_obj:
-            raise BadRequest("Egg failed validation: %s" % err)
-
-        attachments, err = qa_doc_parser.convert_to_attachments()
-
-        if None is attachments:
-            raise BadRequest("QA Docs processing failed: %s" % err)
-
-        # actually upload
-        up_success, err = uploader_obj.upload()
-        if not up_success:
-            raise BadRequest("Upload failed: %s" % err)
-
-
-        #now we can do the ION side of things
-
-        #make an attachment for the url
-        attachments.append(IonObject(RT.Attachment,
-                                     name=uploader_obj.get_egg_urlfile_name(),
-                                     description="url to egg",
-                                     content="[InternetShortcut]\nURL=%s" % uploader_obj.get_destination_url(),
-                                     content_type="text/url",
-                                     keywords=[KeywordFlag.EGG_URL],
-                                     attachment_type=AttachmentType.ASCII))
-
-        #insert all attachments
-        for att in attachments:
-            self.RR2.create_attachment(instrument_agent_id, att)
-
-        #updates the state of this InstAgent to integrated
-        self.RR2.advance_lcs(instrument_agent_id, LCE.INTEGRATE)
+        # OOIION-1655
+        raise NotImplementedError('Implemented as part of R3 D041 Data Processing Management Service')
 
     ##########################################################################
     #
@@ -793,10 +772,10 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         @retval success whether it succeeded
 
         """
-        self.RR2.retire(instrument_model_id, RT.InstrumentModel)
+        self.RR2.lcs_delete(instrument_model_id, RT.InstrumentModel)
 
     def force_delete_instrument_model(self, instrument_model_id=''):
-        self.RR2.pluck_delete(instrument_model_id, RT.InstrumentModel)
+        self.RR2.force_delete(instrument_model_id, RT.InstrumentModel)
 
 
 
@@ -848,11 +827,11 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         @retval success whether it succeeded
 
         """
-        self.RR2.retire(instrument_device_id, RT.InstrumentDevice)
+        self.RR2.lcs_delete(instrument_device_id, RT.InstrumentDevice)
 
 
     def force_delete_instrument_device(self, instrument_device_id=''):
-        self.RR2.pluck_delete(instrument_device_id, RT.InstrumentDevice)
+        self.RR2.force_delete(instrument_device_id, RT.InstrumentDevice)
 
     ##
     ##
@@ -868,7 +847,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         except Inconsistent, ex:
             return False, ex.message
 
-        #Device policy
+        #Instrument policy
         if gov_values.op == 'execute_instrument_device_lifecycle' or gov_values.op == 'execute_platform_device_lifecycle':
 
             log.debug("check_device_lifecycle_policy: actor info: %s %s %s", gov_values.actor_id, gov_values.actor_roles, gov_values.resource_id)
@@ -897,7 +876,13 @@ class InstrumentManagementService(BaseInstrumentManagementService):
 
                 #Check across Orgs which have shared this device for role which as proper level to allow lifecycle transition
                 for org in orgs:
-                    if has_org_role(gov_values.actor_roles, org.org_governance_name, [INSTRUMENT_OPERATOR_ROLE] ) and is_shared:
+                    if has_org_role(gov_values.actor_roles, org.org_governance_name, [INSTRUMENT_OPERATOR ] ) and is_shared:
+                        return True, ''
+                    if has_org_role(gov_values.actor_roles, org.org_governance_name, [OBSERVATORY_OPERATOR, ORG_MANAGER_ROLE ] ):
+                        return True, ''
+            else:
+                for org in orgs:
+                    if has_org_role(gov_values.actor_roles, org.org_governance_name, [OBSERVATORY_OPERATOR, ORG_MANAGER_ROLE ] ):
                         return True, ''
 
             return False, '%s(%s) has been denied since the user %s has not acquired the resource or is not the proper role for this transition: %s' % (process.name, gov_values.op, gov_values.actor_id, lifecycle_event)
@@ -907,6 +892,30 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             return True, ''
 
 
+    def check_start_stop_policy(self, process, message, headers):
+
+        log.debug(str(process))
+        log.debug(str(message))
+        log.debug(str(headers))
+        try:
+            gov_values = GovernanceHeaderValues(headers=headers, process=process)
+            resource_id = gov_values.resource_id
+        except Inconsistent, ex:
+            log.error("unable to retrieve governance header")
+            return False, ex.message
+
+
+
+        # Allow actor to start/stop instrument in an org where the actor has the appropriate role
+        orgs,_ = self.clients.resource_registry.find_subjects(subject_type=RT.Org, predicate=PRED.hasResource, object=resource_id, id_only=False)
+        for org in orgs:
+            if (has_org_role(gov_values.actor_roles, org.org_governance_name, [INSTRUMENT_OPERATOR, ORG_MANAGER_ROLE, OBSERVATORY_OPERATOR])):
+                log.error("returning true: "+str(gov_values.actor_roles))
+                return True, ''
+
+        log.error("returning false: "+str(gov_values.actor_roles))
+
+        return False, '%s(%s) denied since user doesn''t have appropriate role in any org with which the instrument %s is shared ' % (process.name, gov_values.op, resource_id)
 
     ##########################################################################
     #
@@ -956,10 +965,10 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         @retval success whether it succeeded
 
         """
-        self.RR2.retire(platform_agent_instance_id, RT.PlatformAgentInstance)
+        self.RR2.lcs_delete(platform_agent_instance_id, RT.PlatformAgentInstance)
 
     def force_delete_platform_agent_instance(self, platform_agent_instance_id=''):
-        self.RR2.pluck_delete(platform_agent_instance_id, RT.PlatformAgentInstance)
+        self.RR2.force_delete(platform_agent_instance_id, RT.PlatformAgentInstance)
 
 #    def _get_child_platforms(self, platform_device_id):
 #        """ recursively trace hasDevice relationships, return list of all PlatformDevice objects
@@ -989,6 +998,12 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         configuration_builder = PlatformAgentConfigurationBuilder(self.clients)
         launcher = AgentLauncher(self.clients.process_dispatcher)
 
+        # set actor_id in configuration:
+        ctx = self.get_context()
+        actor_id = ctx.get('ion-actor-id', None) if ctx else None
+        log.debug('[xa] actor_id=%r', actor_id)
+        configuration_builder.set_actor_id(actor_id)
+        # TODO also do similar setting in start_instrument_agent_instance
 
         configuration_builder.set_agent_instance_object(platform_agent_instance_obj)
         config = configuration_builder.prepare()
@@ -996,6 +1011,9 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         platform_device_obj = configuration_builder._get_device()
         log.debug("start_platform_agent_instance: device is %s connected to platform agent instance %s (L4-CI-SA-RQ-363)",
                   str(platform_device_obj._id),  str(platform_agent_instance_id))
+
+        # Check that persistence is on
+        self._assert_persistence_on(configuration_builder)
 
         # Save the config into an object in the object store which will be passed to the agent by the container.
         configuration_builder.record_launch_parameters(config)
@@ -1018,8 +1036,28 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             raise BadRequest("Expected a InstrumentAgentInstance for the resource %s, but received type %s" %
                             (platform_agent_instance_id, platform_agent_instance_obj.type_))
 
-        self._stop_agent_instance(platform_agent_instance_id, RT.PlatformDevice, platform_agent_instance_obj)
+        agent_process_id = None
+        try:
+            instance_obj, device_id, agent_process_id = self._stop_agent_instance(
+                platform_agent_instance_id, RT.PlatformDevice, platform_agent_instance_obj)
+        finally:
+            if agent_process_id:
+                # Save the process state
+                agent_instance_res = self.clients.resource_registry.read(platform_agent_instance_id)
+                old_state = None
+                try:
+                    old_state,_ = self.container.state_repository.get_state(agent_process_id)
+                    old_state["_prior_agent_process_id"] = agent_process_id
+                except NotFound:
+                    log.warn("Could not find process state for agent instance %s", platform_agent_instance_id)
 
+                if old_state and isinstance(old_state, dict):
+                    agent_instance_res.saved_agent_state = old_state
+                else:
+                    agent_instance_res.saved_agent_state = {}
+
+                agent_instance_res.saved_agent_state = old_state
+                self.clients.resource_registry.update(agent_instance_res)
 
 
 
@@ -1082,10 +1120,10 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         @retval success whether it succeeded
 
         """
-        self.RR2.retire(platform_agent_id, RT.PlatformAgent)
+        self.RR2.lcs_delete(platform_agent_id, RT.PlatformAgent)
 
     def force_delete_platform_agent(self, platform_agent_id=''):
-        self.RR2.pluck_delete(platform_agent_id, RT.PlatformAgent)
+        self.RR2.force_delete(platform_agent_id, RT.PlatformAgent)
 
 
     ##########################################################################
@@ -1131,10 +1169,10 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         @retval success whether it succeeded
 
         """
-        self.RR2.retire(platform_model_id, RT.PlatformModel)
+        self.RR2.lcs_delete(platform_model_id, RT.PlatformModel)
 
     def force_delete_platform_model(self, platform_model_id=''):
-        self.RR2.pluck_delete(platform_model_id, RT.PlatformModel)
+        self.RR2.force_delete(platform_model_id, RT.PlatformModel)
 
 
     ##########################################################################
@@ -1188,10 +1226,10 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         @retval success whether it succeeded
 
         """
-        self.RR2.retire(platform_device_id, RT.PlatformDevice)
+        self.RR2.lcs_delete(platform_device_id, RT.PlatformDevice)
 
     def force_delete_platform_device(self, platform_device_id=''):
-        self.RR2.pluck_delete(platform_device_id, RT.PlatformDevice)
+        self.RR2.force_delete(platform_device_id, RT.PlatformDevice)
 
 
 
@@ -1240,10 +1278,10 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         @retval success whether it succeeded
 
         """
-        self.RR2.retire(sensor_model_id, RT.SensorModel)
+        self.RR2.lcs_delete(sensor_model_id, RT.SensorModel)
 
     def force_delete_sensor_model(self, sensor_model_id=''):
-        self.RR2.pluck_delete(sensor_model_id, RT.SensorModel)
+        self.RR2.force_delete(sensor_model_id, RT.SensorModel)
 
 
     ##########################################################################
@@ -1290,10 +1328,10 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         @retval success whether it succeeded
 
         """
-        self.RR2.retire(sensor_device_id, RT.SensorDevice)
+        self.RR2.lcs_delete(sensor_device_id, RT.SensorDevice)
 
     def force_delete_sensor_device(self, sensor_device_id=''):
-        self.RR2.pluck_delete(sensor_device_id, RT.SensorDevice)
+        self.RR2.force_delete(sensor_device_id, RT.SensorDevice)
 
 
 
@@ -1401,32 +1439,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         self.RR2.unassign_sensor_device_from_instrument_device_with_has_device(sensor_device_id, instrument_device_id)
 
 
-    ##########################################################################
-    #
-    # DEPLOYMENTS
-    #
-    ##########################################################################
 
-
-
-    def deploy_instrument_device(self, instrument_device_id='', deployment_id=''):
-        # OBSOLETE - Move calls to assign/unassign in observatory_management
-        self.RR2.assign_deployment_to_instrument_device_with_has_deployment(deployment_id, instrument_device_id)
-
-
-    def undeploy_instrument_device(self, instrument_device_id='', deployment_id=''):
-        # OBSOLETE - Move calls to assign/unassign in observatory_management
-        self.RR2.unassign_deployment_from_instrument_device_with_has_deployment(deployment_id, instrument_device_id)
-
-
-    def deploy_platform_device(self, platform_device_id='', deployment_id=''):
-        # OBSOLETE - Move calls to assign/unassign in observatory_management
-        self.RR2.assign_deployment_to_platform_device_with_has_deployment(deployment_id, platform_device_id)
-
-
-    def undeploy_platform_device(self, platform_device_id='', deployment_id=''):
-        # OBSOLETE - Move calls to assign/unassign in observatory_management
-        self.RR2.unassign_deployment_from_platform_device_with_has_deployment(deployment_id, platform_device_id)
 
 
 
@@ -1581,6 +1594,9 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         if not instrument_device_id:
             raise BadRequest("The instrument_device_id parameter is empty")
 
+        RR2 = EnhancedResourceRegistryClient(self.clients.resource_registry)
+        outil = ObservatoryUtil(self, enhanced_rr=RR2, device_status_mgr=DeviceStateManager())
+
         extended_resource_handler = ExtendedResourceContainer(self)
 
         extended_instrument = extended_resource_handler.create_extended_resource_container(
@@ -1593,27 +1609,49 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         if t:
             t.complete_step('ims.instrument_device_extension.container')
 
-        # retrieve the statuses for the instrument
-        self.agent_status_builder.add_device_rollup_statuses_to_computed_attributes(instrument_device_id,
-                                                                                    extended_instrument.computed)
-        # retrieve the aggregate status for the instrument
-        status_values = [ extended_instrument.computed.communications_status_roll_up,
-                          extended_instrument.computed.data_status_roll_up,
-                          extended_instrument.computed.location_status_roll_up,
-                          extended_instrument.computed.power_status_roll_up  ]
-        status = self.agent_status_builder._crush_status_list(status_values)
+        try:
+            extended_instrument.platform_model = None
+            if extended_instrument.platform_device:
+                try:
+                    extended_instrument.platform_model = RR2.read_object(extended_instrument.platform_device._id, PRED.hasModel, RT.PlatformModel, id_only=False)
+                except Exception as ex:
+                    log.exception("Cannot get platform_model for platform_device=%s", extended_instrument.platform_device._id)
 
-        log.debug('get_instrument_device_extension  extended_instrument.computed: %s', extended_instrument.computed)
-        if t:
-            t.complete_step('ims.instrument_device_extension.rollup')
+            statuses = outil.get_status_roll_ups(instrument_device_id, include_structure=True)
 
-        # add UI details for deployments in same order as deployments
-        extended_instrument.deployment_info = describe_deployments(extended_instrument.deployments, self.clients,
-                                                                   instruments=[extended_instrument.resource],
-                                                                   instrument_status=[status])
-        if t:
-            t.complete_step('ims.instrument_device_extension.deploy')
-            stats.add(t)
+            comms_rollup = statuses.get(instrument_device_id,{}).get(AggregateStatusType.AGGREGATE_COMMS,DeviceStatusType.STATUS_UNKNOWN)
+            power_rollup = statuses.get(instrument_device_id,{}).get(AggregateStatusType.AGGREGATE_POWER,DeviceStatusType.STATUS_UNKNOWN)
+            data_rollup = statuses.get(instrument_device_id,{}).get(AggregateStatusType.AGGREGATE_DATA,DeviceStatusType.STATUS_UNKNOWN)
+            location_rollup = statuses.get(instrument_device_id,{}).get(AggregateStatusType.AGGREGATE_LOCATION,DeviceStatusType.STATUS_UNKNOWN)
+            aggstatus = statuses.get(instrument_device_id,{}).get('agg',DeviceStatusType.STATUS_UNKNOWN)
+
+            extended_instrument.computed.communications_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=comms_rollup)
+            extended_instrument.computed.data_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=power_rollup)
+            extended_instrument.computed.location_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=data_rollup)
+            extended_instrument.computed.power_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=location_rollup)
+
+            log.debug('get_instrument_device_extension  extended_instrument.computed: %s', extended_instrument.computed)
+            if t:
+                t.complete_step('ims.instrument_device_extension.rollup')
+
+            # add UI details for deployments in same order as deployments
+            dep_util = DeploymentUtil(self.container)
+            extended_instrument.deployment_info = dep_util.describe_deployments(extended_instrument.deployments,
+                                                                                status_map=statuses)
+
+            # Get current active deployment. May be site or parent sites
+            extended_instrument.deployment = dep_util.get_active_deployment(instrument_device_id, is_site=False, rr2=RR2)
+
+            if t:
+                t.complete_step('ims.instrument_device_extension.deploy')
+                stats.add(t)
+
+        except Exception as ex:
+            log.exception("Cannot build instrument %s status", instrument_device_id)
+
+        from ion.util.extresource import strip_resource_extension, get_matchers, matcher_DataProduct, matcher_DeviceModel, matcher_Site
+        matchers = get_matchers([matcher_DataProduct, matcher_DeviceModel, matcher_Site])
+        strip_resource_extension(extended_instrument, matchers=matchers)
 
         return extended_instrument
 
@@ -1632,7 +1670,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
 
         resource_agent_state_labels = {
             'RESOURCE_AGENT_STATE_POWERED_DOWN': 'POWERED DOWN',
-            'RESOURCE_AGENT_STATE_UNINITIALIZED':'UNINITIALIZED',
+            'RESOURCE_AGENT_STATE_UNINITIALIZED': 'UNINITIALIZED',
             'RESOURCE_AGENT_STATE_INACTIVE': 'INACTIVE',
             'RESOURCE_AGENT_STATE_IDLE': 'IDLE',
             'RESOURCE_AGENT_STATE_STOPPED': 'STOPPED',
@@ -1643,36 +1681,24 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             'RESOUCE_AGENT_STATE_DIRECT_ACCESS': 'DIRECT ACCESS',
             'RESOURCE_AGENT_STATE_BUSY': 'BUSY',
             'RESOURCE_AGENT_STATE_LOST_CONNECTION': 'LOST CONNECTION',
-            'PLATFORM_AGENT_STATE_AUTOSAMPLE' : 'STREAMING',
-            'PLATFORM_AGENT_STATE_LAUNCHING' : 'LAUNCHING'
+            'PLATFORM_AGENT_STATE_AUTOSAMPLE': 'STREAMING',
+            'PLATFORM_AGENT_STATE_LAUNCHING': 'LAUNCHING'
         }
 
         retval = IonObject(OT.ComputedStringValue)
-        ia_client, reason = self.agent_status_builder.get_device_agent(taskable_resource_id)
 
-        # early exit for no client
-        if ia_client is None:
+        dsm = DeviceStateManager()
+        state_list = dsm.read_states([taskable_resource_id])
+
+        if state_list and type(state_list[0]) is dict and 'state' in state_list[0] and 'current' in state_list[0]['state']:
+            cur_state = state_list[0]['state']['current']
+            retval.value = resource_agent_state_labels.get(cur_state, cur_state)
+            retval.status = ComputedValueAvailability.PROVIDED
+
+        else:
             retval.value = 'UNKNOWN'
             retval.status = ComputedValueAvailability.NOTAVAILABLE
-            retval.reason = reason
-            return retval
-
-        try:
-            state = ia_client.get_agent_state()
-            if resource_agent_state_labels.has_key(state):
-                retval.value = resource_agent_state_labels[ state ]
-                retval.status = ComputedValueAvailability.PROVIDED
-            else:
-                log.warning('IMS:get_operational_state label map has no value for this state:  %s', state)
-                retval.value = 'UNKNOWN'
-                retval.status = ComputedValueAvailability.NOTAVAILABLE
-                retval.reason = "State not returned in agent response"
-
-        except Unauthorized:
-            retval.value = 'UNKNOWN'
-            retval.status = ComputedValueAvailability.NOTAVAILABLE
-            retval.reason = "The requester does not have the proper role to access the status of this agent"
-
+            retval.reason = "State event not available in object store."
 
         return retval
 
@@ -1695,18 +1721,12 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         # These below are the possible new event states while taking the instrument off streaming mode or the platform off monitoring mode
         # This is info got from possible actions to wind down the instrument or platform that one can take in the UI when the device is already streaming/monitoring
         #----------------------------------------------------------------------------------------------
-        event_state = ''
         not_streaming_states = [ResourceAgentState.COMMAND, ResourceAgentState.INACTIVE, ResourceAgentState.UNINITIALIZED]
-
-        if device.type_ == 'InstrumentDevice':
-            event_state = ResourceAgentState.STREAMING
-        elif device.type_ == 'PlatformDevice':
-            event_state = PlatformAgentState.MONITORING
 
         #----------------------------------------------------------------------------------------------
         # Get events associated with device from the events db
         #----------------------------------------------------------------------------------------------
-        log.debug("For uptime, we are checking the device with id: %s, type_: %s, and searching recent events for the following event_state: %s",device_id, device.type_, event_state)
+        log.debug("For uptime, we are checking the device with id: %s, type_: %s, and searching recent streaming or monitoring events. ",device_id, device.type_)
         event_tuples = self.container.event_repository.find_events(origin=device_id, event_type='ResourceAgentStateEvent', descending=True)
 
         recent_events = [tuple[2] for tuple in event_tuples]
@@ -1717,7 +1737,8 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         for evt in recent_events:
             log.debug("Got a recent event with event_state: %s", evt.state)
 
-            if evt.state == event_state: # "RESOURCE_AGENT_STATE_STREAMING"
+            #RSN Platform agent publishes PlatformAgentState.MONITORING while Instrument and Dataset Agents publish ResourceAgentState.STREAMING
+            if (evt.state == ResourceAgentState.STREAMING or evt.state == PlatformAgentState.MONITORING):
                 current_time = get_ion_ts() # this is in milliseconds
                 log.debug("Got most recent streaming event with ts_created:  %s. Got the current time: %s", evt.ts_created, current_time)
                 return self._convert_to_string(ret, int(current_time)/1000 - int(evt.ts_created)/1000 )
@@ -1750,7 +1771,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         t = Timer() if stats.is_log_enabled() else None
 
         RR2 = EnhancedResourceRegistryClient(self.clients.resource_registry)
-        outil = ObservatoryUtil(self, enhanced_rr=RR2)
+        outil = ObservatoryUtil(self, enhanced_rr=RR2, device_status_mgr=DeviceStateManager())
 
         if not platform_device_id:
             raise BadRequest("The platform_device_id parameter is empty")
@@ -1841,75 +1862,74 @@ class InstrumentManagementService(BaseInstrumentManagementService):
         for ch_id in child_site_ids:
             device_id = self._get_site_device(ch_id, portal_device_relations)
             device_obj = child_by_id.get(device_id, None)
-            extended_platform.portal_instruments.append(device_obj)
+
             if device_obj:
                 #these are the same set of devices that constitute the rollup status for this platform device, create the list
+                extended_platform.portal_instruments.append(device_obj)
                 portal_instrument_ids.append(device_obj._id)
 
         log.debug('have portal instruments %s', [i._id if i else "None" for i in extended_platform.portal_instruments])
 
-        # Building status - for PlatformAgents only (not ExternalDatasetAgent)
-        # @TODO: clean this UP!!!
-        child_device_ids = device_relations.keys()
-        self.agent_status_builder.add_device_rollup_statuses_to_computed_attributes(platform_device_id,
-                                                                                    extended_platform.computed,
-                                                                                    portal_instrument_ids)
 
-        statuses, reason = self.agent_status_builder.get_cumulative_status_dict(platform_device_id)
-        def csl(device_id_list):
-            return self.agent_status_builder.compute_status_list(statuses, device_id_list)
+        statuses = outil.get_status_roll_ups(platform_device_id, include_structure=True)
 
-        extended_platform.computed.instrument_status = csl([dev._id for dev in extended_platform.instrument_devices])
-        extended_platform.computed.platform_status   = csl([platform._id for platform in extended_platform.platforms])
-        log.debug('instrument_status: %s %r instruments %d\nplatform_status: %s %r platforms %d',
-            extended_platform.computed.instrument_status.reason, extended_platform.computed.instrument_status.value, len(extended_platform.instrument_devices),
-            extended_platform.computed.platform_status.reason, extended_platform.computed.platform_status.value, len(extended_platform.platforms))
-        if t:
-            t.complete_step('ims.platform_device_extension.status')
+        comms_rollup = statuses.get(platform_device_id,{}).get(AggregateStatusType.AGGREGATE_COMMS,DeviceStatusType.STATUS_UNKNOWN)
+        power_rollup = statuses.get(platform_device_id,{}).get(AggregateStatusType.AGGREGATE_POWER,DeviceStatusType.STATUS_UNKNOWN)
+        data_rollup = statuses.get(platform_device_id,{}).get(AggregateStatusType.AGGREGATE_DATA,DeviceStatusType.STATUS_UNKNOWN)
+        location_rollup = statuses.get(platform_device_id,{}).get(AggregateStatusType.AGGREGATE_LOCATION,DeviceStatusType.STATUS_UNKNOWN)
 
-        # TODO: why don't we just use the immediate device children? child_objs
-        ids =[i._id if i else None for i in extended_platform.portal_instruments]
-        extended_platform.computed.portal_status = csl(ids)
-        log.debug('%d portals, %d instruments, %d status: %r', len(extended_platform.portals),
-                  len(extended_platform.portal_instruments), len(extended_platform.computed.portal_status.value), ids)
+        extended_platform.computed.communications_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=comms_rollup)
+        extended_platform.computed.power_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=power_rollup)
+        extended_platform.computed.data_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=data_rollup)
+        extended_platform.computed.location_status_roll_up = ComputedIntValue(status=ComputedValueAvailability.PROVIDED, value=location_rollup)
 
-        rollx_builder = RollXBuilder(self)
-        top_platformnode_id = rollx_builder.get_toplevel_network_node(platform_device_id)
-        if t:
-            t.complete_step('ims.platform_device_extension.top')
-        net_stats, ancestors = rollx_builder.get_network_hierarchy(top_platformnode_id,
-                                                                   lambda x: self.agent_status_builder.get_aggregate_status_of_device(x))
-        if t:
-            t.complete_step('ims.platform_device_extension.hierarchy')
-        extended_platform.computed.rsn_network_child_device_status = ComputedDictValue(value=net_stats,
-                                                                                       status=ComputedValueAvailability.PROVIDED)
-        if t:
-            t.complete_step('ims.platform_device_extension.nodes')
-        parent_node_device_ids = rollx_builder.get_parent_network_nodes(platform_device_id)
 
-        if not parent_node_device_ids:
-            # todo, just the current network status?
-            extended_platform.computed.rsn_network_rollup = ComputedDictValue(status=ComputedValueAvailability.NOTAVAILABLE,
-                                                                              reason="Could not find parent network node")
+        instrument_status = []
+        if extended_platform.instrument_devices:
+            for x in extended_platform.instrument_devices:
+                if x:
+                    instrument_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    instrument_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_platform.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=instrument_status)
         else:
-            parent_node_statuses = [self.agent_status_builder.get_status_of_device(x) for x in parent_node_device_ids]
-            rollup_values = {}
-            for astkey, astname in AggregateStatusType._str_map.iteritems():
-                log.debug("collecting all %s values to crush", astname)
-                single_type_list = [nodestat.get(astkey, DeviceStatusType.STATUS_UNKNOWN) for nodestat in parent_node_statuses]
-                rollup_values[astkey] = self.agent_status_builder._crush_status_list(single_type_list)
+            extended_platform.computed.instrument_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
-            extended_platform.computed.rsn_network_rollup = ComputedDictValue(status=ComputedValueAvailability.PROVIDED,
-                                                                             value=rollup_values)
-        if t:
-            t.complete_step('ims.platform_device_extension.crush')
+        platform_status = []
+        if extended_platform.platforms:
+            for x in extended_platform.platforms:
+                if x:
+                    platform_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    platform_status.append(DeviceStatusType.STATUS_UNKNOWN)
+
+        portal_status = []
+        if extended_platform.portal_instruments:
+            for x in extended_platform.portal_instruments:
+                if x:
+                    portal_status.append(statuses.get(x._id,{}).get("agg", DeviceStatusType.STATUS_UNKNOWN))
+                else:
+                    portal_status.append(DeviceStatusType.STATUS_UNKNOWN)
+            extended_platform.computed.portal_status = ComputedListValue(status=ComputedValueAvailability.PROVIDED, value=portal_status)
+        else:
+            extended_platform.computed.portal_status = ComputedListValue(status=ComputedValueAvailability.NOTAVAILABLE)
 
         # add UI details for deployments
-        extended_platform.deployment_info = describe_deployments(extended_platform.deployments, self.clients,
-                instruments=extended_platform.instrument_devices, instrument_status=extended_platform.computed.instrument_status.value)
+        dep_util = DeploymentUtil(self.container)
+        extended_platform.deployment_info = dep_util.describe_deployments(extended_platform.deployments,
+                                                                          status_map=statuses)
+
+        # Get current active deployment. May be site or parent sites
+        extended_platform.deployment = dep_util.get_active_deployment(platform_device_id, is_site=False, rr2=RR2)
+
         if t:
             t.complete_step('ims.platform_device_extension.deploy')
             stats.add(t)
+
+        from ion.util.extresource import strip_resource_extension, get_matchers, matcher_DataProduct, \
+            matcher_DeviceModel, matcher_Site
+        matchers = get_matchers([matcher_DataProduct, matcher_DeviceModel, matcher_Site])
+        strip_resource_extension(extended_platform, matchers=matchers)
 
         return extended_platform
 
@@ -2249,5 +2269,27 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             'unassign_instrument_agent_from_instrument_agent_instance', {"instrument_agent_id": instrument_agent_id,
                                                                          "instrument_agent_instance_id":  "$(instrument_agent_instance_id)" })
 
+
+        return resource_data
+
+
+    def prepare_platform_agent_support(self, platform_agent_id=''):
+        """
+        Returns the object containing the data to create/update a platform agent
+        """
+        resource_data = extended_resource_handler.create_prepare_resource_support(instrument_agent_id, OT.PlatformAgentPrepareSupport)
+
+        # TODO
+
+        return resource_data
+
+
+    def prepare_platform_agent_instance_support(self, platform_agent_instance_id=''):
+        """
+        Returns the object containing the data to create/update a platform agent instance
+        """
+        resource_data = extended_resource_handler.create_prepare_resource_support(instrument_agent_id, OT.PlatformAgentInstancePrepareSupport)
+
+        # TODO
 
         return resource_data
